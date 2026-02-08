@@ -13,7 +13,7 @@ WORKDIR /src
 ARG VALHALLA_BRANCH=curvature-costing
 RUN git clone --recurse-submodules --shallow-submodules --depth=1 \
     -b ${VALHALLA_BRANCH} \
-    https://github.com/AndreyLazarko/curvagen-valhalla.git valhalla
+    https://github.com/Lazark0x/valhalla.git valhalla
 
 WORKDIR /src/valhalla
 RUN bash ./scripts/install-linux-deps.sh
