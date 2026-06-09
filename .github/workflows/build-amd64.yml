@@ -32,5 +32,7 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/lazark0x/valhalla:amd64
+          tags: ghcr.io/lazark0x/valhalla-curvature:amd64
           provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
