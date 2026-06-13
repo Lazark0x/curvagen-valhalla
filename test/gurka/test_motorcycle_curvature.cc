@@ -9,9 +9,9 @@ class MotorcycleCurvature : public ::testing::Test {
 protected:
   static gurka::map map;
   static void SetUpTestSuite() {
-    // Two paths from A to D:
-    //   Top path:    A - B - D  (shorter, set to straight / curvature 15)
-    //   Bottom path: A - C - E - D  (longer, set to curvy / curvature 0)
+    // Two paths from A to D (new metric: 0 = straight, 15 = maximally twisty):
+    //   Top path:    A - B - D  (shorter, set to straight / curvature 0)
+    //   Bottom path: A - C - E - D  (longer, set to curvy / curvature 15)
     const std::string ascii_map = R"(
       A----B----D
       |         |
@@ -50,10 +50,10 @@ protected:
                                                          baldr::DirectedEdge& edge) {
                             if (std::find(straight_edges.begin(), straight_edges.end(), edgeid) !=
                                 straight_edges.end()) {
-                              edge.set_curvature(15);
+                              edge.set_curvature(0);
                             } else if (std::find(curvy_edges.begin(), curvy_edges.end(), edgeid) !=
                                        curvy_edges.end()) {
-                              edge.set_curvature(0);
+                              edge.set_curvature(15);
                             }
                           });
   }
