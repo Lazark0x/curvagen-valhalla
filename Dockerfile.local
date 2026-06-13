@@ -1,0 +1,73 @@
+# Local-source build of the curvature-costing fork.
+#
+# Unlike the deploy Dockerfile (which `git clone`s the pushed fork branch from
+# GitHub), this builds the LOCAL working tree, so local edits compile without
+# pushing. Submodules must be populated on the host first:
+#     git submodule update --init --recursive
+#
+# Local test image (gurka/unit tests enabled):
+#     DOCKER_BUILDKIT=0 docker build -f Dockerfile.local --target builder \
+#       --build-arg ENABLE_TESTS=On -t valhalla-fork-test .
+# Local serving image:
+#     DOCKER_BUILDKIT=0 docker build -f Dockerfile.local \
+#       --build-arg ENABLE_TESTS=On -t curvagen-valhalla:latest .
+
+FROM ubuntu:24.04 AS builder
+
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV LD_LIBRARY_PATH=/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
+RUN export DEBIAN_FRONTEND=noninteractive && apt-get update && apt-get install -y sudo git
+
+WORKDIR /src/valhalla
+
+# Install build deps + prime_server first so source edits don't invalidate this
+# (slow) layer on every recompile.
+COPY scripts/install-linux-deps.sh scripts/install-linux-deps.sh
+RUN bash ./scripts/install-linux-deps.sh
+
+# Then the local working tree (third_party submodules included from the host).
+COPY . .
+
+ARG ENABLE_TESTS=Off
+RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc \
+      -DENABLE_TESTS=${ENABLE_TESTS} -DENABLE_SINGLE_FILES_WERROR=Off && \
+    make -C build all -j$(nproc) && \
+    make -C build install
+
+WORKDIR /usr/local/src
+RUN for f in /src/valhalla/locales/*.json; do \
+      cat ${f} | python3 -c "import sys; import json; print(json.load(sys.stdin)[\"posix_locale\"])"; \
+    done > valhalla_locales
+
+# Runner image with scripts for tile building + service startup
+FROM ubuntu:24.04 AS runner
+
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV LD_LIBRARY_PATH=/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
+
+RUN apt-get update > /dev/null && \
+    export DEBIAN_FRONTEND=noninteractive && \
+    apt-get install -y libluajit-5.1-2 libgeotiff5 \
+    libzmq5 libczmq4 spatialite-bin libprotobuf-lite32 sudo locales \
+    libsqlite3-0 libsqlite3-mod-spatialite libcurl4 \
+    python3-minimal python3-requests python3-shapely python-is-python3 \
+    curl unzip moreutils jq > /dev/null && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local /usr/local
+COPY docker/scripts/. /valhalla/scripts
+
+ENV use_tiles_ignore_pbf=True
+ENV build_tar=True
+ENV serve_tiles=True
+ENV update_existing_config=True
+ENV force_rebuild=False
+ENV build_admins=True
+ENV build_time_zones=True
+ENV build_elevation=False
+ENV build_transit=False
+
+WORKDIR /custom_files
+EXPOSE 8002
+ENTRYPOINT ["/valhalla/scripts/docker-entrypoint.sh"]
+CMD ["build_tiles"]
