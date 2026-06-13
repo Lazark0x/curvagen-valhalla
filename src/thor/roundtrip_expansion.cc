@@ -79,8 +79,13 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
       turn_sum += static_cast<double>(de->curvature()) * de->length();
       len_sum += de->length();
       if (!got_node) { // the turnaround node = end node of its leading edge
-        node_ll = tile->get_node_ll(de->endnode());
-        got_node = true;
+        // endnode may live in a different tile than the edge; fetch its own tile.
+        const GraphId end_node = de->endnode();
+        graph_tile_ptr ntile = reader.GetGraphTile(end_node);
+        if (ntile) {
+          node_ll = ntile->get_node_ll(end_node);
+          got_node = true;
+        }
       }
     }
     if (len_sum <= 0.0)
