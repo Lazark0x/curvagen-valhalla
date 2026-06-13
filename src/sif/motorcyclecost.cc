@@ -61,6 +61,8 @@ constexpr float kReuseStrength = 4.0f;
 constexpr ranged_default_t<float> kCurvinessContinuityRange{0.f, 0.0f, 1.0f};
 constexpr uint32_t kCurvyBucketThreshold = 9;   // curvature >= this counts as "curvy"
 constexpr float kContinuityBreakPenalty = 8.0f; // seconds added when leaving a curvy road
+constexpr ranged_default_t<float> kPreferElevationRange{0.f, 0.0f, 1.0f};
+constexpr float kGradeReward = 0.01f; // per |weighted_grade - 6| step
 constexpr ranged_default_t<uint32_t> kMotorcycleSpeedRange{10, baldr::kMaxAssumedSpeed,
                                                            baldr::kMaxSpeedKph};
 
@@ -322,6 +324,7 @@ public:
   float highway_factor_; // Factor applied when road is a motorway or trunk
   float curvature_factor_; // Curvature preference scaling (0 = off, 2 = max)
   float continuity_factor_ = 0.0f; // 0 = off; scales the leave-curvy penalty
+  float elevation_factor_ = 0.0f;  // 0 = off; rewards graded (hilly) edges
 };
 
 // Constructor
@@ -384,6 +387,9 @@ MotorcycleCost::MotorcycleCost(const Costing& costing)
 
   // ADR-0032 sustained curviness scaling (0 = off).
   continuity_factor_ = costing_options.curviness_continuity();
+
+  // ADR-0032 elevation: reward graded (hilly/scenic) edges (0 = off).
+  elevation_factor_ = costing_options.prefer_elevation();
 }
 
 // Destructor
@@ -469,6 +475,12 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
                  highway_factor_ * kHighwayFactor[static_cast<uint32_t>(edge->classification())] +
                  surface_factor_ * kSurfaceFactor[static_cast<uint32_t>(edge->surface())] +
                  curvature_factor_ * kCurvatureFactor[edge->curvature()];
+  // ADR-0032 elevation: reward grade (hilly/scenic). weighted_grade 0..15, 6 = flat.
+  // The small grade discount cannot drive factor negative for realistic grades.
+  if (elevation_factor_ != 0.0f) {
+    int grade_dev = static_cast<int>(edge->weighted_grade()) - 6;
+    factor -= elevation_factor_ * ((grade_dev < 0 ? -grade_dev : grade_dev) * kGradeReward);
+  }
   factor += SpeedPenalty(edge, tile, time_info, flow_sources, edge_speed);
   if (edge->toll()) {
     factor += toll_factor_;
@@ -660,6 +672,8 @@ void ParseMotorcycleCostOptions(const rapidjson::Document& doc,
   JSON_PBF_RANGED_DEFAULT(co, kReusePenaltyRange, json, "/reuse_penalty", reuse_penalty, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kCurvinessContinuityRange, json, "/curviness_continuity",
                           curviness_continuity, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kPreferElevationRange, json, "/prefer_elevation", prefer_elevation,
+                          warnings);
 }
 
 cost_ptr_t CreateMotorcycleCost(const Costing& costing_options) {
