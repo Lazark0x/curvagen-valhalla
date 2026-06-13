@@ -52,6 +52,8 @@ public:
   static void adjust_locations(valhalla::Api& options);
 
   void route(Api& request);
+  // ADR-0033: native round-trip loop action (branched from route() on options.roundtrip).
+  void roundtrip_impl(Api& request, const std::string& costing);
   std::string matrix(Api& request);
   void optimized_route(Api& request);
   std::string isochrones(Api& request);
