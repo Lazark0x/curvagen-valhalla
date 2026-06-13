@@ -55,6 +55,9 @@ constexpr ranged_default_t<float> kUseHighwaysRange{0, kDefaultUseHighways, 1.0f
 constexpr ranged_default_t<float> kUseTollsRange{0, kDefaultUseTolls, 1.0f};
 constexpr ranged_default_t<float> kUseTrailsRange{0, kDefaultUseTrails, 1.0f};
 constexpr ranged_default_t<float> kPreferCurvatureRange{0.f, 0.0f, 1.0f};
+constexpr ranged_default_t<float> kReusePenaltyRange{0.f, 0.0f, 1.0f};
+// reuse_penalty 1.0 -> a re-ridden edge costs (1 + kReuseStrength)x its time.
+constexpr float kReuseStrength = 4.0f;
 constexpr ranged_default_t<uint32_t> kMotorcycleSpeedRange{10, baldr::kMaxAssumedSpeed,
                                                            baldr::kMaxSpeedKph};
 
@@ -371,6 +374,9 @@ MotorcycleCost::MotorcycleCost(const Costing& costing)
   // Curvature preference: 0.0 = no effect, 1.0 = maximum preference for curvy roads
   float prefer_curvature = costing_options.prefer_curvature();
   curvature_factor_ = prefer_curvature * 2.0f;
+
+  // ADR-0031 edge-reuse leash: map [0,1] reuse_penalty to a per-edge cost multiplier.
+  reuse_factor_ = 1.0f + costing_options.reuse_penalty() * kReuseStrength;
 }
 
 // Destructor
@@ -632,6 +638,7 @@ void ParseMotorcycleCostOptions(const rapidjson::Document& doc,
   JSON_PBF_RANGED_DEFAULT(co, kMotorcycleSpeedRange, json, "/top_speed", top_speed, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kPreferCurvatureRange, json, "/prefer_curvature", prefer_curvature,
                           warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kReusePenaltyRange, json, "/reuse_penalty", reuse_penalty, warnings);
 }
 
 cost_ptr_t CreateMotorcycleCost(const Costing& costing_options) {
