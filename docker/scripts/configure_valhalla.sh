@@ -121,7 +121,7 @@ if test -f "${CONFIG_FILE}"; then
     echo "INFO: Found existing valhalla.json. Updating possibly missing entries."
 
     # overwrite config file
-    valhalla_build_config --output "$CONFIG_FILE" --merge-config "$CONFIG_FILE" --report
+    valhalla_build_config --output "$CONFIG_FILE" --merge-config "$CONFIG_FILE"
   fi
 
   jq --arg d "${TILE_DIR}" '.mjolnir.tile_dir = $d' "${CONFIG_FILE}"| sponge "${CONFIG_FILE}"
