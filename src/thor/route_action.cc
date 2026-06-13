@@ -2,10 +2,15 @@
 #include "midgard/logging.h"
 #include "proto/common.pb.h"
 #include "thor/route_matcher.h"
+#include "thor/roundtrip_expansion.h"
 #include "thor/triplegbuilder.h"
 #include "thor/worker.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
+#include <limits>
 
 using namespace valhalla;
 using namespace valhalla::midgard;
@@ -377,6 +382,12 @@ void thor_worker_t::route(Api& request) {
                           min_linear_cost_factor, max_linear_cost_edges);
   }
   auto costing = parse_costing(request);
+
+  // ADR-0033: native round-trip loop action. locations are [start, start].
+  if (options.has_roundtrip()) {
+    roundtrip_impl(request, costing);
+    return;
+  }
 
   // get all the legs
   if (options.date_time_type() == Options::arrive_by) {
@@ -968,6 +979,215 @@ void thor_worker_t::path_depart_at(Api& api, const std::string& costing) {
 
   // assign changed locations
   *api.mutable_options()->mutable_locations() = std::move(correlated);
+}
+
+namespace {
+
+// Reconstruct the forward PathInfo (start -> turnaround) from the expansion label tree.
+// Walk the predecessor chain (mirror centroid path reconstruction), then reverse to
+// start->turnaround order. Each leg's costs are cumulative from the start, which is the
+// leg start for the forward leg.
+std::vector<PathInfo> ForwardPath(const RoundTripExpansion& exp, uint32_t label_index) {
+  std::vector<PathInfo> rev;
+  const auto& labels = exp.labels();
+  for (uint32_t l = label_index; l != baldr::kInvalidLabel; l = labels[l].predecessor()) {
+    rev.emplace_back(labels[l].mode(), labels[l].cost(), labels[l].edgeid(), 0,
+                     labels[l].path_distance(), labels[l].restriction_idx(),
+                     labels[l].transition_cost());
+  }
+  std::reverse(rev.begin(), rev.end()); // start -> turnaround
+  return rev;
+}
+
+// Build a routing Location snapped to a graph node, mirroring a loki node correlation:
+// one PathEdge per edge leaving the node (begin-node, percent_along 0) plus its opposing
+// inbound edge (end-node, percent_along 1) so the location works as both origin and
+// destination of a leg (ADR-0033).
+valhalla::Location correlate_node(const baldr::GraphId& node, baldr::GraphReader& reader) {
+  valhalla::Location loc;
+  graph_tile_ptr tile = reader.GetGraphTile(node);
+  const baldr::NodeInfo* ni = tile->node(node);
+  const PointLL node_ll = tile->get_node_ll(node);
+  loc.mutable_ll()->set_lng(node_ll.lng());
+  loc.mutable_ll()->set_lat(node_ll.lat());
+
+  auto add_edge = [&](const baldr::GraphId& eid, bool begin_node) {
+    auto* pe = loc.mutable_correlation()->mutable_edges()->Add();
+    pe->set_graph_id(eid);
+    pe->set_percent_along(begin_node ? 0.0 : 1.0);
+    pe->set_begin_node(begin_node);
+    pe->set_end_node(!begin_node);
+    pe->set_distance(0);
+    pe->set_inbound_reach(0);
+    pe->set_outbound_reach(0);
+    pe->set_side_of_street(valhalla::Location::kNone);
+    pe->mutable_ll()->set_lng(node_ll.lng());
+    pe->mutable_ll()->set_lat(node_ll.lat());
+  };
+
+  for (uint32_t i = 0; i < ni->edge_count(); ++i) {
+    const baldr::GraphId eid(node.tileid(), node.level(), ni->edge_index() + i);
+    const DirectedEdge* de = tile->directededge(eid);
+    if (de->is_shortcut() || !(de->forwardaccess() & kAutoAccess))
+      continue;
+    add_edge(eid, true); // outbound edge leaving the node
+    const baldr::GraphId opp = reader.GetOpposingEdgeId(eid);
+    if (opp.is_valid())
+      add_edge(opp, false); // opposing inbound edge arriving at the node
+  }
+  return loc;
+}
+
+} // namespace
+
+// ADR-0033 native round-trip: one forward expansion grows the curvy frontier; turnarounds
+// are harvested near target/2, bearing-bucketed for diversity, and each is closed by a
+// leash-penalized return with a one-shot distance correction. The N loops serialize as
+// Trip.routes (alternates), best-first by curviness-per-km.
+void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/) {
+  auto& options = *request.mutable_options();
+  const double target = options.roundtrip().target_distance();
+  const uint32_t want = std::max<uint32_t>(1, options.roundtrip().num_candidates());
+
+  // Start = locations(0); the duplicate locations(1) is ignored.
+  valhalla::Location start = options.locations(0);
+  auto* cost = mode_costing[static_cast<uint32_t>(mode)].get();
+  cost->clear_used_edges();
+
+  // 1) One forward expansion + harvest turnarounds (Task A4).
+  RoundTripExpansion expander;
+  auto cands = expander.Harvest(request, *reader, mode_costing, mode, target);
+  if (cands.empty())
+    throw valhalla_exception_t{442}; // no path / no candidates -> 422 to the client
+
+  // 2) Bearing-bucket for diversity: keep best curviness-per-km per sector.
+  const uint32_t buckets = want;
+  std::vector<int> best(buckets, -1);
+  for (uint32_t i = 0; i < cands.size(); ++i) {
+    uint32_t b = std::min(buckets - 1,
+                          static_cast<uint32_t>(cands[i].bearing_deg / (360.0f / buckets)));
+    if (best[b] < 0 || cands[i].curviness_per_km > cands[best[b]].curviness_per_km)
+      best[b] = static_cast<int>(i);
+  }
+  std::vector<uint32_t> chosen;
+  for (int b : best)
+    if (b >= 0)
+      chosen.push_back(static_cast<uint32_t>(b));
+  // Backfill empty buckets from the global best-curviness remainder.
+  if (chosen.size() < want) {
+    std::vector<uint32_t> rest;
+    for (uint32_t i = 0; i < cands.size(); ++i)
+      if (std::find(chosen.begin(), chosen.end(), i) == chosen.end())
+        rest.push_back(i);
+    std::sort(rest.begin(), rest.end(), [&](uint32_t a, uint32_t c) {
+      return cands[a].curviness_per_km > cands[c].curviness_per_km;
+    });
+    for (uint32_t i = 0; i < rest.size() && chosen.size() < want; ++i)
+      chosen.push_back(rest[i]);
+  }
+
+  // Return-leg router: seed the reuse leash with the forward leg's edges (both directions),
+  // route turnaround -> start on fresh roads, then clear the leash for the next candidate.
+  bidir_astar.set_interrupt(interrupt);
+  cost->set_allow_destination_only(true);
+  cost->set_pass(0);
+  auto route_return = [&](uint32_t fwd_label, valhalla::Location& turn) -> std::vector<PathInfo> {
+    cost->clear_used_edges();
+    std::vector<uint64_t> vals;
+    for (uint32_t l = fwd_label; l != baldr::kInvalidLabel; l = expander.labels()[l].predecessor()) {
+      const GraphId e = expander.labels()[l].edgeid();
+      vals.push_back(e.value);
+      const GraphId opp = reader->GetOpposingEdgeId(e);
+      if (opp.is_valid())
+        vals.push_back(opp.value);
+    }
+    cost->mark_edges_used(vals);
+    bidir_astar.Clear();
+    auto paths = bidir_astar.GetBestPath(turn, start, *reader, mode_costing, mode, options);
+    cost->clear_used_edges();
+    return paths.empty() ? std::vector<PathInfo>{} : paths.front();
+  };
+
+  auto node_for = [&](uint32_t cand_index) -> baldr::GraphId {
+    const GraphId ta_edge = expander.labels()[cands[cand_index].label_index].edgeid();
+    return reader->GetGraphTile(ta_edge)->directededge(ta_edge)->endnode();
+  };
+
+  // 3) Build each chosen loop: forward leg from the tree + leashed return, with a one-shot
+  //    distance correction (re-pick a turnaround at ~target-return from the SAME tree).
+  struct Loop {
+    std::vector<PathInfo> fwd, ret;
+    valhalla::Location turn;
+    float curviness;
+  };
+  std::vector<Loop> loops;
+  for (uint32_t ci : chosen) {
+    valhalla::Location turn = correlate_node(node_for(ci), *reader);
+    std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
+    std::vector<PathInfo> ret = route_return(cands[ci].label_index, turn);
+    if (ret.empty() || fwd.empty())
+      continue;
+
+    // One-shot distance correction: re-pick a turnaround whose forward distance ~=
+    // target - return_length from the same tree (free), route its return once, keep closer.
+    const double ret_m = ret.back().path_distance;
+    const double want_fwd = target - ret_m;
+    int alt = -1;
+    uint32_t bestdiff = std::numeric_limits<uint32_t>::max();
+    for (uint32_t k = 0; k < cands.size(); ++k) {
+      const uint32_t d = static_cast<uint32_t>(
+          std::abs(static_cast<int>(cands[k].path_distance) - static_cast<int>(want_fwd)));
+      if (d < bestdiff) {
+        bestdiff = d;
+        alt = static_cast<int>(k);
+      }
+    }
+    if (alt >= 0 && static_cast<uint32_t>(alt) != ci) {
+      valhalla::Location turn2 = correlate_node(node_for(static_cast<uint32_t>(alt)), *reader);
+      auto fwd2 = ForwardPath(expander, cands[alt].label_index);
+      auto ret2 = route_return(cands[alt].label_index, turn2);
+      if (!ret2.empty() && !fwd2.empty()) {
+        const double tot1 = fwd.back().path_distance + ret_m;
+        const double tot2 = fwd2.back().path_distance + ret2.back().path_distance;
+        if (std::fabs(tot2 - target) < std::fabs(tot1 - target)) {
+          fwd = std::move(fwd2);
+          ret = std::move(ret2);
+          turn = std::move(turn2);
+        }
+      }
+    }
+
+    loops.push_back(
+        {std::move(fwd), std::move(ret), std::move(turn), cands[ci].curviness_per_km});
+  }
+  if (loops.empty())
+    throw valhalla_exception_t{442};
+
+  // 4) Engine ranks best-first by curviness-per-km (distance gated, reuse leashed).
+  std::stable_sort(loops.begin(), loops.end(),
+                   [](const Loop& a, const Loop& b) { return a.curviness > b.curviness; });
+
+  // 5) Serialize each loop as a 2-leg TripRoute (start -> turnaround -> start). Pass fresh
+  //    Location copies per leg since TripLegBuilder mutates origin/destination.
+  valhalla::Trip& trip = *request.mutable_trip();
+  trip.mutable_routes()->Reserve(static_cast<int>(loops.size()));
+  std::vector<std::string> algorithms;
+  for (auto& lp : loops) {
+    auto* route = trip.mutable_routes()->Add();
+    route->mutable_legs()->Reserve(2);
+    {
+      valhalla::Location o = start, d = lp.turn;
+      auto& leg = *route->mutable_legs()->Add();
+      TripLegBuilder::Build(options, controller, *reader, mode_costing, lp.fwd.begin(),
+                            lp.fwd.end(), o, d, leg, algorithms, interrupt, {}, {});
+    }
+    {
+      valhalla::Location o = lp.turn, d = start;
+      auto& leg = *route->mutable_legs()->Add();
+      TripLegBuilder::Build(options, controller, *reader, mode_costing, lp.ret.begin(),
+                            lp.ret.end(), o, d, leg, algorithms, interrupt, {}, {});
+    }
+  }
 }
 } // namespace thor
 } // namespace valhalla
