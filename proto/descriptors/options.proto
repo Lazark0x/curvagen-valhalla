@@ -396,6 +396,15 @@ message LinearFeatureCost {
   bool ignore_access_restrictions = 4;                           // whether to ignore all restrictions along this shape
 }
 
+message RoundTrip {
+  oneof has_target_distance {
+    double target_distance = 1;  // Target loop distance in meters (start == end)
+  }
+  oneof has_num_candidates {
+    uint32 num_candidates = 2;   // Number of loop candidates to return (1..6)
+  }
+}
+
 message Options {
 
   enum Units {
@@ -562,4 +571,7 @@ message Options {
   TileOptions tile_options = 64;                                   // additional /tile specific options
   repeated Levels exclude_levels = 65;                             // Levels to exclude within the exclude_polygon at the same index
   uint32 expansion_max_distance = 66;                              // Maximum path distance in meters for expansion. 0 = disabled.
+  oneof has_roundtrip {
+    RoundTrip roundtrip = 67;  // Present => route() runs the native round-trip loop action (ADR-0033)
+  }
 }
