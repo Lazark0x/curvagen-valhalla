@@ -63,21 +63,21 @@ gurka::map MotorcycleCurvature::map = {};
 
 TEST_F(MotorcycleCurvature, NoPreference_TakesShortestPath) {
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "D"}, "motorcycle",
-                                 {{"prefer_curvature", "0.0"}});
+                                 {{"/costing_options/motorcycle/prefer_curvature", "0.0"}});
   gurka::assert::raw::expect_path(result, {"AB", "BD"});
 }
 
 TEST_F(MotorcycleCurvature, MaxPreference_TakesCurvyPath) {
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "D"}, "motorcycle",
-                                 {{"prefer_curvature", "1.0"}});
+                                 {{"/costing_options/motorcycle/prefer_curvature", "1.0"}});
   gurka::assert::raw::expect_path(result, {"AC", "CE", "ED"});
 }
 
 TEST_F(MotorcycleCurvature, ModeratePreference_ChangesCost) {
   auto result_none = gurka::do_action(valhalla::Options::route, map, {"A", "D"}, "motorcycle",
-                                      {{"prefer_curvature", "0.0"}});
+                                      {{"/costing_options/motorcycle/prefer_curvature", "0.0"}});
   auto result_mod = gurka::do_action(valhalla::Options::route, map, {"A", "D"}, "motorcycle",
-                                     {{"prefer_curvature", "0.5"}});
+                                     {{"/costing_options/motorcycle/prefer_curvature", "0.5"}});
 
   auto cost_none =
       result_none.trip().routes(0).legs(0).node().rbegin()->cost().elapsed_cost().cost();
