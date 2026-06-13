@@ -15,6 +15,7 @@ struct Turnaround {
   uint32_t path_distance; // metres from start along the curvy-cost-optimal path
   float bearing_deg;      // straight-line bearing start -> turnaround node (0..360)
   float curviness_per_km; // post-hoc: sum(curvature*len)/len over the reconstructed path
+  uint64_t node;          // turnaround node GraphId value (for dedup + correlation)
 };
 
 // One forward Dijkstra expansion from the start under the curvy motorcycle costing,
@@ -52,7 +53,8 @@ protected:
                          uint32_t& edge_label_reservation) const override;
 
 private:
-  float max_meters_ = 0.0f; // = target/2 * 1.2
+  float max_meters_ = 0.0f;   // = target/2 * 1.2
+  float near_radius_ = 0.0f;  // explore all road levels within this radius; arterials-only beyond
 };
 
 } // namespace thor

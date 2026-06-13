@@ -1303,6 +1303,8 @@ void from_json(rapidjson::Document& doc, Options::Action action, Api& api) {
       pb->set_target_distance(*td);
     if (auto nc = rapidjson::get_optional<unsigned int>(*rt, "/num_candidates"))
       pb->set_num_candidates(*nc);
+    if (auto sd = rapidjson::get_optional<unsigned int>(*rt, "/seed"))
+      pb->set_seed(*sd);
   }
 
   // whether to return guidance_views, default false
