@@ -363,6 +363,9 @@ message Costing {
     oneof has_reuse_penalty {
       float reuse_penalty = 98;
     }
+    oneof has_curviness_continuity {
+      float curviness_continuity = 99;
+    }
   }
 
   oneof has_options {
