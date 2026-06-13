@@ -18,7 +18,12 @@ constexpr float kDistanceBand = 0.18f; // accept turnarounds within ±18% of tar
 // there-and-back path (right path distance, ~0 straight-line) reads as a turnaround and
 // yields a degenerate out-and-back loop. Also disfavors near-start lollipops.
 constexpr float kMinStraightFraction = 0.3f; // >= 0.3 * target/2 straight-line from start
-}
+// Explore all road levels within this radius of the start; beyond it only arterials/highways
+// carry the expansion. Bounds the settled-node count on long loops so they stay feasible
+// (ADR-0033 hierarchy pruning), at the cost of far-out curviness. Sized so loops up to
+// ~150km (max_meters ~90km) are fully explored — unchanged from the unpruned behavior.
+constexpr float kFullExploreRadiusM = 90000.0f;
+} // namespace
 
 RoundTripExpansion::RoundTripExpansion(const boost::property_tree::ptree& config)
     : Dijkstras(config) {
@@ -37,8 +42,13 @@ ExpansionRecommendation RoundTripExpansion::ShouldExpand(GraphReader&,
   uint32_t dist = pred.predecessor() == kInvalidLabel
                       ? 0
                       : bdedgelabels_[pred.predecessor()].path_distance();
-  return dist > static_cast<uint32_t>(max_meters_) ? ExpansionRecommendation::prune_expansion
-                                                   : ExpansionRecommendation::continue_expansion;
+  if (dist > static_cast<uint32_t>(max_meters_))
+    return ExpansionRecommendation::prune_expansion;
+  // Beyond the near radius, stop growing local roads (level 2) — only arterials/highways
+  // (levels 0/1) carry the expansion out to the far turnaround band. Keeps long loops feasible.
+  if (dist > static_cast<uint32_t>(near_radius_) && pred.edgeid().level() >= 2)
+    return ExpansionRecommendation::prune_expansion;
+  return ExpansionRecommendation::continue_expansion;
 }
 
 std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
@@ -48,6 +58,7 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
                                                     double target_distance_m) {
   const double target_half = target_distance_m * 0.5;
   max_meters_ = static_cast<float>(target_half * 1.2);
+  near_radius_ = std::min(max_meters_, kFullExploreRadiusM);
 
   // Run the forward expansion (fills bdedgelabels_). Dijkstras::Expand dispatches
   // to Compute<ExpansionType::forward> using api.options().locations() as origins.
@@ -69,6 +80,7 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
     // Post-hoc curviness-per-km: walk the predecessor chain summing curvature*len.
     double turn_sum = 0.0, len_sum = 0.0;
     PointLL node_ll = start_ll;
+    GraphId turn_node;
     bool got_node = false;
     for (uint32_t l = i; l != kInvalidLabel; l = bdedgelabels_[l].predecessor()) {
       const GraphId eid = bdedgelabels_[l].edgeid();
@@ -80,15 +92,15 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
       len_sum += de->length();
       if (!got_node) { // the turnaround node = end node of its leading edge
         // endnode may live in a different tile than the edge; fetch its own tile.
-        const GraphId end_node = de->endnode();
-        graph_tile_ptr ntile = reader.GetGraphTile(end_node);
+        turn_node = de->endnode();
+        graph_tile_ptr ntile = reader.GetGraphTile(turn_node);
         if (ntile) {
-          node_ll = ntile->get_node_ll(end_node);
+          node_ll = ntile->get_node_ll(turn_node);
           got_node = true;
         }
       }
     }
-    if (len_sum <= 0.0)
+    if (len_sum <= 0.0 || !got_node)
       continue;
 
     // Reject turnarounds whose node sits near the start (there-and-back / tiny loop).
@@ -101,6 +113,7 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
     t.bearing_deg = static_cast<float>(start_ll.Heading(node_ll)); // 0..360
     // curvature() is 0..15; normalise to 0..1 per km-equivalent for ranking only.
     t.curviness_per_km = static_cast<float>(turn_sum / len_sum / 15.0);
+    t.node = turn_node.value;
     out.push_back(t);
   }
   return out;

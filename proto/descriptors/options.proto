@@ -403,6 +403,9 @@ message RoundTrip {
   oneof has_num_candidates {
     uint32 num_candidates = 2;   // Number of loop candidates to return (1..6)
   }
+  oneof has_seed {
+    uint32 seed = 3;             // Shuffle seed: rotates bearing-diversity buckets so the
+  }                              // same (start,target,curviness) yields a different loop set
 }
 
 message Options {
