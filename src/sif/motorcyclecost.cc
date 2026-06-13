@@ -82,25 +82,25 @@ constexpr float kSurfaceFactor[] = {
 };
 
 // Maps DirectedEdge::curvature() (0-15) to a cost factor.
-// Curvature 0 = most curvy (switchbacks), 15 = straightest.
-// Negative values reward curvature, positive penalize straightness.
+// New metric (mjolnir compute_curvature): 0 = straight, 15 = maximally twisty.
+// Negative values reward twistiness (make the edge cheaper). Calibrated in Task 5.
 constexpr float kCurvatureFactor[] = {
-    0.0f,   // 0: extremely curvy
-    -0.05f, // 1
-    -0.1f,  // 2
-    -0.1f,  // 3
-    -0.05f, // 4
-    0.0f,   // 5
-    0.05f,  // 6
-    0.1f,   // 7
-    0.15f,  // 8
-    0.2f,   // 9
-    0.3f,   // 10
-    0.4f,   // 11
-    0.5f,   // 12
-    0.6f,   // 13
-    0.7f,   // 14
-    0.8f    // 15: dead straight
+    0.00f,  // 0 straight
+    -0.02f, // 1
+    -0.04f, // 2
+    -0.06f, // 3
+    -0.08f, // 4
+    -0.10f, // 5
+    -0.12f, // 6
+    -0.14f, // 7
+    -0.16f, // 8
+    -0.18f, // 9
+    -0.20f, // 10
+    -0.22f, // 11
+    -0.24f, // 12
+    -0.26f, // 13
+    -0.28f, // 14
+    -0.30f, // 15 maximally twisty
 };
 
 BaseCostingOptionsConfig GetBaseCostOptsConfig() {
