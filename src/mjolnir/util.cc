@@ -496,8 +496,9 @@ uint32_t compute_curvature(const std::vector<PointLL>& shape) {
   }
   // Turning density (degrees per km), mapped to the 4-bit 0..15 bucket.
   // kFullyCurvyDegPerKm = turning/km that maps to the maximum bucket. Calibrated
-  // against the Serbia tile distribution in Task 5; start at 600 (switchback-dense).
-  constexpr float kFullyCurvyDegPerKm = 600.0f;
+  // against the Serbia curvature histogram (600 compressed curvy roads into buckets
+  // 0-5; 350 spreads twisty ~150-350 deg/km roads across 6-15, switchbacks cap at 15).
+  constexpr float kFullyCurvyDegPerKm = 350.0f;
   float deg_per_km = (total_turn_deg / length_m) * 1000.0f;
   float bucket = (deg_per_km / kFullyCurvyDegPerKm) * 15.0f;
   return bucket >= 15.0f ? 15u : static_cast<uint32_t>(bucket + 0.5f);
