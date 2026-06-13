@@ -1,0 +1,105 @@
+#include "thor/roundtrip_expansion.h"
+#include "baldr/graphconstants.h"
+#include "midgard/pointll.h"
+
+#include <algorithm>
+#include <cmath>
+
+using namespace valhalla::baldr;
+using namespace valhalla::sif;
+using namespace valhalla::midgard;
+
+namespace valhalla {
+namespace thor {
+
+namespace {
+constexpr float kDistanceBand = 0.18f; // accept turnarounds within ±18% of target/2
+// A real turnaround must be far from the start in straight-line distance too, else a
+// there-and-back path (right path distance, ~0 straight-line) reads as a turnaround and
+// yields a degenerate out-and-back loop. Also disfavors near-start lollipops.
+constexpr float kMinStraightFraction = 0.3f; // >= 0.3 * target/2 straight-line from start
+}
+
+RoundTripExpansion::RoundTripExpansion(const boost::property_tree::ptree& config)
+    : Dijkstras(config) {
+}
+
+void RoundTripExpansion::GetExpansionHints(uint32_t& bucket_count,
+                                           uint32_t& edge_label_reservation) const {
+  bucket_count = 20000;
+  edge_label_reservation = 1000000; // bounded expansion; far below isochrone default
+}
+
+// Prune purely on path distance (round trip cares about metres, not seconds).
+ExpansionRecommendation RoundTripExpansion::ShouldExpand(GraphReader&,
+                                                         const EdgeLabel& pred,
+                                                         const ExpansionType) {
+  uint32_t dist = pred.predecessor() == kInvalidLabel
+                      ? 0
+                      : bdedgelabels_[pred.predecessor()].path_distance();
+  return dist > static_cast<uint32_t>(max_meters_) ? ExpansionRecommendation::prune_expansion
+                                                   : ExpansionRecommendation::continue_expansion;
+}
+
+std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
+                                                    GraphReader& reader,
+                                                    const mode_costing_t& mode_costing,
+                                                    const sif::TravelMode mode,
+                                                    double target_distance_m) {
+  const double target_half = target_distance_m * 0.5;
+  max_meters_ = static_cast<float>(target_half * 1.2);
+
+  // Run the forward expansion (fills bdedgelabels_). Dijkstras::Expand dispatches
+  // to Compute<ExpansionType::forward> using api.options().locations() as origins.
+  Dijkstras::Expand(ExpansionType::forward, api, reader, mode_costing, mode);
+
+  // Start point for bearing computation.
+  const auto& start_ll_pb = api.options().locations(0).ll();
+  const PointLL start_ll{start_ll_pb.lng(), start_ll_pb.lat()};
+
+  const uint32_t lo = static_cast<uint32_t>(target_half * (1.0f - kDistanceBand));
+  const uint32_t hi = static_cast<uint32_t>(target_half * (1.0f + kDistanceBand));
+
+  std::vector<Turnaround> out;
+  for (uint32_t i = 0; i < bdedgelabels_.size(); ++i) {
+    const uint32_t pd = bdedgelabels_[i].path_distance();
+    if (pd < lo || pd > hi)
+      continue;
+
+    // Post-hoc curviness-per-km: walk the predecessor chain summing curvature*len.
+    double turn_sum = 0.0, len_sum = 0.0;
+    PointLL node_ll = start_ll;
+    bool got_node = false;
+    for (uint32_t l = i; l != kInvalidLabel; l = bdedgelabels_[l].predecessor()) {
+      const GraphId eid = bdedgelabels_[l].edgeid();
+      graph_tile_ptr tile = reader.GetGraphTile(eid);
+      if (!tile)
+        continue;
+      const DirectedEdge* de = tile->directededge(eid);
+      turn_sum += static_cast<double>(de->curvature()) * de->length();
+      len_sum += de->length();
+      if (!got_node) { // the turnaround node = end node of its leading edge
+        node_ll = tile->get_node_ll(de->endnode());
+        got_node = true;
+      }
+    }
+    if (len_sum <= 0.0)
+      continue;
+
+    // Reject turnarounds whose node sits near the start (there-and-back / tiny loop).
+    if (static_cast<double>(start_ll.Distance(node_ll)) < target_half * kMinStraightFraction)
+      continue;
+
+    Turnaround t;
+    t.label_index = i;
+    t.path_distance = pd;
+    t.bearing_deg = static_cast<float>(start_ll.Heading(node_ll)); // 0..360
+    // curvature() is 0..15; normalise to 0..1 per km-equivalent for ranking only.
+    t.curviness_per_km = static_cast<float>(turn_sum / len_sum / 15.0);
+    out.push_back(t);
+  }
+  return out;
+}
+
+} // namespace thor
+} // namespace valhalla
