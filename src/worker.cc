@@ -1304,6 +1304,15 @@ void from_json(rapidjson::Document& doc, Options::Action action, Api& api) {
   if (options.action() != Options::trace_attributes && options.locations_size() > 2)
     options.set_alternates(0);
 
+  // ADR-0033 native round-trip: parse the optional /roundtrip sub-message.
+  if (auto rt = rapidjson::get_child_optional(doc, "/roundtrip")) {
+    auto* pb = options.mutable_roundtrip();
+    if (auto td = rapidjson::get_optional<double>(*rt, "/target_distance"))
+      pb->set_target_distance(*td);
+    if (auto nc = rapidjson::get_optional<unsigned int>(*rt, "/num_candidates"))
+      pb->set_num_candidates(*nc);
+  }
+
   // whether to return guidance_views, default false
   options.set_guidance_views(rapidjson::get<bool>(doc, "/guidance_views", options.guidance_views()));
 
