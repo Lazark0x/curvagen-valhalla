@@ -5,6 +5,7 @@
 #include "baldr/rapidjson_utils.h"
 #include "baldr/tilehierarchy.h"
 #include "midgard/logging.h"
+#include "midgard/polyline2.h"
 #include "mjolnir/bssbuilder.h"
 #include "mjolnir/elevationbuilder.h"
 #include "mjolnir/graphbuilder.h"
@@ -461,47 +462,51 @@ std::string remove_double_quotes(const std::string& s) {
 }
 
 /**
- * Compute a curvature metric given an edge shape. The final value is from 0 to 15 it is computed by
- * taking each pair of 3 points in the shape and finding the radius of the circle for which all 3
- * points lie on it. The larger the radius the less curvy a set of 3 points is. The function is not
- * robust to the ordering of the points which means some pathological cases can seem straight but
- * actually be curvy however this is uncommon in real data sets. Each radius of 3 consecutive points
- * is measured and capped at a maximum value, the radii are averaged together and a final score
- * between 0 and 15 is stored.
+ * Compute a curvature metric (turning density) given an edge shape. The shape is first
+ * Douglas-Peucker simplified (~5 m) to remove OSM mapping density / GPS jitter, then the
+ * total absolute heading change (the integral of curvature) is divided by edge length to
+ * get turning per km, mapped to the 4-bit 0..15 bucket. Unlike the old averaged-radius
+ * metric this is sampling-invariant: the same road yields the same bucket regardless of
+ * how densely its shape is sampled.
  *
  * @param shape   the shape whose curviness we want to measure
- * @return value between 0 and 15 representing the average curviness of the input shape. lower
- *         values indicate less curvy shapes and higher values indicate curvier shapes
+ * @return value between 0 and 15. 0 = straight, 15 = maximally twisty (switchback-dense).
  */
 uint32_t compute_curvature(const std::vector<PointLL>& shape) {
-  // Edges with just 2 shape points have no curvature.
-  // TODO - perhaps a post-process to "average" curvature along adjacent edges
-  // and smooth curvature on connected edges may be desirable?
-  if (shape.size() == 2) {
+  if (shape.size() < 3) {
     return 0;
   }
-
-  // Iterate through sets of shape vertices and compute a radius of curvature.
-  // Apply a score to each section.
-  uint32_t n = 0;
-  float total_score = 0.0f;
-  auto p1 = shape.begin();
-  auto p2 = p1;
-  p2++;
-  auto p3 = p2;
-  p3++;
-  for (; p3 != shape.end(); ++p1, ++p2, ++p3) {
-    float radius = p1->Curvature(*p2, *p3);
-    if (!std::isnan(radius)) {
-      // Compute a score and cap it at 25 (that way one sharp turn doesn't
-      // impact the total edge more than it should)
-      float score = (radius > 1000.0f) ? 0.0f : 1500.0f / radius;
-      total_score += (score > 25.0f) ? 25.0f : score;
-      n++;
-    }
+  // Denoise: Douglas-Peucker simplify (~5 m) so OSM mapping density / GPS jitter
+  // does not fake curviness. This makes the metric sampling-invariant.
+  midgard::Polyline2<PointLL> pl(shape);
+  pl.Generalize(5.0f);
+  const auto& pts = pl.pts();
+  if (pts.size() < 3) {
+    return 0;
   }
-  float average_score = (n == 0) ? 0.0f : total_score / n;
-  return average_score > 15.0f ? 15 : static_cast<uint32_t>(average_score);
+  // Total absolute heading change (degrees) = integral of curvature along the edge.
+  float total_turn_deg = 0.0f;
+  for (size_t i = 1; i + 1 < pts.size(); ++i) {
+    float d = std::fabs(pts[i].Heading(pts[i + 1]) - pts[i - 1].Heading(pts[i]));
+    if (d > 180.0f) {
+      d = 360.0f - d;
+    }
+    total_turn_deg += d;
+  }
+  float length_m = 0.0f;
+  for (size_t i = 1; i < pts.size(); ++i) {
+    length_m += pts[i - 1].Distance(pts[i]);
+  }
+  if (length_m < 1.0f) {
+    return 0;
+  }
+  // Turning density (degrees per km), mapped to the 4-bit 0..15 bucket.
+  // kFullyCurvyDegPerKm = turning/km that maps to the maximum bucket. Calibrated
+  // against the Serbia tile distribution in Task 5; start at 600 (switchback-dense).
+  constexpr float kFullyCurvyDegPerKm = 600.0f;
+  float deg_per_km = (total_turn_deg / length_m) * 1000.0f;
+  float bucket = (deg_per_km / kFullyCurvyDegPerKm) * 15.0f;
+  return bucket >= 15.0f ? 15u : static_cast<uint32_t>(bucket + 0.5f);
 }
 
 // Do the 2 shape vectors match (either direction).
