@@ -364,6 +364,9 @@ message Costing {
     oneof has_prefer_curvature {
       float prefer_curvature = 98;
     }
+    oneof has_reuse_penalty {
+      float reuse_penalty = 98;
+    }
   }
 
   oneof has_options {
