@@ -1068,20 +1068,25 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
 
   const uint32_t buckets = want;
   const float sector = 360.0f / static_cast<float>(buckets);
-  const float offset = static_cast<float>(seed % 360u);
-  std::vector<int> best(buckets, -1);
+  std::vector<std::vector<uint32_t>> bucketed(buckets);
   for (uint32_t i : uniq) {
-    float rb = cands[i].bearing_deg + offset;
-    if (rb >= 360.0f)
-      rb -= 360.0f;
-    uint32_t b = std::min(buckets - 1, static_cast<uint32_t>(rb / sector));
-    if (best[b] < 0 || cands[i].curviness_per_km > cands[best[b]].curviness_per_km)
-      best[b] = static_cast<int>(i);
+    uint32_t b = std::min(buckets - 1, static_cast<uint32_t>(cands[i].bearing_deg / sector));
+    bucketed[b].push_back(i);
   }
+  // Per bearing sector, pick a seed-varied turnaround among the top-M curviest. seed=fixed
+  // is reproducible; a fresh seed (Shuffle) rotates the pick to a different curvy loop.
+  constexpr uint32_t kShuffleTopM = 8;
   std::vector<uint32_t> chosen;
-  for (int b : best)
-    if (b >= 0)
-      chosen.push_back(static_cast<uint32_t>(b));
+  for (uint32_t b = 0; b < buckets; ++b) {
+    auto& bk = bucketed[b];
+    if (bk.empty())
+      continue;
+    std::sort(bk.begin(), bk.end(), [&](uint32_t a, uint32_t c) {
+      return cands[a].curviness_per_km > cands[c].curviness_per_km;
+    });
+    const uint32_t topm = std::min<uint32_t>(kShuffleTopM, static_cast<uint32_t>(bk.size()));
+    chosen.push_back(bk[(seed + b) % topm]);
+  }
   // Backfill from the remaining unique-node turnarounds, best curviness first.
   if (chosen.size() < want) {
     std::vector<uint32_t> rest;
@@ -1135,36 +1140,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::vector<PathInfo> ret = route_return(cands[ci].label_index, turn);
     if (ret.empty() || fwd.empty())
       continue;
-
-    // One-shot distance correction: re-pick a turnaround whose forward distance ~=
-    // target - return_length from the same tree (free), route its return once, keep closer.
-    const double ret_m = ret.back().path_distance;
-    const double want_fwd = target - ret_m;
-    int alt = -1;
-    uint32_t bestdiff = std::numeric_limits<uint32_t>::max();
-    for (uint32_t k = 0; k < cands.size(); ++k) {
-      const uint32_t d = static_cast<uint32_t>(
-          std::abs(static_cast<int>(cands[k].path_distance) - static_cast<int>(want_fwd)));
-      if (d < bestdiff) {
-        bestdiff = d;
-        alt = static_cast<int>(k);
-      }
-    }
-    if (alt >= 0 && static_cast<uint32_t>(alt) != ci) {
-      valhalla::Location turn2 = correlate_node(node_for(static_cast<uint32_t>(alt)), *reader);
-      auto fwd2 = ForwardPath(expander, cands[alt].label_index);
-      auto ret2 = route_return(cands[alt].label_index, turn2);
-      if (!ret2.empty() && !fwd2.empty()) {
-        const double tot1 = fwd.back().path_distance + ret_m;
-        const double tot2 = fwd2.back().path_distance + ret2.back().path_distance;
-        if (std::fabs(tot2 - target) < std::fabs(tot1 - target)) {
-          fwd = std::move(fwd2);
-          ret = std::move(ret2);
-          turn = std::move(turn2);
-        }
-      }
-    }
-
+    // Distance comes from the harvest band (turnaround at target/2 ±18% => loop ~target ±18%);
+    // no global re-pick correction, which would converge distinct candidates onto one loop.
     loops.push_back(
         {std::move(fwd), std::move(ret), std::move(turn), cands[ci].curviness_per_km});
   }
