@@ -72,8 +72,8 @@ constexpr float kHighwayFactor[] = {
     0.0f, // Primary
     0.0f, // Secondary
     0.0f, // Tertiary
-    0.0f, // Unclassified
-    0.0f, // Residential
+    0.5f, // Unclassified (ADR-0032: demote urban-grid wandering, was 0.0)
+    0.5f, // Residential (ADR-0032: demote urban-grid wandering, was 0.0)
     0.0f  // Service, other
 };
 
