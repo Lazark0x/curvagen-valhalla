@@ -58,6 +58,9 @@ constexpr ranged_default_t<float> kPreferCurvatureRange{0.f, 0.0f, 1.0f};
 constexpr ranged_default_t<float> kReusePenaltyRange{0.f, 0.0f, 1.0f};
 // reuse_penalty 1.0 -> a re-ridden edge costs (1 + kReuseStrength)x its time.
 constexpr float kReuseStrength = 4.0f;
+constexpr ranged_default_t<float> kCurvinessContinuityRange{0.f, 0.0f, 1.0f};
+constexpr uint32_t kCurvyBucketThreshold = 9;   // curvature >= this counts as "curvy"
+constexpr float kContinuityBreakPenalty = 8.0f; // seconds added when leaving a curvy road
 constexpr ranged_default_t<uint32_t> kMotorcycleSpeedRange{10, baldr::kMaxAssumedSpeed,
                                                            baldr::kMaxSpeedKph};
 
@@ -318,6 +321,7 @@ public:
   float surface_factor_; // How much the surface factors are applied when using trails
   float highway_factor_; // Factor applied when road is a motorway or trunk
   float curvature_factor_; // Curvature preference scaling (0 = off, 2 = max)
+  float continuity_factor_ = 0.0f; // 0 = off; scales the leave-curvy penalty
 };
 
 // Constructor
@@ -377,6 +381,9 @@ MotorcycleCost::MotorcycleCost(const Costing& costing)
 
   // ADR-0031 edge-reuse leash: map [0,1] reuse_penalty to a per-edge cost multiplier.
   reuse_factor_ = 1.0f + costing_options.reuse_penalty() * kReuseStrength;
+
+  // ADR-0032 sustained curviness scaling (0 = off).
+  continuity_factor_ = costing_options.curviness_continuity();
 }
 
 // Destructor
@@ -490,7 +497,7 @@ Cost MotorcycleCost::TransitionCost(
     const baldr::NodeInfo* node,
     const EdgeLabel& pred,
     const graph_tile_ptr& /*tile*/,
-    const std::function<LimitedGraphReader()>& /*reader_getter*/) const {
+    const std::function<LimitedGraphReader()>& reader_getter) const {
   // Get the transition cost for country crossing, ferry, gate, toll booth,
   // destination only, alley, maneuver penalty
   uint32_t idx = pred.opp_local_idx();
@@ -542,6 +549,18 @@ Cost MotorcycleCost::TransitionCost(
       seconds *= kTransDensityFactor[node->density()];
     }
     c.cost += seconds;
+  }
+  // ADR-0032 sustained curviness: discourage leaving a curvy road for a straight one,
+  // so the router strings together continuous twisties instead of scattered bends.
+  if (continuity_factor_ > 0.0f) {
+    auto reader = reader_getter();
+    const graph_tile_ptr pred_tile = reader.GetGraphTile(pred.edgeid());
+    const baldr::DirectedEdge* pred_edge =
+        pred_tile ? pred_tile->directededge(pred.edgeid()) : nullptr;
+    if (pred_edge && pred_edge->curvature() >= kCurvyBucketThreshold &&
+        edge->curvature() < kCurvyBucketThreshold) {
+      c.cost += continuity_factor_ * kContinuityBreakPenalty;
+    }
   }
   return c;
 }
@@ -639,6 +658,8 @@ void ParseMotorcycleCostOptions(const rapidjson::Document& doc,
   JSON_PBF_RANGED_DEFAULT(co, kPreferCurvatureRange, json, "/prefer_curvature", prefer_curvature,
                           warnings);
   JSON_PBF_RANGED_DEFAULT(co, kReusePenaltyRange, json, "/reuse_penalty", reuse_penalty, warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kCurvinessContinuityRange, json, "/curviness_continuity",
+                          curviness_continuity, warnings);
 }
 
 cost_ptr_t CreateMotorcycleCost(const Costing& costing_options) {
