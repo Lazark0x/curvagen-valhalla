@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <unordered_map>
 
 using namespace valhalla;
 using namespace valhalla::midgard;
@@ -1060,12 +1061,32 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (cands.empty())
     throw valhalla_exception_t{442}; // no path / no candidates -> 422 to the client
 
-  // 2) Bearing-bucket for diversity: keep best curviness-per-km per sector.
-  const uint32_t buckets = want;
-  std::vector<int> best(buckets, -1);
+  // 2) Dedup turnarounds by node (best curviness per node) so candidates are genuinely
+  //    distinct loops, then bearing-bucket for diversity. The shuffle seed rotates the bucket
+  //    origin, so the same (start,target,curviness) yields a different loop set per seed.
+  const uint32_t seed = options.roundtrip().seed();
+  std::unordered_map<uint64_t, uint32_t> best_by_node;
   for (uint32_t i = 0; i < cands.size(); ++i) {
-    uint32_t b = std::min(buckets - 1,
-                          static_cast<uint32_t>(cands[i].bearing_deg / (360.0f / buckets)));
+    auto it = best_by_node.find(cands[i].node);
+    if (it == best_by_node.end() ||
+        cands[i].curviness_per_km > cands[it->second].curviness_per_km)
+      best_by_node[cands[i].node] = i;
+  }
+  std::vector<uint32_t> uniq;
+  uniq.reserve(best_by_node.size());
+  for (const auto& kv : best_by_node)
+    uniq.push_back(kv.second);
+  std::sort(uniq.begin(), uniq.end()); // deterministic order (unordered_map is not)
+
+  const uint32_t buckets = want;
+  const float sector = 360.0f / static_cast<float>(buckets);
+  const float offset = static_cast<float>(seed % 360u);
+  std::vector<int> best(buckets, -1);
+  for (uint32_t i : uniq) {
+    float rb = cands[i].bearing_deg + offset;
+    if (rb >= 360.0f)
+      rb -= 360.0f;
+    uint32_t b = std::min(buckets - 1, static_cast<uint32_t>(rb / sector));
     if (best[b] < 0 || cands[i].curviness_per_km > cands[best[b]].curviness_per_km)
       best[b] = static_cast<int>(i);
   }
@@ -1073,10 +1094,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   for (int b : best)
     if (b >= 0)
       chosen.push_back(static_cast<uint32_t>(b));
-  // Backfill empty buckets from the global best-curviness remainder.
+  // Backfill from the remaining unique-node turnarounds, best curviness first.
   if (chosen.size() < want) {
     std::vector<uint32_t> rest;
-    for (uint32_t i = 0; i < cands.size(); ++i)
+    for (uint32_t i : uniq)
       if (std::find(chosen.begin(), chosen.end(), i) == chosen.end())
         rest.push_back(i);
     std::sort(rest.begin(), rest.end(), [&](uint32_t a, uint32_t c) {
@@ -1109,8 +1130,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   };
 
   auto node_for = [&](uint32_t cand_index) -> baldr::GraphId {
-    const GraphId ta_edge = expander.labels()[cands[cand_index].label_index].edgeid();
-    return reader->GetGraphTile(ta_edge)->directededge(ta_edge)->endnode();
+    return baldr::GraphId(cands[cand_index].node);
   };
 
   // 3) Build each chosen loop: forward leg from the tree + leashed return, with a one-shot
