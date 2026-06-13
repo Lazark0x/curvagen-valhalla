@@ -530,6 +530,8 @@ void thor_worker_t::path_arrive_by(Api& api, const std::string& costing) {
   const Costing_Options& costing_options =
       options.costings().find(options.costing_type())->second.options();
   valhalla::Trip& trip = *api.mutable_trip();
+  // ADR-0031: start each request with an empty used-edge set.
+  mode_costing[static_cast<uint32_t>(mode)]->clear_used_edges();
   trip.mutable_routes()->Reserve(options.alternates() + 1);
 
   graph_tile_ptr tile = nullptr;
@@ -587,6 +589,19 @@ void thor_worker_t::path_arrive_by(Api& api, const std::string& costing) {
     auto temp_paths = this->get_path(path_algorithm, *origin, *destination, costing, api);
     if (temp_paths.empty())
       return false;
+    // ADR-0031 edge-reuse leash: remember this leg's edges (both directions) so
+    // subsequent legs of this request pay reuse_factor_ to re-ride them.
+    {
+      std::vector<uint64_t> leg_edge_values;
+      leg_edge_values.reserve(temp_paths.front().size() * 2);
+      for (const auto& info : temp_paths.front()) {
+        leg_edge_values.push_back(info.edgeid.value);
+        const baldr::GraphId opp = reader->GetOpposingEdgeId(info.edgeid);
+        if (opp.is_valid())
+          leg_edge_values.push_back(opp.value);
+      }
+      mode_costing[static_cast<uint32_t>(mode)]->mark_edges_used(leg_edge_values);
+    }
     for (auto& temp_path : temp_paths) {
       auto out_tz = reader->GetTimezoneFromEdge(temp_path.back().edgeid, tile);
       auto in_tz = reader->GetTimezoneFromEdge(temp_path.front().edgeid, tile);
@@ -756,6 +771,8 @@ void thor_worker_t::path_depart_at(Api& api, const std::string& costing) {
   const Costing_Options& costing_options =
       options.costings().find(options.costing_type())->second.options();
   valhalla::Trip& trip = *api.mutable_trip();
+  // ADR-0031: start each request with an empty used-edge set.
+  mode_costing[static_cast<uint32_t>(mode)]->clear_used_edges();
   trip.mutable_routes()->Reserve(options.alternates() + 1);
 
   // get the user provided hierarchy limits and store one for each path algorithm
@@ -809,6 +826,19 @@ void thor_worker_t::path_depart_at(Api& api, const std::string& costing) {
     auto temp_paths = this->get_path(path_algorithm, *origin, *destination, costing, api);
     if (temp_paths.empty())
       return false;
+    // ADR-0031 edge-reuse leash: remember this leg's edges (both directions) so
+    // subsequent legs of this request pay reuse_factor_ to re-ride them.
+    {
+      std::vector<uint64_t> leg_edge_values;
+      leg_edge_values.reserve(temp_paths.front().size() * 2);
+      for (const auto& info : temp_paths.front()) {
+        leg_edge_values.push_back(info.edgeid.value);
+        const baldr::GraphId opp = reader->GetOpposingEdgeId(info.edgeid);
+        if (opp.is_valid())
+          leg_edge_values.push_back(opp.value);
+      }
+      mode_costing[static_cast<uint32_t>(mode)]->mark_edges_used(leg_edge_values);
+    }
 
     for (auto& temp_path : temp_paths) {
 
