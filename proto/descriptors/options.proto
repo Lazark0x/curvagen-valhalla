@@ -370,6 +370,9 @@ message Costing {
     oneof has_curviness_continuity {
       float curviness_continuity = 99;
     }
+    oneof has_prefer_elevation {
+      float prefer_elevation = 100;
+    }
   }
 
   oneof has_options {
