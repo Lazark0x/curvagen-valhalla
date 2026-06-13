@@ -25,6 +25,7 @@
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+#include <unordered_set>
 
 // macros aren't great but writing these out for every option is an abomination worse than this macro
 
@@ -1263,14 +1264,32 @@ protected:
    * no custom cost factors were provided for this edge, return 1.
    */
   double EdgeFactor(const baldr::GraphId& edgeid) const {
-    if (linear_cost_edges_.empty() || edgeid == baldr::kInvalidGraphId)
-      return 1.;
-
-    if (auto it = linear_cost_edges_.find(edgeid); it != linear_cost_edges_.end())
-      return it->second.avg_factor;
-
-    return 1.;
+    double factor = 1.;
+    if (!linear_cost_edges_.empty() && edgeid != baldr::kInvalidGraphId) {
+      if (auto it = linear_cost_edges_.find(edgeid); it != linear_cost_edges_.end())
+        factor = it->second.avg_factor;
+    }
+    // ADR-0031 edge-reuse leash: a road already ridden this request costs more.
+    if (reuse_factor_ > 1.0f && edgeid != baldr::kInvalidGraphId &&
+        used_edges_.find(edgeid.value) != used_edges_.end())
+      factor *= reuse_factor_;
+    return factor;
   }
+
+public:
+  /// ADR-0031: remember edges (directed-edge GraphId::value, both directions)
+  /// traversed by committed through-legs of this request. Called by thor between
+  /// legs; read by EdgeFactor during the next leg's search.
+  void mark_edges_used(const std::vector<uint64_t>& edge_values) {
+    used_edges_.insert(edge_values.begin(), edge_values.end());
+  }
+
+  /// ADR-0031: reset the used-edge set at the start of a route request.
+  void clear_used_edges() {
+    used_edges_.clear();
+  }
+
+protected:
 
   /**
    * Calculate `track` costs based on tracks preference.
@@ -1402,6 +1421,10 @@ protected:
   // User specified edges to cost based on user provided factors
   std::unordered_map<baldr::GraphId, custom_cost_t> linear_cost_edges_;
   double min_linear_cost_factor_;
+
+  // ADR-0031 edge-reuse leash state (per request).
+  std::unordered_set<uint64_t> used_edges_;
+  float reuse_factor_ = 1.0f; // 1.0 = off; >1 multiplies the cost of a re-ridden edge
 
   /**
    * Get the base transition costs (and ferry factor) from the costing options.
