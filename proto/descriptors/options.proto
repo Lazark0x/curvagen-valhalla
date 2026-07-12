@@ -401,7 +401,7 @@ message RoundTrip {
     double target_distance = 1;  // Target loop distance in meters (start == end)
   }
   oneof has_num_candidates {
-    uint32 num_candidates = 2;   // Number of loop candidates to return (1..6)
+    uint32 num_candidates = 2;   // Number of loop candidates to return (1..16, server-clamped)
   }
   oneof has_seed {
     uint32 seed = 3;             // Shuffle seed: rotates bearing-diversity buckets so the
