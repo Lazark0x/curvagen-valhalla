@@ -114,6 +114,7 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
     // curvature() is 0..15; normalise to 0..1 per km-equivalent for ranking only.
     t.curviness_per_km = static_cast<float>(turn_sum / len_sum / 15.0);
     t.node = turn_node.value;
+    t.ll = node_ll;
     out.push_back(t);
   }
   return out;

@@ -16,6 +16,7 @@ struct Turnaround {
   float bearing_deg;      // straight-line bearing start -> turnaround node (0..360)
   float curviness_per_km; // post-hoc: sum(curvature*len)/len over the reconstructed path
   uint64_t node;          // turnaround node GraphId value (for dedup + correlation)
+  midgard::PointLL ll;    // turnaround node location (for the min-separation guard)
 };
 
 // One forward Dijkstra expansion from the start under the curvy motorcycle costing,
