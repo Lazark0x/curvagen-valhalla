@@ -1302,7 +1302,10 @@ void from_json(rapidjson::Document& doc, Options::Action action, Api& api) {
     if (auto td = rapidjson::get_optional<double>(*rt, "/target_distance"))
       pb->set_target_distance(*td);
     if (auto nc = rapidjson::get_optional<unsigned int>(*rt, "/num_candidates"))
-      pb->set_num_candidates(*nc);
+      // Server-side clamp (ADR-0036 T9): each candidate pays a return-leg
+      // bidirectional A*, so an unbounded caller value must not be able to
+      // request thousands of them.
+      pb->set_num_candidates(std::min(16u, std::max(1u, *nc)));
     if (auto sd = rapidjson::get_optional<unsigned int>(*rt, "/seed"))
       pb->set_seed(*sd);
   }

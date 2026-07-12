@@ -1073,10 +1073,23 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     uint32_t b = std::min(buckets - 1, static_cast<uint32_t>(cands[i].bearing_deg / sector));
     bucketed[b].push_back(i);
   }
+  // Min-separation guard (ADR-0036 T9): node-dedup cannot see adjacent nodes
+  // on the same road, and the curviness-only backfill floods the single
+  // curviest massif when bearing sectors are empty (border-clipped starts:
+  // 5/12 byte-identical loops measured). Reject any turnaround within
+  // eps straight-line of one already chosen; eps = 0.1 x target/2.
+  const double min_separation_m = 0.1 * (target / 2.0);
+  std::vector<uint32_t> chosen;
+  auto separated = [&](uint32_t i) {
+    for (uint32_t c : chosen)
+      if (static_cast<double>(cands[i].ll.Distance(cands[c].ll)) < min_separation_m)
+        return false;
+    return true;
+  };
+
   // Per bearing sector, pick a seed-varied turnaround among the top-M curviest. seed=fixed
   // is reproducible; a fresh seed (Shuffle) rotates the pick to a different curvy loop.
   constexpr uint32_t kShuffleTopM = 8;
-  std::vector<uint32_t> chosen;
   for (uint32_t b = 0; b < buckets; ++b) {
     auto& bk = bucketed[b];
     if (bk.empty())
@@ -1085,7 +1098,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       return cands[a].curviness_per_km > cands[c].curviness_per_km;
     });
     const uint32_t topm = std::min<uint32_t>(kShuffleTopM, static_cast<uint32_t>(bk.size()));
-    chosen.push_back(bk[(seed + b) % topm]);
+    // Start at the seed-rotated pick; walk the top-M until one clears the
+    // separation guard (a fully-rejected sector is left to the backfill).
+    for (uint32_t off = 0; off < topm; ++off) {
+      const uint32_t pick = bk[(seed + b + off) % topm];
+      if (separated(pick)) {
+        chosen.push_back(pick);
+        break;
+      }
+    }
   }
   // Backfill from the remaining unique-node turnarounds, best curviness first.
   if (chosen.size() < want) {
@@ -1097,7 +1118,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       return cands[a].curviness_per_km > cands[c].curviness_per_km;
     });
     for (uint32_t i = 0; i < rest.size() && chosen.size() < want; ++i)
-      chosen.push_back(rest[i]);
+      if (separated(rest[i]))
+        chosen.push_back(rest[i]);
   }
 
   // Return-leg router: seed the reuse leash with the forward leg's edges (both directions),
