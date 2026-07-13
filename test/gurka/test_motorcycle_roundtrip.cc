@@ -165,3 +165,61 @@ TEST_F(MotorcycleRoundTripCluster, CandidatesAreGeometricallyDistinct) {
   EXPECT_EQ(uniq.size(), paths.size())
       << "duplicate loop geometry — the turnaround separation guard failed";
 }
+
+// A curvy dead-end spur mid-corridor: the expansion legally U-turns at the dead end
+// (the costing allows U-turns at deadend nodes), so the settled tree contains a bounced
+// chain A->B->X->B whose doubled spur curvature outranks every clean candidate:
+//   bounce X->B at 9 km (in band for target 18 km), curviness 0.444
+//   clean  C->D at 9 km, curviness 0.222
+// Without harvest bounce rejection (ADR-0037 turnaround hardening) the bounced chain is
+// harvested and the forward leg ships an out-and-back spike on BX. The D-E-F-A road
+// gives the clean candidate a return leg home.
+class MotorcycleRoundTripBounce : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      A----B-C-D
+      |    |   |
+      |    X   |
+      F--------E
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
+        {"CD", {{"highway", "secondary"}}}, {"BX", {{"highway", "secondary"}}},
+        {"AF", {{"highway", "secondary"}}}, {"FE", {{"highway", "secondary"}}},
+        {"ED", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_bounce");
+
+    // The spur and the far corridor section are the curvy prizes; the bounced chain
+    // rides the spur twice and outranks the clean C->D chain unless rejected.
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "B", "X")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "X", "B")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "C", "D")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "D", "C")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripBounce::map = {};
+
+TEST_F(MotorcycleRoundTripBounce, BouncedChainNotHarvested) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "18000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u);
+  // The bounced chain (curviest, rides the spur twice) must not be served: no loop
+  // may enter the dead-end spur at all.
+  for (const auto& path : paths)
+    for (const auto& edge : path)
+      EXPECT_NE(edge, "BX") << "a harvested chain bounced through the dead-end spur";
+}
