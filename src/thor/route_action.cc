@@ -1170,8 +1170,24 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   std::vector<Loop> loops;
   for (uint32_t ci : chosen) {
     valhalla::Location turn = correlate_node(node_for(ci), *reader);
+    // A turnaround with no auto-accessible outbound edge (one-way sink, e.g. a
+    // one-way clipped at the tileset border) has no possible return leg — and
+    // bidir A* reads correlation.edges(0) unchecked at entry (#44 SIGSEGV).
+    if (turn.correlation().edges().empty())
+      continue;
     std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
-    std::vector<PathInfo> ret = route_return(cands[ci].label_index, turn);
+    std::vector<PathInfo> ret;
+    try {
+      ret = route_return(cands[ci].label_index, turn);
+    } catch (const std::exception& e) {
+      // A return leg that cannot route fails this candidate only — the same
+      // contract as the empty-path skip below. Re-poke the interrupt so a
+      // swallowed client-disconnect/shutdown still aborts the whole request.
+      if (interrupt)
+        (*interrupt)();
+      LOG_WARN("roundtrip: return leg failed, candidate skipped: " + std::string(e.what()));
+      continue;
+    }
     if (ret.empty() || fwd.empty())
       continue;
     // Distance comes from the harvest band (turnaround at target/2 ±18% => loop ~target ±18%);
