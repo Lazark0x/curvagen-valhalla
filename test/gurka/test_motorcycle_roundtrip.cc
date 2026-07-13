@@ -80,6 +80,53 @@ TEST_F(MotorcycleRoundTrip, ClampsExtremeCandidateCounts) {
   EXPECT_GE(gurka::detail::get_paths(zero).size(), 1u) << "0 must clamp to 1";
 }
 
+// A one-way dead-end spur: the expansion rides A->S legally (7 km, in the
+// harvest band at target 14 km), but S has no auto-accessible outbound edge —
+// the only way out is against the one-way. correlate_node() therefore yields a
+// Location with ZERO path edges, and stock bidir A* reads edges(0) unchecked at
+// entry (#44: null Rep* chain -> SIGSEGV, worker death). The sink candidate
+// must fail alone; the rectangle loop must still be served.
+class MotorcycleRoundTripOneWaySink : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      S------A----B
+             |    |
+             C----D
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}},
+        {"BD", {{"highway", "secondary"}}},
+        {"DC", {{"highway", "secondary"}}},
+        {"CA", {{"highway", "secondary"}}},
+        // one-way INTO the dead end: reachable outbound, unroutable back.
+        {"AS", {{"highway", "secondary"}, {"oneway", "yes"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_oneway_sink");
+  }
+};
+gurka::map MotorcycleRoundTripOneWaySink::map = {};
+
+TEST_F(MotorcycleRoundTripOneWaySink, SinkTurnaroundSkippedNotFatal) {
+  // Both in-band turnarounds get chosen (S ~270°, D ~111° — separate sectors):
+  // the sink S must be skipped as a per-candidate failure, not kill the worker.
+  auto result =
+      gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                       {{"/roundtrip/target_distance", "14000"},
+                        {"/roundtrip/num_candidates", "4"},
+                        {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u) << "sink candidate killed the whole round trip";
+
+  // No served loop may contain the spur — its return leg cannot exist.
+  for (const auto& path : paths)
+    for (const auto& edge : path)
+      EXPECT_NE(edge, "AS") << "a loop was built through the one-way sink";
+}
+
 // A long stem into a tight ladder of cells: many in-band turnaround nodes
 // packed ~500 m apart — closer than the min-separation eps (0.1 x target/2 =
 // 700 m at 14 km). Node-dedup keeps them all, bearings collapse into one or
