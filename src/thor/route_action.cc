@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <set>
 #include <unordered_map>
 
 using namespace valhalla;
@@ -1004,7 +1005,16 @@ std::vector<PathInfo> ForwardPath(const RoundTripExpansion& exp, uint32_t label_
 // one PathEdge per edge leaving the node (begin-node, percent_along 0) plus its opposing
 // inbound edge (end-node, percent_along 1) so the location works as both origin and
 // destination of a leg (ADR-0033).
-valhalla::Location correlate_node(const baldr::GraphId& node, baldr::GraphReader& reader) {
+// ADR-0037 turnaround hardening: the opposing edge of the forward leg's arrival edge is
+// dropped from the outbound set, so the return leg cannot open with a U-turn back down
+// the approach road (the seam_uturn spike door — A* origin edges never pass through the
+// costing's Allowed(), so only the correlation itself can close it). The arrival edge is
+// added explicitly as an end-node PathEdge: a one-way arrival's opposing edge fails the
+// access filter, leaving the forward leg's destination edge missing and TripLegBuilder
+// throwing 499 for the WHOLE request — the #53 bank-fill death class.
+valhalla::Location correlate_node(const baldr::GraphId& node,
+                                  baldr::GraphReader& reader,
+                                  const baldr::GraphId& arrival_edge) {
   valhalla::Location loc;
   graph_tile_ptr tile = reader.GetGraphTile(node);
   const baldr::NodeInfo* ni = tile->node(node);
@@ -1026,8 +1036,12 @@ valhalla::Location correlate_node(const baldr::GraphId& node, baldr::GraphReader
     pe->mutable_ll()->set_lat(node_ll.lat());
   };
 
+  const baldr::GraphId uturn_door =
+      arrival_edge.is_valid() ? reader.GetOpposingEdgeId(arrival_edge) : baldr::GraphId{};
   for (uint32_t i = 0; i < ni->edge_count(); ++i) {
     const baldr::GraphId eid(node.tileid(), node.level(), ni->edge_index() + i);
+    if (uturn_door.is_valid() && eid == uturn_door)
+      continue; // no U-turn opening for the return leg
     const DirectedEdge* de = tile->directededge(eid);
     if (de->is_shortcut() || !(de->forwardaccess() & kAutoAccess))
       continue;
@@ -1036,6 +1050,11 @@ valhalla::Location correlate_node(const baldr::GraphId& node, baldr::GraphReader
     if (opp.is_valid())
       add_edge(opp, false); // opposing inbound edge arriving at the node
   }
+  // The forward leg arrives on this edge; TripLegBuilder needs it present to trim the
+  // forward destination. It can never appear in the loop above — its opposing edge is
+  // the skipped U-turn door — so adding it here cannot duplicate.
+  if (arrival_edge.is_valid())
+    add_edge(arrival_edge, false);
   return loc;
 }
 
@@ -1169,11 +1188,18 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   };
   std::vector<Loop> loops;
   for (uint32_t ci : chosen) {
-    valhalla::Location turn = correlate_node(node_for(ci), *reader);
-    // A turnaround with no auto-accessible outbound edge (one-way sink, e.g. a
-    // one-way clipped at the tileset border) has no possible return leg — and
-    // bidir A* reads correlation.edges(0) unchecked at entry (#44 SIGSEGV).
-    if (turn.correlation().edges().empty())
+    // ADR-0037: the forward leg's arrival edge closes the return U-turn door in
+    // correlate_node and guarantees the destination trim edge (#53).
+    const GraphId arrival(expander.labels()[cands[ci].label_index].edgeid());
+    valhalla::Location turn = correlate_node(node_for(ci), *reader, arrival);
+    // The return leg needs at least one NON-U-turn outbound edge: a dead-end tip whose
+    // only exit was the dropped U-turn door is a forced spike, and a one-way sink has
+    // no exit at all — both fail this candidate alone (the #44 contract; bidir A*
+    // must never see an origin without a traversable outbound edge).
+    uint32_t outbound = 0;
+    for (const auto& pe : turn.correlation().edges())
+      outbound += pe.begin_node() ? 1 : 0;
+    if (outbound == 0)
       continue;
     std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
     std::vector<PathInfo> ret;
@@ -1201,6 +1227,26 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // 4) Engine ranks best-first by curviness-per-km (distance gated, reuse leashed).
   std::stable_sort(loops.begin(), loops.end(),
                    [](const Loop& a, const Loop& b) { return a.curviness > b.curviness; });
+
+  // ADR-0037 turnaround hardening side effect: with the U-turn door dropped, adjacent
+  // turnarounds on the same road can converge onto byte-identical loops (both return
+  // legs detour the same block). The T9 separation guard cannot see this — it reasons
+  // about turnaround nodes, not return legs. Identical alternates are worthless to the
+  // rider: serve the best-scored copy only (post-sort, first occurrence wins).
+  {
+    std::set<std::vector<uint64_t>> served;
+    loops.erase(std::remove_if(loops.begin(), loops.end(),
+                               [&served](const Loop& lp) {
+                                 std::vector<uint64_t> sig;
+                                 sig.reserve(lp.fwd.size() + lp.ret.size());
+                                 for (const auto& pi : lp.fwd)
+                                   sig.push_back(pi.edgeid.value);
+                                 for (const auto& pi : lp.ret)
+                                   sig.push_back(pi.edgeid.value);
+                                 return !served.insert(std::move(sig)).second;
+                               }),
+                loops.end());
+  }
 
   // 5) Serialize each loop as a 2-leg TripRoute (start -> turnaround -> start). Pass fresh
   //    Location copies per leg since TripLegBuilder mutates origin/destination.
