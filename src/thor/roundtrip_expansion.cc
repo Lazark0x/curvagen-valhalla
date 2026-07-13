@@ -78,16 +78,28 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
       continue;
 
     // Post-hoc curviness-per-km: walk the predecessor chain summing curvature*len.
+    // The same walk rejects bounced chains (ADR-0037 turnaround hardening): the
+    // costing's own U-turn test (pred.opp_local_idx() == edge.localedgeidx()) admits
+    // U-turns at dead ends, so a chain can legally ride into a spur and bounce back —
+    // and harvesting it bakes the out-and-back stub into the forward leg, a spike no
+    // return leg can undo.
     double turn_sum = 0.0, len_sum = 0.0;
     PointLL node_ll = start_ll;
     GraphId turn_node;
     bool got_node = false;
+    bool bounced = false;
     for (uint32_t l = i; l != kInvalidLabel; l = bdedgelabels_[l].predecessor()) {
       const GraphId eid = bdedgelabels_[l].edgeid();
       graph_tile_ptr tile = reader.GetGraphTile(eid);
       if (!tile)
         continue;
       const DirectedEdge* de = tile->directededge(eid);
+      const uint32_t pred = bdedgelabels_[l].predecessor();
+      if (pred != kInvalidLabel &&
+          bdedgelabels_[pred].opp_local_idx() == de->localedgeidx()) {
+        bounced = true;
+        break;
+      }
       turn_sum += static_cast<double>(de->curvature()) * de->length();
       len_sum += de->length();
       if (!got_node) { // the turnaround node = end node of its leading edge
@@ -100,7 +112,7 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
         }
       }
     }
-    if (len_sum <= 0.0 || !got_node)
+    if (bounced || len_sum <= 0.0 || !got_node)
       continue;
 
     // Reject turnarounds whose node sits near the start (there-and-back / tiny loop).
