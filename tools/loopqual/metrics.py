@@ -28,9 +28,24 @@ modes (the serving polyline is exactly on that grid already).
 
 import math
 
-METRICS_VERSION = "v1.1"  # v1.1: + curviness_geom_clean (Gate v1, wayfinder #49/#50)
+# v1.1: + curviness_geom_clean (Gate v1, wayfinder #49/#50)
+# v1.2: Start-Exemption-aware stem + reuse meters (ADR-0037 §3, curvagen #55).
+#   The first stretch of a ride is often network-forced (dead-end starts, single
+#   access roads) and the engine deliberately allows the loop to close on it
+#   (clean-first, dirty-last-resort). The old meters billed that designed behavior
+#   as defect: a ~1.5 km forced stem in a 20 km loop read 0.15 reuse and ~100%
+#   lollipop BY CONSTRUCTION. v1.2: the stem meter counts only stem beyond the
+#   exemption; the geometric reuse meter discounts reuse inside it, the discount
+#   zone capped at the constant per loop end (no blank check). edge_reuse_way
+#   keeps v1 semantics (informative cross-check, not a gate input).
+METRICS_VERSION = "v1.2"
 
 PARAMS = {
+    # ADR-0037 §3 Start Exemption: path-distance radius around the start inside
+    # which forward-edge reuse is designed behavior. PINNED to the fork's
+    # kStartExemptionMeters (src/thor/route_action.cc, curvagen #56 T2) — change
+    # them together, never one alone.
+    "start_exemption_m": 1500.0,
     # point grid all geometry is snapped to (degrees; ~1.1 m)
     "grid_deg": 1e-5,
     # spike: minimum one-way stub length to count (excludes snap jitter)
@@ -309,12 +324,21 @@ def seam_uturn(loop: Loop) -> bool:
     return 0 < i < len(loop.pts) - 1 and loop.pts[i - 1] == loop.pts[i + 1]
 
 
-def edge_reuse_geom(loop: Loop) -> float:
+def edge_reuse_geom(loop: Loop,
+                    exemption_m: float = PARAMS["start_exemption_m"]) -> float:
     """edge_reuse_geom: undirected segment reuse — fraction of total loop
     length spent on segments whose undirected 1e-5 grid key appears more
     than once (both traversals count; a pure out-and-back = 1.0). Geometric
     analog of the fork's both-direction leash marking and of the retired
-    eval_routes.py edge_reuse."""
+    eval_routes.py edge_reuse.
+
+    v1.2 (ADR-0037 §3): reused segments INSIDE the Start Exemption are
+    designed behavior and do not count. A segment is inside when its
+    midpoint lies within exemption_m of ride start (first traversal of the
+    forced stem) or within exemption_m of ride end (the traversal home) —
+    the discount zone is capped at the constant per loop end, so reuse
+    deeper in the loop is never forgiven (no blank check).
+    """
     from collections import Counter
     keys = []
     for i in range(len(loop.pts) - 1):
@@ -323,7 +347,14 @@ def edge_reuse_geom(loop: Loop) -> float:
     c = Counter(keys)
     if not loop.total_m:
         return 0.0
-    reused = sum(l for k, l in zip(keys, loop.seg_lens) if c[k] > 1)
+    reused = 0.0
+    for i, (k, l) in enumerate(zip(keys, loop.seg_lens)):
+        if c[k] <= 1:
+            continue
+        mid = (loop.cum[i] + loop.cum[i + 1]) / 2.0
+        if mid < exemption_m or mid > loop.total_m - exemption_m:
+            continue  # inside the Start Exemption zone — designed reuse
+        reused += l
     return reused / loop.total_m
 
 
@@ -374,7 +405,10 @@ def corridor_stats(loop: Loop,
     """lollipop_stem_fraction / bulb_count primitive.
 
     stem_out_m: length of the maximal leg0 PREFIX within radius of leg1
-                (unshared gaps <= gap_m tolerated).
+                (unshared gaps <= gap_m tolerated), MINUS the Start
+                Exemption (v1.2 — only stem beyond the exemption counts;
+                stem_back_m likewise). rejoin_return_frac follows the
+                discounted stem_back.
     stem_back_m: same for the leg1 SUFFIX vs leg0.
     stem_frac: (stem_out + stem_back) / total loop length.
     shadow_frac: fraction of leg0 length within radius of leg1 ANYWHERE
@@ -413,6 +447,13 @@ def corridor_stats(loop: Loop,
         if m1[-1] or (len(m1) > 1 and m1[-2])
         else 0.0
     )
+    # v1.2 (ADR-0037 §3): the stem meter counts only stem BEYOND the Start
+    # Exemption — the first exemption_m of each stem is the network-forced,
+    # engine-designed stretch. Discount before the min-stem zeroing so a
+    # just-past-exemption dribble does not read as a lollipop stem.
+    exemption_m = PARAMS["start_exemption_m"]
+    stem_out = max(0.0, stem_out - exemption_m)
+    stem_back = max(0.0, stem_back - exemption_m)
     if stem_out < min_stem_m:
         stem_out = 0.0
     if stem_back < min_stem_m:

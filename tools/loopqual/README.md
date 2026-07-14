@@ -62,6 +62,13 @@ Jobs enumerate cells → origins → distances → seeds, in file order.
 
 ## Metric spec v1
 
+**v1.2 (ADR-0037 §3, curvagen #55):** Start-Exemption-aware meters. `PARAMS["start_exemption_m"] = 1500.0`
+is PINNED to the fork's `kStartExemptionMeters` (`src/thor/route_action.cc`) — change them together.
+The stem meter (`lollipop_stem_fraction` family) counts only stem beyond the exemption; `edge_reuse_geom`
+discounts reused segments whose midpoint lies within the exemption of ride start or ride end (zone capped
+at the constant per loop end — no blank check). `edge_reuse_way` keeps v1 semantics (informative only).
+Gate 8b (c0.8 > c0.5 ordering) is advisory in `gate_v1_proto.py` since v1.2.
+
 `METRICS_VERSION = "v1"` lives in `metrics.py` together with every parameter
 below; any change to a formula, parameter, or input handling bumps the version.
 Every `report.json`/`report.md` carries the version — compare runs only within

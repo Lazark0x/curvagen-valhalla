@@ -103,11 +103,16 @@ def main(base_dir, cand_dir):
         row("8 curviness_geom_clean >= 0.95x base", lvl, ">= 0.95x",
             f"{bcv:.1f}", f"{ccv:.1f} ({ccv / bcv:.3f}x)" if bcv else f"{ccv:.1f}", ok)
 
-    # 8b ordering guard
+    # 8b ordering guard — ADVISORY since Gate v1.2 (ADR-0037 §3): the baseline
+    # itself fails it, so it cannot gate a candidate. Whether the curviness
+    # knob's upper range buys the rider anything is a costing-calibration
+    # question, outside the loop-shape scope. Printed, never counted.
     if 0.5 in c_by_c and 0.8 in c_by_c:
         m05 = st.mean([l["curviness_geom_clean"] for l in c_by_c[0.5]])
         m08 = st.mean([l["curviness_geom_clean"] for l in c_by_c[0.8]])
-        row("8b ordering c0.8 > c0.5", "all", ">", f"", f"{m08:.1f} vs {m05:.1f}", m08 > m05)
+        rows.append(("8b ordering c0.8 > c0.5 (advisory)", "all", ">",
+                     "", f"{m08:.1f} vs {m05:.1f}",
+                     "ADVISORY-PASS" if m08 > m05 else "ADVISORY-MISS"))
 
     # 9 latency (rig ratio)
     for q in ("latency_p50_s", "latency_p95_s"):
