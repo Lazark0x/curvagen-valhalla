@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <numeric>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -1015,6 +1016,20 @@ constexpr float kFlexHiFrac = 1.18f;
 // (the proto-v3f lesson: 32 underfilled cells, dirty served, spikes back).
 constexpr uint32_t kAttemptSlack = 8;
 
+// ADR-0037 §2 Second Via: the Defect Gate's decode adds the loopqual metrics-v1.2 stem
+// check (tools/loopqual/metrics.py, curvagen #55) — corridor-proximity stem, discounted
+// by the Start Exemption. A clean loop whose stem fraction exceeds the lollipop
+// threshold is rebuilt two-lobed: a second via bearing-diverse from the turnaround,
+// opposite half-sector, drawn from the same (widened) candidate band. The ladder keeps
+// the one-via loop whenever the two-lobe build fails — never a no-route over shape.
+constexpr double kSecondViaStemFrac = 0.10;   // = PARAMS["lollipop_stem_frac_threshold"]
+constexpr double kStemCorridorRadiusM = 40.0; // = PARAMS["lollipop_corridor_radius_m"]
+constexpr double kStemGapM = 120.0;           // = PARAMS["lollipop_gap_m"]
+constexpr double kStemMinM = 150.0;           // = PARAMS["lollipop_min_stem_m"]
+// Build-time tunables (ADR §2 pins the principle; these are ours to tune):
+constexpr float kSecondViaSectorDeg = 180.0f; // eligible V2 sector width around bearing+180
+constexpr uint32_t kSecondViaRetries = 2;     // V2 candidates tried before keeping one-via
+
 // ADR-0037 Defect Gate: a built loop carrying an exact-mirror stub >= this at the seam
 // is rejected and its slot refilled (the harness spike meter's own threshold).
 constexpr double kSeamStubRejectM = 30.0;
@@ -1187,6 +1202,138 @@ std::vector<PathInfo> walk_back_trapped_tip(std::vector<PathInfo> fwd,
     ++popped;
   }
   return fwd;
+}
+
+// Decode a leg's edges onto the 1e-5 grid (consecutive duplicates dropped) — the same
+// snap the Defect Gate and the loopqual harness use. Returns false on an unresolvable
+// tile (caller treats the check as inconclusive-clean, like the gate does).
+bool decode_leg_grid(const std::vector<PathInfo>& leg,
+                     baldr::GraphReader& reader,
+                     std::vector<std::pair<int64_t, int64_t>>& pts) {
+  for (const auto& pi : leg) {
+    graph_tile_ptr tile = reader.GetGraphTile(pi.edgeid);
+    if (!tile)
+      return false;
+    const DirectedEdge* de = tile->directededge(pi.edgeid);
+    auto shape = tile->edgeinfo(de).shape();
+    if (!de->forward())
+      std::reverse(shape.begin(), shape.end());
+    for (const auto& p : shape) {
+      std::pair<int64_t, int64_t> k{std::llround(p.lat() * 1e5), std::llround(p.lng() * 1e5)};
+      if (pts.empty() || pts.back() != k)
+        pts.push_back(k);
+    }
+  }
+  return true;
+}
+
+// ADR-0037 §2: the metrics-v1.2 stem check, mirrored from the loopqual harness
+// (corridor_stats in tools/loopqual/metrics.py). stem_out = length of the maximal leg0
+// PREFIX whose points lie within the corridor radius of leg1 (unshared gaps <= kStemGapM
+// tolerated); stem_back = same for the leg1 SUFFIX vs leg0. Each stem is discounted by
+// the Start Exemption (the network-forced first stretch is designed behavior), stems
+// under kStemMinM zero out, and the result is (stem_out + stem_back) / loop length.
+// Distances run in a local equirectangular frame (fine at corridor scale).
+double stem_fraction(const std::vector<PathInfo>& fwd,
+                     const std::vector<PathInfo>& ret,
+                     baldr::GraphReader& reader) {
+  std::vector<std::pair<int64_t, int64_t>> leg0, leg1;
+  if (!decode_leg_grid(fwd, reader, leg0) || !decode_leg_grid(ret, reader, leg1))
+    return 0.0;
+  if (leg0.size() < 2 || leg1.size() < 2)
+    return 0.0;
+
+  const double coslat = std::cos(leg0.front().first * 1e-5 * midgard::kRadPerDeg);
+  const double m_per_unit_lat = 1e-5 * midgard::kMetersPerDegreeLat;
+  const double m_per_unit_lon = m_per_unit_lat * coslat;
+  auto dist_m = [&](const std::pair<int64_t, int64_t>& a, const std::pair<int64_t, int64_t>& b) {
+    const double dy = (a.first - b.first) * m_per_unit_lat;
+    const double dx = (a.second - b.second) * m_per_unit_lon;
+    return std::sqrt(dx * dx + dy * dy);
+  };
+  auto seg_lens = [&](const std::vector<std::pair<int64_t, int64_t>>& leg) {
+    std::vector<double> out;
+    out.reserve(leg.size() - 1);
+    for (size_t i = 0; i + 1 < leg.size(); ++i)
+      out.push_back(dist_m(leg[i], leg[i + 1]));
+    return out;
+  };
+  const std::vector<double> len0 = seg_lens(leg0), len1 = seg_lens(leg1);
+  const double total_m =
+      std::accumulate(len0.begin(), len0.end(), 0.0) + std::accumulate(len1.begin(), len1.end(), 0.0);
+  if (total_m <= 0.0)
+    return 0.0;
+
+  // Cell hash at ~corridor-radius pitch; a point is "shared" when any point of the
+  // other leg sits within the radius (3x3 neighborhood scan, like the harness _grid).
+  const int64_t cell_lat = std::max<int64_t>(1, llround(kStemCorridorRadiusM / m_per_unit_lat));
+  const int64_t cell_lon = std::max<int64_t>(1, llround(kStemCorridorRadiusM / m_per_unit_lon));
+  auto build_hash = [&](const std::vector<std::pair<int64_t, int64_t>>& leg) {
+    std::unordered_map<uint64_t, std::vector<std::pair<int64_t, int64_t>>> g;
+    for (const auto& k : leg)
+      g[static_cast<uint64_t>(k.first / cell_lat) << 32 |
+        (static_cast<uint64_t>(k.second / cell_lon) & 0xffffffffu)]
+          .push_back(k);
+    return g;
+  };
+  auto shared_mask = [&](const std::vector<std::pair<int64_t, int64_t>>& leg_a,
+                         const std::unordered_map<uint64_t, std::vector<std::pair<int64_t, int64_t>>>& g) {
+    std::vector<bool> mask;
+    mask.reserve(leg_a.size());
+    for (const auto& k : leg_a) {
+      bool found = false;
+      const int64_t ci = k.first / cell_lat, cj = k.second / cell_lon;
+      for (int64_t di = -1; di <= 1 && !found; ++di)
+        for (int64_t dj = -1; dj <= 1 && !found; ++dj) {
+          auto it = g.find(static_cast<uint64_t>(ci + di) << 32 |
+                           (static_cast<uint64_t>(cj + dj) & 0xffffffffu));
+          if (it == g.end())
+            continue;
+          for (const auto& o : it->second)
+            if (dist_m(k, o) <= kStemCorridorRadiusM) {
+              found = true;
+              break;
+            }
+        }
+      mask.push_back(found);
+    }
+    return mask;
+  };
+  // Walk while shared, tolerating unshared gaps <= kStemGapM (harness prefix_len).
+  auto prefix_len = [&](const std::vector<bool>& mask, const std::vector<double>& lens) {
+    double length = 0.0, last_shared = 0.0, gap = 0.0;
+    for (size_t i = 0; i < lens.size(); ++i) {
+      if (mask[i + 1]) {
+        length += gap + lens[i];
+        gap = 0.0;
+        last_shared = length;
+      } else {
+        gap += lens[i];
+        if (gap > kStemGapM)
+          break;
+      }
+    }
+    return last_shared;
+  };
+
+  const auto g1 = build_hash(leg1);
+  const auto m0 = shared_mask(leg0, g1);
+  double stem_out =
+      (m0[0] || (m0.size() > 1 && m0[1])) ? prefix_len(m0, len0) : 0.0;
+  const auto g0 = build_hash(leg0);
+  auto m1 = shared_mask(leg1, g0);
+  std::reverse(m1.begin(), m1.end());
+  std::vector<double> len1r(len1.rbegin(), len1.rend());
+  double stem_back = (m1[0] || (m1.size() > 1 && m1[1])) ? prefix_len(m1, len1r) : 0.0;
+
+  // v1.2: only stem beyond the Start Exemption counts; sub-minimum stems zero out.
+  stem_out = std::max(0.0, stem_out - kStartExemptionMeters);
+  stem_back = std::max(0.0, stem_back - kStartExemptionMeters);
+  if (stem_out < kStemMinM)
+    stem_out = 0.0;
+  if (stem_back < kStemMinM)
+    stem_back = 0.0;
+  return (stem_out + stem_back) / total_m;
 }
 
 // ADR-0037 Defect Gate detector: decode both legs onto the 1e-5 grid and measure the
@@ -1408,6 +1555,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // Request-level avoids (loki avoid_locations) survive the per-candidate swaps.
   const auto avoid_baseline = cost->user_avoid_edges();
   uint32_t fallback_count = 0;
+  uint32_t second_via_count = 0;
+  double secondvia_ms = 0;
   // Generalized corridor-aware leg router (ADR-0037): routes from -> to with the given
   // corridor hard-excluded beyond the Start Exemption, soft-leashed everywhere, and its
   // junction edges progress-grade-penalized. The round-trip return is corridor=forward
@@ -1627,16 +1776,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     }
     if (ret.empty())
       continue;
-    {
-      std::vector<uint64_t> sig;
-      sig.reserve(fwd.size() + ret.size());
-      for (const auto& pi : fwd)
-        sig.push_back(pi.edgeid.value);
-      for (const auto& pi : ret)
-        sig.push_back(pi.edgeid.value);
-      if (!served_sigs.insert(std::move(sig)).second)
-        continue; // identical to an already-built loop — refill from the queue
-    }
     // Build-time Defect Gate (ADR-0037): a loop whose seam carries an exact-mirror
     // stub >= 30 m is not bank-worthy — stash it and refill the slot from the queue;
     // it is served only if the cell would otherwise return no route (clean-first,
@@ -1656,6 +1795,125 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                                cands[ci].curviness_per_km, fell_back});
       continue;
     }
+
+    // ADR-0037 §2 Second Via: the gate's decode adds the metrics-v1.2 stem check; a
+    // clean loop over the lollipop threshold is rebuilt two-lobed — same forward leg,
+    // return re-routed through a bearing-diverse second via from the opposite
+    // half-sector of the (widened) candidate band, spliced back into the single
+    // return leg the 2-leg serialization contract expects. The ladder keeps the
+    // one-via loop whenever the rebuild fails: never a no-route over shape.
+    {
+      const auto t_sv = ledger_clock::now();
+      if (stem_fraction(fwd, ret, *reader) > kSecondViaStemFrac) {
+        widen_pool();
+        std::vector<uint32_t> v2s;
+        for (uint32_t i = 0; i < static_cast<uint32_t>(cands.size()); ++i) {
+          if (cands[i].node == cands[ci].node)
+            continue;
+          // Angular separation from the turnaround's bearing (0..180); eligible when
+          // it lands inside the opposite half-sector: within kSecondViaSectorDeg/2 of
+          // dead-opposite, i.e. separation >= 180 - width/2.
+          const float sep = std::fabs(
+              std::fmod(cands[i].bearing_deg - cands[ci].bearing_deg + 540.0f, 360.0f) - 180.0f);
+          if (sep >= 180.0f - kSecondViaSectorDeg / 2.0f)
+            v2s.push_back(i);
+        }
+        std::sort(v2s.begin(), v2s.end(), [&](uint32_t a, uint32_t c) {
+          return cands[a].curviness_per_km > cands[c].curviness_per_km;
+        });
+        uint32_t tried = 0;
+        for (uint32_t vi : v2s) {
+          if (tried++ >= kSecondViaRetries)
+            break;
+          // Leg B: turnaround -> V2, the forward corridor excluded/leashed. V2 is a
+          // plain destination here (no arrival edge yet, so no U-turn door to drop).
+          valhalla::Location v2 = correlate_node(GraphId(cands[vi].node), *reader, GraphId{});
+          // A sink V2 (no accessible edges) would hand bidir A* an empty destination
+          // correlation — the #44 crash class, destination side.
+          if (v2.correlation().edges().empty())
+            continue;
+          bool fb_b = false;
+          std::vector<PathInfo> leg_b;
+          try {
+            leg_b = route_leg(fwd, turn, v2, fb_b);
+          } catch (const std::exception&) {
+            if (interrupt)
+              (*interrupt)();
+            continue;
+          }
+          if (leg_b.empty())
+            continue;
+          // V2 becomes a turnaround for leg C: same origin hardening as any other.
+          const GraphId arrival2 = leg_b.back().edgeid;
+          graph_tile_ptr a2_tile = reader->GetGraphTile(arrival2);
+          if (!a2_tile)
+            continue;
+          valhalla::Location turn2 =
+              correlate_node(a2_tile->directededge(arrival2)->endnode(), *reader, arrival2);
+          uint32_t outbound2 = 0;
+          for (const auto& pe : turn2.correlation().edges())
+            outbound2 += pe.begin_node() ? 1 : 0;
+          if (outbound2 == 0)
+            continue;
+          // Leg C corridor = forward + leg B, path distances rebased to ride order so
+          // the Start Exemption keeps meaning "near the ride's start".
+          std::vector<PathInfo> corridor = fwd;
+          corridor.reserve(fwd.size() + leg_b.size());
+          const float fwd_total = fwd.back().path_distance;
+          for (PathInfo pi : leg_b) {
+            pi.path_distance += fwd_total;
+            corridor.push_back(pi);
+          }
+          bool fb_c = false;
+          std::vector<PathInfo> leg_c;
+          try {
+            leg_c = route_leg(corridor, turn2, start, fb_c);
+          } catch (const std::exception&) {
+            if (interrupt)
+              (*interrupt)();
+            continue;
+          }
+          if (leg_c.empty())
+            continue;
+          // Splice B+C into one return leg (response seam stays the turnaround).
+          std::vector<PathInfo> ret2 = leg_b;
+          ret2.reserve(leg_b.size() + leg_c.size());
+          const sif::Cost b_cost = leg_b.back().elapsed_cost;
+          const float b_dist = leg_b.back().path_distance;
+          for (PathInfo pi : leg_c) {
+            pi.elapsed_cost += b_cost;
+            pi.path_distance += b_dist;
+            ret2.push_back(pi);
+          }
+          // The rebuild must beat the gate at BOTH junctions — full decodes; the
+          // seam-window reasoning does not extend to a mid-return via — and clear
+          // the stem check it was triggered by.
+          if (seam_stub_m(fwd, ret2, *reader, 0.0) >= kSeamStubRejectM)
+            continue;
+          if (seam_stub_m(corridor, leg_c, *reader, 0.0) >= kSeamStubRejectM)
+            continue;
+          if (stem_fraction(fwd, ret2, *reader) > kSecondViaStemFrac)
+            continue;
+          ret = std::move(ret2);
+          fell_back = fb_b || fb_c;
+          ++second_via_count;
+          break;
+        }
+        // Ladder exhausted => the one-via loop stands.
+      }
+      secondvia_ms += ms_since(t_sv);
+    }
+
+    {
+      std::vector<uint64_t> sig;
+      sig.reserve(fwd.size() + ret.size());
+      for (const auto& pi : fwd)
+        sig.push_back(pi.edgeid.value);
+      for (const auto& pi : ret)
+        sig.push_back(pi.edgeid.value);
+      if (!served_sigs.insert(std::move(sig)).second)
+        continue; // identical to an already-built loop — refill from the queue
+    }
     // Distance comes from the harvest band (turnaround at target/2 ±18% => loop ~target ±18%);
     // no global re-pick correction, which would converge distinct candidates onto one loop.
     built_lls.push_back(cands[ci].ll);
@@ -1665,6 +1923,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (fallback_count > 0)
     LOG_INFO("roundtrip: " + std::to_string(fallback_count) +
              " candidate(s) fell back to the soft leash (Fallback Loop)");
+  if (second_via_count > 0)
+    LOG_INFO("roundtrip: Second Via rebuilt " + std::to_string(second_via_count) +
+             " over-stem loop(s) two-lobed");
   if (!dirty_loops.empty())
     LOG_INFO("roundtrip: Defect Gate rejected " + std::to_string(dirty_loops.size()) +
              " seam-stub loop(s) at build time");
@@ -1710,8 +1971,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     LOG_INFO("roundtrip timing: harvest=" + ms(harvest_ms) + " scan=" + ms(scan_ms) +
              " walkback=" + ms(walkback_ms) + " rejoin=" + ms(rejoin_ms) +
              " astar=" + ms(astar_ms) + " astar_fb=" + ms(astar_fb_ms) +
-             " seam=" + ms(seam_ms) + " build=" + ms(build_ms) +
+             " seam=" + ms(seam_ms) + " secondvia=" + ms(secondvia_ms) +
+             " build=" + ms(build_ms) +
              " (ms) attempts=" + std::to_string(attempts) +
+             " second_vias=" + std::to_string(second_via_count) +
              " fallbacks=" + std::to_string(fallback_count) +
              " loops=" + std::to_string(loops.size()) +
              " dirty=" + std::to_string(dirty_loops.size()) + (widened ? " widened" : ""));
