@@ -716,6 +716,120 @@ TEST_F(MotorcycleRoundTripWalkBack, StubTipWalksBackToTheJunction) {
   EXPECT_EQ(uniq.size(), paths[0].size()) << "an edge was ridden twice (bounce served)";
 }
 
+// A forced-stem lollipop with a rescue: the east bulb hangs off a 2.2 km stem (beyond
+// the 1.5 km Start Exemption), so the one-via loop reads stem_fraction 0.14 — over the
+// Second Via trigger. A west ring offers a bearing-diverse V2 in the flex band. The
+// ADR-0037 §2 two-lobe rebuild must reroute the return through the west lobe, diluting
+// the stem below threshold; the response stays 2-leg (seam = the east turnaround).
+class MotorcycleRoundTripSecondVia : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+         Q          R          C      D
+
+
+
+
+
+
+
+         P          A          B      E
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
+        {"CD", {{"highway", "secondary"}}}, {"DE", {{"highway", "secondary"}}},
+        {"EB", {{"highway", "secondary"}}}, {"AP", {{"highway", "secondary"}}},
+        {"PQ", {{"highway", "secondary"}}}, {"QR", {{"highway", "secondary"}}},
+        {"RA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 200);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_secondvia");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "C", "D")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "D", "C")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripSecondVia::map = {};
+
+TEST_F(MotorcycleRoundTripSecondVia, OverStemLoopRebuiltTwoLobed) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "10000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u);
+  ASSERT_EQ(result.trip().routes(0).legs_size(), 2) << "two-lobe must keep the 2-leg contract";
+  bool east_bulb = false, west_lobe = false;
+  for (const auto& edge : paths[0]) {
+    east_bulb |= (edge == "CD");
+    west_lobe |= (edge == "PQ");
+  }
+  EXPECT_TRUE(east_bulb) << "the original curvy lobe was lost";
+  EXPECT_TRUE(west_lobe) << "over-stem loop was served without the second lobe";
+}
+
+// The same forced-stem lollipop with NO west network: the trigger fires, the eligible
+// V2 pool is empty, and the ladder must keep the one-via loop — never a no-route
+// over shape (ADR-0037 §2).
+class MotorcycleRoundTripSecondViaLadder : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+                    C      D
+
+
+
+
+
+
+
+         A          B      E
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
+        {"CD", {{"highway", "secondary"}}}, {"DE", {{"highway", "secondary"}}},
+        {"EB", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 200);
+    map = gurka::buildtiles(layout, ways, {}, {},
+                            "test/data/motorcycle_roundtrip_secondvia_ladder");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "C", "D")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "D", "C")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripSecondViaLadder::map = {};
+
+TEST_F(MotorcycleRoundTripSecondViaLadder, NoViaCandidateKeepsTheOneViaLoop) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "10000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u) << "an over-stem loop with no rescue must still serve";
+  std::map<std::string, int> count;
+  for (const auto& edge : paths[0])
+    ++count[edge];
+  EXPECT_EQ(count["AB"], 2) << "expected the one-via stem loop kept as-is";
+  EXPECT_EQ(count["CD"], 1);
+}
+
 // Progress-graded rejoin (ADR-0037): the return leg should not shadow the forward
 // corridor home on the cheapest crossing. From turnaround T two fresh returns exist:
 //   R1 crosses corridor node M near the start (edges QM + MX, 22.8 km — shortest)
