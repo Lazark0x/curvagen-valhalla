@@ -145,6 +145,12 @@ protected:
   double min_linear_cost_factor;
   uint64_t max_linear_cost_edges;
 
+  // ADR-0037 §4: per-request round-trip stage-timing ledger (harvest/scan/walk-back/
+  // rejoin/A*/seam/build). Config "thor.roundtrip_stage_timing"; default off. It found
+  // the decisive ScanBand regression (#54) and is the only stage-cost visibility on
+  // the box, so it stays wired rather than compiled out.
+  bool roundtrip_stage_timing;
+
 private:
   std::string service_name() const override {
     return "thor";
