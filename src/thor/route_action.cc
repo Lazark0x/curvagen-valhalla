@@ -1008,6 +1008,15 @@ constexpr float kRejoinGradeShare = 0.5f;
 constexpr float kFlexLoFrac = 0.55f;
 constexpr float kFlexHiFrac = 1.18f;
 
+// ADR-0037 Defect Gate: a built loop carrying an exact-mirror stub >= this at the seam
+// is rejected and its slot refilled (the harness spike meter's own threshold).
+constexpr double kSeamStubRejectM = 30.0;
+// Seam-window decode radius: a hard-exclude success cannot retrace the forward leg at
+// the seam (those edges were barred from its return search), so decoding ~this much of
+// each leg around the seam is a FINAL verdict for it. Fallback Loops never use the
+// window — see the gate below.
+constexpr double kSeamWindowM = 1500.0;
+
 // Reconstruct the forward PathInfo (start -> turnaround) from the expansion label tree.
 // Walk the predecessor chain (mirror centroid path reconstruction), then reverse to
 // start->turnaround order. Each leg's costs are cumulative from the start, which is the
@@ -1093,6 +1102,84 @@ valhalla::Location correlate_node(const baldr::GraphId& node,
   if (arrival_edge.is_valid())
     add_edge(arrival_edge, false);
   return loc;
+}
+
+// ADR-0037 Defect Gate detector: decode both legs onto the 1e-5 grid and measure the
+// longest exact-mirror stub whose interval covers the seam — the cross-leg retrace that
+// survives every forward-side guard (a fallback return riding back down a dead-end
+// stub). window_m > 0 decodes only the last/first ~window_m of each leg around the
+// seam; window_m == 0 decodes both legs whole.
+double seam_stub_m(const std::vector<PathInfo>& fwd,
+                   const std::vector<PathInfo>& ret,
+                   baldr::GraphReader& reader,
+                   double window_m) {
+  auto ddist = [](const std::vector<PathInfo>& leg, size_t i) {
+    return static_cast<double>(leg[i].path_distance - (i ? leg[i - 1].path_distance : 0.f));
+  };
+  size_t fwd_begin = 0;
+  size_t ret_end = ret.size();
+  if (window_m > 0.0) {
+    fwd_begin = fwd.size();
+    double acc = 0.0;
+    while (fwd_begin > 0 && acc < window_m) {
+      --fwd_begin;
+      acc += ddist(fwd, fwd_begin);
+    }
+    ret_end = 0;
+    acc = 0.0;
+    while (ret_end < ret.size() && acc < window_m) {
+      acc += ddist(ret, ret_end);
+      ++ret_end;
+    }
+  }
+  std::vector<std::pair<int64_t, int64_t>> pts;
+  std::vector<double> cum{0.0};
+  size_t seam_idx = 0;
+  auto append_leg = [&](const std::vector<PathInfo>& leg, size_t from, size_t to) -> bool {
+    for (size_t li = from; li < to; ++li) {
+      graph_tile_ptr tile = reader.GetGraphTile(leg[li].edgeid);
+      if (!tile)
+        return false;
+      const DirectedEdge* de = tile->directededge(leg[li].edgeid);
+      auto shape = tile->edgeinfo(de).shape();
+      if (!de->forward())
+        std::reverse(shape.begin(), shape.end());
+      for (const auto& p : shape) {
+        std::pair<int64_t, int64_t> k{std::llround(p.lat() * 1e5), std::llround(p.lng() * 1e5)};
+        if (pts.empty() || pts.back() != k) {
+          if (!pts.empty())
+            cum.push_back(cum.back() +
+                          midgard::PointLL(pts.back().second / 1e5, pts.back().first / 1e5)
+                              .Distance(midgard::PointLL(k.second / 1e5, k.first / 1e5)));
+          pts.push_back(k);
+        }
+      }
+    }
+    return true;
+  };
+  if (!append_leg(fwd, fwd_begin, fwd.size()))
+    return 0.0;
+  seam_idx = pts.empty() ? 0 : pts.size() - 1;
+  if (!append_leg(ret, 0, ret_end))
+    return 0.0;
+  if (pts.size() < 3)
+    return 0.0;
+  double worst = 0.0;
+  for (size_t i = 1; i + 1 < pts.size(); ++i) {
+    if (pts[i - 1] == pts[i + 1]) {
+      size_t w = 1;
+      while (i >= 1 + w && i + 1 + w < pts.size() && pts[i - 1 - w] == pts[i + 1 + w])
+        ++w;
+      // only stubs whose interval covers the seam (the defect site); slack 2 like the meter
+      if (i - w <= seam_idx + 2 && i + w + 2 >= seam_idx) {
+        const double stub = cum[i] - cum[i - w];
+        if (stub > worst)
+          worst = stub;
+      }
+      i += w; // skip past this palindrome
+    }
+  }
+  return worst;
 }
 
 } // namespace
@@ -1351,6 +1438,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     bool fallback;
   };
   std::vector<Loop> loops;
+  std::vector<Loop> dirty_loops;
   std::vector<PointLL> built_lls;
   auto built_separated = [&](const PointLL& ll) {
     for (const auto& b : built_lls)
@@ -1398,6 +1486,23 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     }
     if (ret.empty())
       continue;
+    // Build-time Defect Gate (ADR-0037): a loop whose seam carries an exact-mirror
+    // stub >= 30 m is not bank-worthy — stash it and refill the slot from the queue;
+    // it is served only if the cell would otherwise return no route (clean-first,
+    // dirty-last-resort). A hard-exclude success cannot retrace the forward leg at the
+    // seam (those edges were barred from its return search), so the seam-window decode
+    // is a FINAL verdict for it. A Fallback Loop CAN carry a cross-leg retrace whose
+    // mirror apex sits far off-seam, where a window sees no palindrome at all — v3f
+    // leaked 25 wrapped bounces exactly this way — so fallbacks always get the full
+    // decode.
+    const double stub = fell_back ? seam_stub_m(fwd, ret, *reader, 0.0)
+                                  : seam_stub_m(fwd, ret, *reader, kSeamWindowM);
+    if (stub >= kSeamStubRejectM) {
+      if (dirty_loops.size() < want)
+        dirty_loops.push_back({std::move(fwd), std::move(ret), std::move(turn),
+                               cands[ci].curviness_per_km, fell_back});
+      continue;
+    }
     // Distance comes from the harvest band (turnaround at target/2 ±18% => loop ~target ±18%);
     // no global re-pick correction, which would converge distinct candidates onto one loop.
     built_lls.push_back(cands[ci].ll);
@@ -1407,6 +1512,16 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (fallback_count > 0)
     LOG_INFO("roundtrip: " + std::to_string(fallback_count) +
              " candidate(s) fell back to the soft leash (Fallback Loop)");
+  if (!dirty_loops.empty())
+    LOG_INFO("roundtrip: Defect Gate rejected " + std::to_string(dirty_loops.size()) +
+             " seam-stub loop(s) at build time");
+  if (loops.empty() && !dirty_loops.empty()) {
+    // Dirty-last-resort: better one honest out-and-back than a 442 in a network that
+    // physically cannot close a clean loop.
+    LOG_WARN("roundtrip: no clean loops — serving " + std::to_string(dirty_loops.size()) +
+             " defective loop(s) as a last resort");
+    loops = std::move(dirty_loops);
+  }
   if (loops.empty())
     throw valhalla_exception_t{442};
 
