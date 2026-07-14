@@ -1505,6 +1505,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   };
   std::vector<Loop> loops;
   std::vector<Loop> dirty_loops;
+  // Byte-identical loop dedup (the T2 hardening side effect), enforced AT BUILD TIME:
+  // with the U-turn door dropped, adjacent turnarounds can converge onto the same
+  // detour loop. Skipping the duplicate here lets the queue refill the slot with a
+  // genuinely distinct loop instead of silently shrinking the fill at serialization.
+  std::set<std::vector<uint64_t>> served_sigs;
   std::vector<PointLL> built_lls;
   auto built_separated = [&](const PointLL& ll) {
     for (const auto& b : built_lls)
@@ -1555,6 +1560,16 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     }
     if (ret.empty())
       continue;
+    {
+      std::vector<uint64_t> sig;
+      sig.reserve(fwd.size() + ret.size());
+      for (const auto& pi : fwd)
+        sig.push_back(pi.edgeid.value);
+      for (const auto& pi : ret)
+        sig.push_back(pi.edgeid.value);
+      if (!served_sigs.insert(std::move(sig)).second)
+        continue; // identical to an already-built loop — refill from the queue
+    }
     // Build-time Defect Gate (ADR-0037): a loop whose seam carries an exact-mirror
     // stub >= 30 m is not bank-worthy — stash it and refill the slot from the queue;
     // it is served only if the cell would otherwise return no route (clean-first,
@@ -1597,26 +1612,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // 4) Engine ranks best-first by curviness-per-km (distance gated, reuse leashed).
   std::stable_sort(loops.begin(), loops.end(),
                    [](const Loop& a, const Loop& b) { return a.curviness > b.curviness; });
-
-  // ADR-0037 turnaround hardening side effect: with the U-turn door dropped, adjacent
-  // turnarounds on the same road can converge onto byte-identical loops (both return
-  // legs detour the same block). The T9 separation guard cannot see this — it reasons
-  // about turnaround nodes, not return legs. Identical alternates are worthless to the
-  // rider: serve the best-scored copy only (post-sort, first occurrence wins).
-  {
-    std::set<std::vector<uint64_t>> served;
-    loops.erase(std::remove_if(loops.begin(), loops.end(),
-                               [&served](const Loop& lp) {
-                                 std::vector<uint64_t> sig;
-                                 sig.reserve(lp.fwd.size() + lp.ret.size());
-                                 for (const auto& pi : lp.fwd)
-                                   sig.push_back(pi.edgeid.value);
-                                 for (const auto& pi : lp.ret)
-                                   sig.push_back(pi.edgeid.value);
-                                 return !served.insert(std::move(sig)).second;
-                               }),
-                loops.end());
-  }
 
   // 5) Serialize each loop as a 2-leg TripRoute (start -> turnaround -> start). Pass fresh
   //    Location copies per leg since TripLegBuilder mutates origin/destination.
