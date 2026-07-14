@@ -13,6 +13,7 @@
 #include <limits>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace valhalla;
 using namespace valhalla::midgard;
@@ -994,6 +995,12 @@ namespace {
 // path distance exceeds the radius is excluded whole.
 constexpr double kStartExemptionMeters = 1500.0;
 
+// ADR-0037 progress-graded rejoin: the peak junction-edge penalty near the start, as a
+// share of the leash surcharge (reuse_factor - 1). The grade fades linearly to zero at
+// the turnaround: rejoining the corridor early is what builds lollipop stems; rejoining
+// near the seam is how loops legitimately close.
+constexpr float kRejoinGradeShare = 0.5f;
+
 // Reconstruct the forward PathInfo (start -> turnaround) from the expansion label tree.
 // Walk the predecessor chain (mirror centroid path reconstruction), then reverse to
 // start->turnaround order. Each leg's costs are cumulative from the start, which is the
@@ -1194,8 +1201,14 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                           bool& fell_back) -> std::vector<PathInfo> {
     cost->clear_used_edges();
     const auto& labels = expander.labels();
+    const double total_dist = std::max<uint32_t>(1, labels[fwd_label].path_distance());
     std::vector<uint64_t> vals;
     std::vector<sif::AvoidEdge> hard;
+    struct NodeAt {
+      GraphId node;
+      double dist;
+    };
+    std::vector<NodeAt> path_nodes;
     for (uint32_t l = fwd_label; l != baldr::kInvalidLabel; l = labels[l].predecessor()) {
       const GraphId e = labels[l].edgeid();
       vals.push_back(e.value);
@@ -1207,8 +1220,44 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         if (opp.is_valid())
           hard.push_back({opp, 0.0});
       }
+      graph_tile_ptr tile = reader->GetGraphTile(e);
+      if (tile)
+        path_nodes.push_back(
+            {tile->directededge(e)->endnode(), static_cast<double>(labels[l].path_distance())});
     }
     cost->mark_edges_used(vals);
+
+    // Progress-graded rejoin (ADR-0037): junction edges hanging off forward-path nodes
+    // get a penalty graded by how far along the forward leg the node sits. Edges on the
+    // forward path itself are skipped — the leash and the hard exclusion own those.
+    const float leash_surcharge = cost->reuse_factor() - 1.0f;
+    if (leash_surcharge > 0.f) {
+      const std::unordered_set<uint64_t> fwd_set(vals.begin(), vals.end());
+      std::unordered_map<uint64_t, float> rejoin;
+      for (const auto& pn : path_nodes) {
+        graph_tile_ptr ntile = reader->GetGraphTile(pn.node);
+        if (!ntile)
+          continue;
+        const NodeInfo* ni = ntile->node(pn.node);
+        const float grade = 1.0f + leash_surcharge * kRejoinGradeShare *
+                                       static_cast<float>(1.0 - std::min(1.0, pn.dist / total_dist));
+        for (uint32_t i = 0; i < ni->edge_count(); ++i) {
+          const GraphId eid(pn.node.tileid(), pn.node.level(), ni->edge_index() + i);
+          if (!fwd_set.count(eid.value)) {
+            auto it = rejoin.emplace(eid.value, grade);
+            if (!it.second && grade > it.first->second)
+              it.first->second = grade;
+          }
+          const GraphId opp = reader->GetOpposingEdgeId(eid);
+          if (opp.is_valid() && !fwd_set.count(opp.value)) {
+            auto it = rejoin.emplace(opp.value, grade);
+            if (!it.second && grade > it.first->second)
+              it.first->second = grade;
+          }
+        }
+      }
+      cost->mark_rejoin_edges(std::move(rejoin));
+    }
     cost->set_user_avoid_edges(avoid_baseline);
     if (!hard.empty())
       cost->AddUserAvoidEdges(hard);
