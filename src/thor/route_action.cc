@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <set>
 #include <unordered_map>
 #include <unordered_set>
@@ -1030,6 +1031,26 @@ constexpr double kStemMinM = 150.0;           // = PARAMS["lollipop_min_stem_m"]
 constexpr float kSecondViaSectorDeg = 180.0f; // eligible V2 sector width around bearing+180
 constexpr uint32_t kSecondViaRetries = 2;     // V2 candidates tried before keeping one-via
 
+// ADR-0037 §2 node-guarded one-shot distance correction (ADR-0033's deferred
+// "maintainer's call", now called): a built loop landing outside tolerance gets ONE
+// corrective re-aim — a fresh candidate near the compensated turnaround distance, in
+// the original's bearing sector, whose node collides with no already-built turnaround
+// (the node guard that preserves K-candidate distinctness; the unguarded version was
+// rejected in ADR-0033 for converging distinct candidates onto one loop). One shot,
+// no convergence loop — the phase-2 latency trap.
+constexpr double kDistCorrTolerance = 0.20; // matches the gate-7 per-loop mean threshold
+constexpr float kCorrSectorDeg = 90.0f;     // re-aim stays in the original bearing sector
+// Latency is a per-REQUEST budget: uncapped, hard cells fire a corrective rebuild on
+// nearly every loop (ledger: 11/12 on a 100 km cell) and the median request pays a
+// whole extra build — measured over gate 9. The cap keeps the correction inside the
+// v3h margin; deterministic (count-based, queue order), a build-time tunable.
+constexpr uint32_t kMaxCorrectionsPerRequest = 8;
+// A Fallback Loop's length is mostly network-forced (no fresh return), and its rebuild
+// pays the exhausted-search double A*, so it only fires the correction on extreme
+// misses — the tail that dominates the mean (measured: ~11-18%% of loops carry
+// err > 0.40 while the median rebuild there is the only one that pays for itself).
+constexpr double kDistCorrFallbackThr = 0.40;
+
 // ADR-0037 Defect Gate: a built loop carrying an exact-mirror stub >= this at the seam
 // is rejected and its slot refilled (the harness spike meter's own threshold).
 constexpr double kSeamStubRejectM = 30.0;
@@ -1237,8 +1258,31 @@ bool decode_leg_grid(const std::vector<PathInfo>& leg,
 double stem_fraction(const std::vector<PathInfo>& fwd,
                      const std::vector<PathInfo>& ret,
                      baldr::GraphReader& reader) {
+  // A lollipop stem lives at the ride's START: the forward PREFIX shadowed by the
+  // return SUFFIX. Decoding whole legs for it made every clean loop pay an O(shape)
+  // decode + corridor hash (measured against gate 9 once the distance correction's
+  // rebuilds landed on top). Slice both legs to a start-side window first — a stem
+  // reaching the window edge is over the trigger threshold by construction, so the
+  // check stays trigger-exact; the (rare) mid-loop shadow the harness's full-leg
+  // meter would fold into a stem is deliberately out of the engine's window.
+  const float total_est = fwd.back().path_distance + ret.back().path_distance;
+  const float window_m = static_cast<float>(kStartExemptionMeters) +
+                         static_cast<float>(kSecondViaStemFrac) * total_est + 1000.0f;
+  std::vector<PathInfo> fwd_win;
+  for (const auto& pi : fwd) {
+    fwd_win.push_back(pi);
+    if (pi.path_distance > window_m)
+      break;
+  }
+  const float ret_total = ret.back().path_distance;
+  size_t ret_from = 0;
+  while (ret_from + 1 < ret.size() &&
+         ret_total - ret[ret_from].path_distance > window_m)
+    ++ret_from;
+  const std::vector<PathInfo> ret_win(ret.begin() + ret_from, ret.end());
+
   std::vector<std::pair<int64_t, int64_t>> leg0, leg1;
-  if (!decode_leg_grid(fwd, reader, leg0) || !decode_leg_grid(ret, reader, leg1))
+  if (!decode_leg_grid(fwd_win, reader, leg0) || !decode_leg_grid(ret_win, reader, leg1))
     return 0.0;
   if (leg0.size() < 2 || leg1.size() < 2)
     return 0.0;
@@ -1259,8 +1303,7 @@ double stem_fraction(const std::vector<PathInfo>& fwd,
     return out;
   };
   const std::vector<double> len0 = seg_lens(leg0), len1 = seg_lens(leg1);
-  const double total_m =
-      std::accumulate(len0.begin(), len0.end(), 0.0) + std::accumulate(len1.begin(), len1.end(), 0.0);
+  const double total_m = static_cast<double>(total_est); // fraction is of the FULL loop
   if (total_m <= 0.0)
     return 0.0;
 
@@ -1670,6 +1713,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // it may reuse forward edges anywhere. The Defect Gate reads this to give the
     // loop a full-leg decode (a seam-window verdict provably leaks wrapped bounces).
     bool fallback;
+    // Second Via tag: this loop was rebuilt two-lobed for shape. Shape outranks
+    // distance — the distance correction never re-aims a two-lobe loop away.
+    bool second_via;
   };
   std::vector<Loop> loops;
   std::vector<Loop> dirty_loops;
@@ -1679,6 +1725,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // genuinely distinct loop instead of silently shrinking the fill at serialization.
   std::set<std::vector<uint64_t>> served_sigs;
   std::vector<PointLL> built_lls;
+  std::unordered_set<uint64_t> built_nodes; // the distance-correction node guard
+  uint32_t correction_count = 0;
   auto built_separated = [&](const PointLL& ll) {
     for (const auto& b : built_lls)
       if (static_cast<double>(ll.Distance(b)) < min_separation_m)
@@ -1710,34 +1758,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     queue.insert(queue.end(), widx.begin(), widx.end());
   };
 
-  // Distance Flex, lazy (ADR-0037 / #54 candidate 6): the widened re-scan of the same
-  // expansion tree runs only when the primary path stalls — queue dry OR attempt budget
-  // dry with loops still missing — and grants a fresh +want budget so the flex pool can
-  // actually fill hard cells. For every cell the primary queue fills, the re-scan never
-  // runs and the loop set is byte-identical to the eager version's (same append order).
-  uint32_t attempts = 0;
-  uint32_t attempt_cap = want + kAttemptSlack;
-  size_t qi = 0;
-  while (true) {
-    if (loops.size() >= want)
-      break;
-    if ((qi >= queue.size() || attempts >= attempt_cap) && !widened) {
-      attempt_cap = attempts + want;
-      widen_pool();
-    }
-    if (qi >= queue.size() || attempts >= attempt_cap) {
-      if (attempts >= attempt_cap)
-        LOG_INFO("roundtrip: attempt cap (" + std::to_string(attempt_cap) + ") hit with " +
-                 std::to_string(loops.size()) + " loop(s) built");
-      break;
-    }
-    const uint32_t ci = queue[qi++];
-    if (!built_separated(cands[ci].ll))
-      continue;
-    ++attempts;
+  // One full candidate build: walk-back, hardened turnaround, corridor return,
+  // Defect Gate, Second Via. Returns the loop WITHOUT committing it (the caller owns
+  // dedup, separation bookkeeping, and the distance-correction decision).
+  auto attempt_build = [&](uint32_t ci) -> std::optional<Loop> {
     std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
     if (fwd.empty())
-      continue;
+      return std::nullopt;
     // Trap-aware walk-back (ADR-0037): a tip inside a dead-end stub retreats to the
     // nearest junction with a probed, genuine way out.
     const auto t_walkback = ledger_clock::now();
@@ -1749,7 +1776,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     const GraphId arrival = fwd.back().edgeid;
     graph_tile_ptr arrival_tile = reader->GetGraphTile(arrival);
     if (!arrival_tile)
-      continue;
+      return std::nullopt;
     valhalla::Location turn =
         correlate_node(arrival_tile->directededge(arrival)->endnode(), *reader, arrival);
     // The return leg needs at least one NON-U-turn outbound edge: a dead-end tip whose
@@ -1760,7 +1787,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     for (const auto& pe : turn.correlation().edges())
       outbound += pe.begin_node() ? 1 : 0;
     if (outbound == 0)
-      continue;
+      return std::nullopt;
     std::vector<PathInfo> ret;
     bool fell_back = false;
     try {
@@ -1772,10 +1799,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       if (interrupt)
         (*interrupt)();
       LOG_WARN("roundtrip: return leg failed, candidate skipped: " + std::string(e.what()));
-      continue;
+      return std::nullopt;
     }
     if (ret.empty())
-      continue;
+      return std::nullopt;
     // Build-time Defect Gate (ADR-0037): a loop whose seam carries an exact-mirror
     // stub >= 30 m is not bank-worthy — stash it and refill the slot from the queue;
     // it is served only if the cell would otherwise return no route (clean-first,
@@ -1792,10 +1819,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (stub >= kSeamStubRejectM) {
       if (dirty_loops.size() < want)
         dirty_loops.push_back({std::move(fwd), std::move(ret), std::move(turn),
-                               cands[ci].curviness_per_km, fell_back});
-      continue;
+                               cands[ci].curviness_per_km, fell_back, false});
+      return std::nullopt;
     }
 
+    bool via_built = false;
     // ADR-0037 §2 Second Via: the gate's decode adds the metrics-v1.2 stem check; a
     // clean loop over the lollipop threshold is rebuilt two-lobed — same forward leg,
     // return re-routed through a bearing-diverse second via from the opposite
@@ -1896,6 +1924,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
             continue;
           ret = std::move(ret2);
           fell_back = fb_b || fb_c;
+          via_built = true;
           ++second_via_count;
           break;
         }
@@ -1904,21 +1933,103 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       secondvia_ms += ms_since(t_sv);
     }
 
+
+    return Loop{std::move(fwd), std::move(ret), std::move(turn),
+                cands[ci].curviness_per_km, fell_back, via_built};
+  };
+
+  // Distance Flex, lazy (ADR-0037 / #54 candidate 6): the widened re-scan of the same
+  // expansion tree runs only when the primary path stalls — queue dry OR attempt budget
+  // dry with loops still missing — and grants a fresh +want budget so the flex pool can
+  // actually fill hard cells. For every cell the primary queue fills, the re-scan never
+  // runs and the loop set is byte-identical to the eager version's (same append order).
+  uint32_t attempts = 0;
+  uint32_t attempt_cap = want + kAttemptSlack;
+  size_t qi = 0;
+  while (true) {
+    if (loops.size() >= want)
+      break;
+    if ((qi >= queue.size() || attempts >= attempt_cap) && !widened) {
+      attempt_cap = attempts + want;
+      widen_pool();
+    }
+    if (qi >= queue.size() || attempts >= attempt_cap) {
+      if (attempts >= attempt_cap)
+        LOG_INFO("roundtrip: attempt cap (" + std::to_string(attempt_cap) + ") hit with " +
+                 std::to_string(loops.size()) + " loop(s) built");
+      break;
+    }
+    const uint32_t ci = queue[qi++];
+    if (!built_separated(cands[ci].ll))
+      continue;
+    ++attempts;
+    auto built = attempt_build(ci);
+    if (!built)
+      continue;
+    uint32_t serve_ci = ci;
+
+    // ADR-0037 §2 distance correction: ONE corrective re-aim when the build lands
+    // outside tolerance. The compensated turnaround distance scales the built leg by
+    // target/actual; the re-aim candidate must sit in the original's bearing sector
+    // and — the node guard — collide with no already-built turnaround node, so K
+    // candidates stay distinct instead of converging on the one ideal node.
+    const double actual_m = static_cast<double>(built->fwd.back().path_distance) +
+                            static_cast<double>(built->ret.back().path_distance);
+    const double dist_err = std::fabs(actual_m - target) / target;
+    // Two-lobe loops are exempt (shape outranks distance). Fallback Loops fire only on
+    // extreme misses — see kDistCorrFallbackThr.
+    const double fire_thr = built->fallback ? kDistCorrFallbackThr : kDistCorrTolerance;
+    if (dist_err > fire_thr && !built->second_via &&
+        correction_count < kMaxCorrectionsPerRequest) {
+      widen_pool();
+      const double comp_pd = std::clamp(cands[ci].path_distance * target / actual_m,
+                                        target * 0.5 * kFlexLoFrac,
+                                        target * 0.5 * kFlexHiFrac);
+      uint32_t best = kInvalidLabel;
+      double best_gap = std::numeric_limits<double>::max();
+      for (uint32_t i = 0; i < static_cast<uint32_t>(cands.size()); ++i) {
+        if (cands[i].node == cands[ci].node || built_nodes.count(cands[i].node))
+          continue;
+        if (!built_separated(cands[i].ll))
+          continue;
+        const float sep = std::fabs(
+            std::fmod(cands[i].bearing_deg - cands[ci].bearing_deg + 540.0f, 360.0f) - 180.0f);
+        if (sep > kCorrSectorDeg / 2.0f)
+          continue;
+        const double gap = std::fabs(static_cast<double>(cands[i].path_distance) - comp_pd);
+        if (gap < best_gap) {
+          best_gap = gap;
+          best = i;
+        }
+      }
+      if (best != kInvalidLabel) {
+        ++correction_count;
+        auto corrected = attempt_build(best);
+        if (corrected) {
+          const double corr_m = static_cast<double>(corrected->fwd.back().path_distance) +
+                                static_cast<double>(corrected->ret.back().path_distance);
+          if (std::fabs(corr_m - target) / target < dist_err) {
+            built = std::move(corrected);
+            serve_ci = best;
+          }
+        }
+      }
+      // Correction failed or was worse: the original loop stands (one shot, no loop).
+    }
+
     {
       std::vector<uint64_t> sig;
-      sig.reserve(fwd.size() + ret.size());
-      for (const auto& pi : fwd)
+      sig.reserve(built->fwd.size() + built->ret.size());
+      for (const auto& pi : built->fwd)
         sig.push_back(pi.edgeid.value);
-      for (const auto& pi : ret)
+      for (const auto& pi : built->ret)
         sig.push_back(pi.edgeid.value);
       if (!served_sigs.insert(std::move(sig)).second)
         continue; // identical to an already-built loop — refill from the queue
     }
-    // Distance comes from the harvest band (turnaround at target/2 ±18% => loop ~target ±18%);
-    // no global re-pick correction, which would converge distinct candidates onto one loop.
-    built_lls.push_back(cands[ci].ll);
-    loops.push_back({std::move(fwd), std::move(ret), std::move(turn),
-                     cands[ci].curviness_per_km, fell_back});
+    built_lls.push_back(cands[serve_ci].ll);
+    built_nodes.insert(cands[serve_ci].node);
+    loops.push_back(std::move(*built));
   }
   if (fallback_count > 0)
     LOG_INFO("roundtrip: " + std::to_string(fallback_count) +
@@ -1926,6 +2037,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (second_via_count > 0)
     LOG_INFO("roundtrip: Second Via rebuilt " + std::to_string(second_via_count) +
              " over-stem loop(s) two-lobed");
+  if (correction_count > 0)
+    LOG_INFO("roundtrip: distance correction re-aimed " + std::to_string(correction_count) +
+             " off-target build(s)");
   if (!dirty_loops.empty())
     LOG_INFO("roundtrip: Defect Gate rejected " + std::to_string(dirty_loops.size()) +
              " seam-stub loop(s) at build time");
@@ -1975,6 +2089,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " build=" + ms(build_ms) +
              " (ms) attempts=" + std::to_string(attempts) +
              " second_vias=" + std::to_string(second_via_count) +
+             " corrections=" + std::to_string(correction_count) +
              " fallbacks=" + std::to_string(fallback_count) +
              " loops=" + std::to_string(loops.size()) +
              " dirty=" + std::to_string(dirty_loops.size()) + (widened ? " widened" : ""));
