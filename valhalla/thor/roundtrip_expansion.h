@@ -34,6 +34,15 @@ public:
                                   const sif::TravelMode mode,
                                   double target_distance_m);
 
+  // Re-scan the settled label tree for turnaround candidates in an arbitrary band
+  // [target_half*lo_frac, target_half*hi_frac] — the ADR-0037 Distance Flex pool.
+  // Requires a prior Harvest() (the expansion must have run).
+  std::vector<Turnaround> ScanBand(baldr::GraphReader& reader,
+                                   const midgard::PointLL& start_ll,
+                                   double target_distance_m,
+                                   float lo_frac,
+                                   float hi_frac);
+
   // Expose the settled labels so the action can reconstruct forward paths.
   const std::vector<sif::BDEdgeLabel>& labels() const {
     return bdedgelabels_;
