@@ -1035,17 +1035,31 @@ valhalla::Location correlate_node(const baldr::GraphId& node,
 
   const baldr::GraphId uturn_door =
       arrival_edge.is_valid() ? reader.GetOpposingEdgeId(arrival_edge) : baldr::GraphId{};
-  for (uint32_t i = 0; i < ni->edge_count(); ++i) {
-    const baldr::GraphId eid(node.tileid(), node.level(), ni->edge_index() + i);
-    if (uturn_door.is_valid() && eid == uturn_door)
-      continue; // no U-turn opening for the return leg
-    const DirectedEdge* de = tile->directededge(eid);
-    if (de->is_shortcut() || !(de->forwardaccess() & kAutoAccess))
+  // A node where road classes meet is split across hierarchy levels (e.g. a primary
+  // approach lives on level 0, the secondary exits on level 1) with transitions linking
+  // the twins. The return leg needs the outbound set of the PHYSICAL junction, so
+  // correlate every level's edges — else a junction turnaround reads as exitless and
+  // the outbound guard below discards it (a harvest-yield leak; a 442 in small cells).
+  std::vector<baldr::GraphId> level_nodes{node};
+  for (uint32_t t = 0; t < ni->transition_count(); ++t)
+    level_nodes.push_back(tile->transition(ni->transition_index() + t)->endnode());
+  for (const baldr::GraphId& n : level_nodes) {
+    graph_tile_ptr ntile = n == node ? tile : reader.GetGraphTile(n);
+    if (!ntile)
       continue;
-    add_edge(eid, true); // outbound edge leaving the node
-    const baldr::GraphId opp = reader.GetOpposingEdgeId(eid);
-    if (opp.is_valid())
-      add_edge(opp, false); // opposing inbound edge arriving at the node
+    const baldr::NodeInfo* nni = ntile->node(n);
+    for (uint32_t i = 0; i < nni->edge_count(); ++i) {
+      const baldr::GraphId eid(n.tileid(), n.level(), nni->edge_index() + i);
+      if (uturn_door.is_valid() && eid == uturn_door)
+        continue; // no U-turn opening for the return leg
+      const DirectedEdge* de = ntile->directededge(eid);
+      if (de->is_shortcut() || !(de->forwardaccess() & kAutoAccess))
+        continue;
+      add_edge(eid, true); // outbound edge leaving the node
+      const baldr::GraphId opp = reader.GetOpposingEdgeId(eid);
+      if (opp.is_valid())
+        add_edge(opp, false); // opposing inbound edge arriving at the node
+    }
   }
   // The forward leg arrives on this edge; TripLegBuilder needs it present to trim the
   // forward destination. It can never appear in the loop above — its opposing edge is
