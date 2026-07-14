@@ -1033,6 +1033,34 @@ std::vector<PathInfo> ForwardPath(const RoundTripExpansion& exp, uint32_t label_
   return rev;
 }
 
+// Visit every auto-accessible, non-shortcut outbound edge of the PHYSICAL junction: the
+// node itself and its hierarchy-level twins (a node where road classes meet is split
+// across levels, linked by transitions — an edge walker that reads one level sees a
+// partial junction; the T2 lesson).
+template <typename Fn>
+void for_each_junction_edge(const baldr::GraphId& node, baldr::GraphReader& reader, Fn&& fn) {
+  graph_tile_ptr tile = reader.GetGraphTile(node);
+  if (!tile)
+    return;
+  const baldr::NodeInfo* ni = tile->node(node);
+  std::vector<baldr::GraphId> level_nodes{node};
+  for (uint32_t t = 0; t < ni->transition_count(); ++t)
+    level_nodes.push_back(tile->transition(ni->transition_index() + t)->endnode());
+  for (const baldr::GraphId& n : level_nodes) {
+    graph_tile_ptr ntile = n == node ? tile : reader.GetGraphTile(n);
+    if (!ntile)
+      continue;
+    const baldr::NodeInfo* nni = ntile->node(n);
+    for (uint32_t i = 0; i < nni->edge_count(); ++i) {
+      const baldr::GraphId eid(n.tileid(), n.level(), nni->edge_index() + i);
+      const DirectedEdge* de = ntile->directededge(eid);
+      if (de->is_shortcut() || !(de->forwardaccess() & kAutoAccess))
+        continue;
+      fn(eid);
+    }
+  }
+}
+
 // Build a routing Location snapped to a graph node, mirroring a loki node correlation:
 // one PathEdge per edge leaving the node (begin-node, percent_along 0) plus its opposing
 // inbound edge (end-node, percent_along 1) so the location works as both origin and
@@ -1049,7 +1077,6 @@ valhalla::Location correlate_node(const baldr::GraphId& node,
                                   const baldr::GraphId& arrival_edge) {
   valhalla::Location loc;
   graph_tile_ptr tile = reader.GetGraphTile(node);
-  const baldr::NodeInfo* ni = tile->node(node);
   const PointLL node_ll = tile->get_node_ll(node);
   loc.mutable_ll()->set_lng(node_ll.lng());
   loc.mutable_ll()->set_lat(node_ll.lat());
@@ -1070,38 +1097,89 @@ valhalla::Location correlate_node(const baldr::GraphId& node,
 
   const baldr::GraphId uturn_door =
       arrival_edge.is_valid() ? reader.GetOpposingEdgeId(arrival_edge) : baldr::GraphId{};
-  // A node where road classes meet is split across hierarchy levels (e.g. a primary
-  // approach lives on level 0, the secondary exits on level 1) with transitions linking
-  // the twins. The return leg needs the outbound set of the PHYSICAL junction, so
-  // correlate every level's edges — else a junction turnaround reads as exitless and
-  // the outbound guard below discards it (a harvest-yield leak; a 442 in small cells).
-  std::vector<baldr::GraphId> level_nodes{node};
-  for (uint32_t t = 0; t < ni->transition_count(); ++t)
-    level_nodes.push_back(tile->transition(ni->transition_index() + t)->endnode());
-  for (const baldr::GraphId& n : level_nodes) {
-    graph_tile_ptr ntile = n == node ? tile : reader.GetGraphTile(n);
-    if (!ntile)
-      continue;
-    const baldr::NodeInfo* nni = ntile->node(n);
-    for (uint32_t i = 0; i < nni->edge_count(); ++i) {
-      const baldr::GraphId eid(n.tileid(), n.level(), nni->edge_index() + i);
-      if (uturn_door.is_valid() && eid == uturn_door)
-        continue; // no U-turn opening for the return leg
-      const DirectedEdge* de = ntile->directededge(eid);
-      if (de->is_shortcut() || !(de->forwardaccess() & kAutoAccess))
-        continue;
-      add_edge(eid, true); // outbound edge leaving the node
-      const baldr::GraphId opp = reader.GetOpposingEdgeId(eid);
-      if (opp.is_valid())
-        add_edge(opp, false); // opposing inbound edge arriving at the node
-    }
-  }
+  // The return leg needs the outbound set of the PHYSICAL junction (all hierarchy
+  // levels) — else a junction turnaround reads as exitless and the outbound guard
+  // below discards it (a harvest-yield leak; a 442 in small cells).
+  for_each_junction_edge(node, reader, [&](const baldr::GraphId& eid) {
+    if (uturn_door.is_valid() && eid == uturn_door)
+      return; // no U-turn opening for the return leg
+    add_edge(eid, true); // outbound edge leaving the node
+    const baldr::GraphId opp = reader.GetOpposingEdgeId(eid);
+    if (opp.is_valid())
+      add_edge(opp, false); // opposing inbound edge arriving at the node
+  });
   // The forward leg arrives on this edge; TripLegBuilder needs it present to trim the
   // forward destination. It can never appear in the loop above — its opposing edge is
   // the skipped U-turn door — so adding it here cannot duplicate.
   if (arrival_edge.is_valid())
     add_edge(arrival_edge, false);
   return loc;
+}
+
+// ADR-0037 trap-aware tip walk-back. When the harvest lands inside a dead-end stub
+// (the out-leg of an excursion — the label U-turn test cannot see it because the
+// retrace only completes on the return leg), the turnaround sits above pavement that
+// forces the fallback return to bounce out-and-back: the wrapped-seam spike class.
+// Walk the built leg's tip back until the tip node offers a fresh exit that survives a
+// bounded probe: a "fresh exit" opening into a pure single-thread dead-end corridor is
+// a trap, not a way out. Branchy or over-budget threads count as viable — the Defect
+// Gate owns those. Both the exit scan and the probe read the whole physical junction
+// (hierarchy twins). Pops stop at the Start Exemption: the first stretch is mandatory
+// riding. Prefix costs stay valid — tail pops need no rebuild.
+constexpr uint32_t kTrapProbeDepth = 60;
+constexpr uint32_t kWalkBackPopCap = 400;
+std::vector<PathInfo> walk_back_trapped_tip(std::vector<PathInfo> fwd,
+                                            baldr::GraphReader& reader) {
+  auto dead_end_thread = [&reader](const baldr::GraphId& first_edge) {
+    baldr::GraphId cur = first_edge;
+    for (uint32_t step = 0; step < kTrapProbeDepth; ++step) {
+      graph_tile_ptr tile = reader.GetGraphTile(cur);
+      if (!tile)
+        return false;
+      const baldr::GraphId endnode = tile->directededge(cur)->endnode();
+      const baldr::GraphId back = reader.GetOpposingEdgeId(cur);
+      baldr::GraphId next;
+      uint32_t onward = 0;
+      for_each_junction_edge(endnode, reader, [&](const baldr::GraphId& eid) {
+        if (back.is_valid() && eid == back)
+          return;
+        ++onward;
+        next = eid;
+      });
+      if (onward == 0)
+        return true; // thread terminated: a pure dead-end corridor
+      if (onward > 1)
+        return false; // branches: viable
+      cur = next;
+    }
+    return false; // long thread: assume viable
+  };
+
+  uint32_t popped = 0;
+  while (fwd.size() > 1 && popped < kWalkBackPopCap) {
+    const PathInfo& tip = fwd.back();
+    // The distance below the tip edge; popping past the exemption would eat the
+    // mandatory first stretch.
+    if (static_cast<double>(fwd[fwd.size() - 2].path_distance) <= kStartExemptionMeters)
+      break;
+    graph_tile_ptr tile = reader.GetGraphTile(tip.edgeid);
+    if (!tile)
+      break;
+    const baldr::GraphId tip_node = tile->directededge(tip.edgeid)->endnode();
+    const baldr::GraphId back_edge = reader.GetOpposingEdgeId(tip.edgeid);
+    uint32_t fresh = 0;
+    for_each_junction_edge(tip_node, reader, [&](const baldr::GraphId& eid) {
+      if (back_edge.is_valid() && eid == back_edge)
+        return; // riding back is not a fresh exit
+      if (fresh == 0 && !dead_end_thread(eid))
+        ++fresh;
+    });
+    if (fresh > 0)
+      break;
+    fwd.pop_back();
+    ++popped;
+  }
+  return fwd;
 }
 
 // ADR-0037 Defect Gate detector: decode both legs onto the 1e-5 grid and measure the
@@ -1453,6 +1531,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
     if (fwd.empty())
       continue;
+    // Trap-aware walk-back (ADR-0037): a tip inside a dead-end stub retreats to the
+    // nearest junction with a probed, genuine way out.
+    fwd = walk_back_trapped_tip(std::move(fwd), *reader);
     // ADR-0037: the forward leg's arrival edge closes the return U-turn door in
     // correlate_node and guarantees the destination trim edge (#53). The turnaround is
     // derived from the built leg's tip, not the harvest record.
