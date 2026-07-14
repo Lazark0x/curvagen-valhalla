@@ -1408,11 +1408,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // Request-level avoids (loki avoid_locations) survive the per-candidate swaps.
   const auto avoid_baseline = cost->user_avoid_edges();
   uint32_t fallback_count = 0;
-  auto route_return = [&](const std::vector<PathInfo>& fwd, valhalla::Location& turn,
-                          bool& fell_back) -> std::vector<PathInfo> {
+  // Generalized corridor-aware leg router (ADR-0037): routes from -> to with the given
+  // corridor hard-excluded beyond the Start Exemption, soft-leashed everywhere, and its
+  // junction edges progress-grade-penalized. The round-trip return is corridor=forward
+  // leg, to=start; the Second Via sub-legs reuse it with wider corridors.
+  auto route_leg = [&](const std::vector<PathInfo>& corridor, valhalla::Location& from,
+                       valhalla::Location& to, bool& fell_back) -> std::vector<PathInfo> {
     const auto t_rejoin = ledger_clock::now();
     cost->clear_used_edges();
-    const double total_dist = std::max(1.0f, fwd.back().path_distance);
+    const double total_dist = std::max(1.0f, corridor.back().path_distance);
     std::vector<uint64_t> vals;
     std::vector<sif::AvoidEdge> hard;
     struct NodeAt {
@@ -1420,9 +1424,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       double dist;
     };
     std::vector<NodeAt> path_nodes;
-    // Walked on the BUILT forward path (not the label chain): edges the walk-back
+    // Walked on the BUILT corridor (not the label chain): edges the walk-back
     // dropped from the leg are neither excluded nor leashed.
-    for (const auto& pi : fwd) {
+    for (const auto& pi : corridor) {
       const GraphId e = pi.edgeid;
       vals.push_back(e.value);
       const GraphId opp = reader->GetOpposingEdgeId(e);
@@ -1445,7 +1449,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // forward path itself are skipped — the leash and the hard exclusion own those.
     const float leash_surcharge = cost->reuse_factor() - 1.0f;
     if (leash_surcharge > 0.f) {
-      const std::unordered_set<uint64_t> fwd_set(vals.begin(), vals.end());
+      const std::unordered_set<uint64_t> corridor_set(vals.begin(), vals.end());
       std::unordered_map<uint64_t, float> rejoin;
       for (const auto& pn : path_nodes) {
         graph_tile_ptr ntile = reader->GetGraphTile(pn.node);
@@ -1456,13 +1460,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                                        static_cast<float>(1.0 - std::min(1.0, pn.dist / total_dist));
         for (uint32_t i = 0; i < ni->edge_count(); ++i) {
           const GraphId eid(pn.node.tileid(), pn.node.level(), ni->edge_index() + i);
-          if (!fwd_set.count(eid.value)) {
+          if (!corridor_set.count(eid.value)) {
             auto it = rejoin.emplace(eid.value, grade);
             if (!it.second && grade > it.first->second)
               it.first->second = grade;
           }
           const GraphId opp = reader->GetOpposingEdgeId(eid);
-          if (opp.is_valid() && !fwd_set.count(opp.value)) {
+          if (opp.is_valid() && !corridor_set.count(opp.value)) {
             auto it = rejoin.emplace(opp.value, grade);
             if (!it.second && grade > it.first->second)
               it.first->second = grade;
@@ -1479,7 +1483,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::vector<std::vector<PathInfo>> paths;
     const auto t_astar = ledger_clock::now();
     try {
-      paths = bidir_astar.GetBestPath(turn, start, *reader, mode_costing, mode, options);
+      paths = bidir_astar.GetBestPath(from, to, *reader, mode_costing, mode, options);
     } catch (const std::exception&) {
       // "No route home under exclusion" can surface as a throw or as an empty result;
       // either way the fallback below decides.
@@ -1497,7 +1501,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       cost->set_user_avoid_edges(avoid_baseline);
       bidir_astar.Clear();
       const auto t_fb = ledger_clock::now();
-      paths = bidir_astar.GetBestPath(turn, start, *reader, mode_costing, mode, options);
+      paths = bidir_astar.GetBestPath(from, to, *reader, mode_costing, mode, options);
       astar_fb_ms += ms_since(t_fb);
     }
     cost->set_user_avoid_edges(avoid_baseline);
@@ -1532,6 +1536,31 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         return false;
     return true;
   };
+  bool widened = false;
+  // The widened ScanBand re-scan, shared by the lazy Distance Flex stall path and the
+  // Second Via candidate pool (both want the full band; idempotent via `widened`).
+  auto widen_pool = [&]() {
+    if (widened)
+      return;
+    widened = true;
+    const auto& sll = options.locations(0).ll();
+    const auto t_scan = ledger_clock::now();
+    auto wide = expander.ScanBand(*reader, PointLL{sll.lng(), sll.lat()}, target,
+                                  kFlexLoFrac, kFlexHiFrac);
+    scan_ms += ms_since(t_scan);
+    const uint32_t base = static_cast<uint32_t>(cands.size());
+    for (const auto& t : wide)
+      if (queued.insert(t.node).second)
+        cands.push_back(t);
+    std::vector<uint32_t> widx;
+    for (uint32_t i = base; i < static_cast<uint32_t>(cands.size()); ++i)
+      widx.push_back(i);
+    std::sort(widx.begin(), widx.end(), [&](uint32_t a, uint32_t c) {
+      return cands[a].curviness_per_km > cands[c].curviness_per_km;
+    });
+    queue.insert(queue.end(), widx.begin(), widx.end());
+  };
+
   // Distance Flex, lazy (ADR-0037 / #54 candidate 6): the widened re-scan of the same
   // expansion tree runs only when the primary path stalls — queue dry OR attempt budget
   // dry with loops still missing — and grants a fresh +want budget so the flex pool can
@@ -1539,30 +1568,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // runs and the loop set is byte-identical to the eager version's (same append order).
   uint32_t attempts = 0;
   uint32_t attempt_cap = want + kAttemptSlack;
-  bool widened = false;
   size_t qi = 0;
   while (true) {
     if (loops.size() >= want)
       break;
     if ((qi >= queue.size() || attempts >= attempt_cap) && !widened) {
-      widened = true;
       attempt_cap = attempts + want;
-      const auto& sll = options.locations(0).ll();
-      const auto t_scan = ledger_clock::now();
-      auto wide = expander.ScanBand(*reader, PointLL{sll.lng(), sll.lat()}, target,
-                                    kFlexLoFrac, kFlexHiFrac);
-      scan_ms += ms_since(t_scan);
-      const uint32_t base = static_cast<uint32_t>(cands.size());
-      for (const auto& t : wide)
-        if (queued.insert(t.node).second)
-          cands.push_back(t);
-      std::vector<uint32_t> widx;
-      for (uint32_t i = base; i < static_cast<uint32_t>(cands.size()); ++i)
-        widx.push_back(i);
-      std::sort(widx.begin(), widx.end(), [&](uint32_t a, uint32_t c) {
-        return cands[a].curviness_per_km > cands[c].curviness_per_km;
-      });
-      queue.insert(queue.end(), widx.begin(), widx.end());
+      widen_pool();
     }
     if (qi >= queue.size() || attempts >= attempt_cap) {
       if (attempts >= attempt_cap)
@@ -1603,7 +1615,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::vector<PathInfo> ret;
     bool fell_back = false;
     try {
-      ret = route_return(fwd, turn, fell_back);
+      ret = route_leg(fwd, turn, start, fell_back);
     } catch (const std::exception& e) {
       // A return leg that cannot route fails this candidate only — the same
       // contract as the empty-path skip below. Re-poke the interrupt so a
