@@ -537,6 +537,73 @@ TEST_F(MotorcycleRoundTripDirtyLastResort, DirtyLoopServedWhenNothingCleanExists
   EXPECT_TRUE(rode_corridor) << "the last-resort loop should be the corridor loop";
 }
 
+// The harvest lands INSIDE a curvy dead-end stub (C-P-Q): the chain carries no U-turn,
+// so bounce rejection cannot see it, and every loop built from the stub bounces on the
+// return. The junction C below the stub sits outside both harvest bands, so no refill
+// candidate can serve its loop — only the trap-aware walk-back (ADR-0037) can retreat
+// the tip from Q to C and build the clean C-D-A loop. Without it the cell serves the
+// Defect-Gate-stashed bounce loop as a last resort.
+class MotorcycleRoundTripWalkBack : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+A-B-C--P--Q
+
+
+
+
+
+
+
+
+
+
+
+    D
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
+        {"CP", {{"highway", "secondary"}}}, {"PQ", {{"highway", "secondary"}}},
+        {"CD", {{"highway", "secondary"}}}, {"DA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_walkback");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "C", "P")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "P", "C")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "P", "Q")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "Q", "P")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripWalkBack::map = {};
+
+TEST_F(MotorcycleRoundTripWalkBack, StubTipWalksBackToTheJunction) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "20000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u);
+  bool rode_corridor = false, rode_ring = false;
+  for (const auto& edge : paths[0]) {
+    EXPECT_NE(edge, "PQ") << "the loop entered the dead-end stub";
+    rode_corridor |= (edge == "BC");
+    rode_ring |= (edge == "CD");
+  }
+  EXPECT_TRUE(rode_corridor && rode_ring)
+      << "expected the walked-back C turnaround loop (A-B-C-D-A)";
+  std::set<std::string> uniq(paths[0].begin(), paths[0].end());
+  EXPECT_EQ(uniq.size(), paths[0].size()) << "an edge was ridden twice (bounce served)";
+}
+
 // Progress-graded rejoin (ADR-0037): the return leg should not shadow the forward
 // corridor home on the cheapest crossing. From turnaround T two fresh returns exist:
 //   R1 crosses corridor node M near the start (edges QM + MX, 22.8 km — shortest)
