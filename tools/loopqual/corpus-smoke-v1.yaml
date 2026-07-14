@@ -1,0 +1,20 @@
+# loopqual smoke corpus v1 — 4 requests for a gentle serving-path check
+# (e.g. against https://api.curvagen.cc with --serving). Distinct fresh seeds
+# so memo/bank replay is unlikely; distances kept ≤100 km to stay light on the
+# live box. NOT a quality baseline — parses/computability check only.
+id: corpus-smoke-v1
+k: 3               # engine-mode only; the orchestrator picks its own K when --serving
+avoid_motorways: true
+origins:
+  belgrade: {lat: 44.7900, lon: 20.4500}
+  nis:      {lat: 43.3209, lon: 21.8958}
+  novisad:  {lat: 45.2551, lon: 19.8452}
+  zlatibor: {lat: 43.7300, lon: 19.7000}
+cells:
+  - {curviness: 0.5, origins: [belgrade], distances_m: [50000],  seeds: [900713]}
+  - {curviness: 0.5, origins: [nis],      distances_m: [100000], seeds: [424242]}
+  - {curviness: 0.5, origins: [novisad],  distances_m: [50000],  seeds: [133742]}
+  - {curviness: 0.8, origins: [zlatibor], distances_m: [100000], seeds: [777001]}
+# way pass only runs when --trace-engine points at a local fork on the same
+# tileset (prod exposes no /trace_attributes); traces cost the live box nothing.
+way_reuse_seeds: [900713, 424242, 133742, 777001]
