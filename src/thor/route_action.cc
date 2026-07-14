@@ -7,6 +7,7 @@
 #include "thor/worker.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -1282,10 +1283,23 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   auto* cost = mode_costing[static_cast<uint32_t>(mode)].get();
   cost->clear_used_edges();
 
+  // ADR-0037 §4 stage-timing ledger (config "thor.roundtrip_stage_timing", default
+  // off): the only per-stage cost visibility on the box — it found the decisive
+  // ScanBand regression (#54). Timestamps are taken unconditionally (nanoseconds
+  // against A* runs); only the log line is gated.
+  using ledger_clock = std::chrono::steady_clock;
+  auto ms_since = [](ledger_clock::time_point t0) {
+    return std::chrono::duration<double, std::milli>(ledger_clock::now() - t0).count();
+  };
+  double harvest_ms = 0, scan_ms = 0, walkback_ms = 0, rejoin_ms = 0, astar_ms = 0,
+         astar_fb_ms = 0, seam_ms = 0, build_ms = 0;
+
   // 1) One forward expansion + harvest turnarounds (Task A4). An empty primary band is
   //    no longer fatal here — the Distance Flex scan below may still fill the queue.
   RoundTripExpansion expander;
+  const auto t_harvest = ledger_clock::now();
   auto cands = expander.Harvest(request, *reader, mode_costing, mode, target);
+  harvest_ms = ms_since(t_harvest);
 
   // 2) Dedup turnarounds by node (best curviness per node) so candidates are genuinely
   //    distinct loops, then bearing-bucket for diversity. The shuffle seed rotates the bucket
@@ -1396,6 +1410,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   uint32_t fallback_count = 0;
   auto route_return = [&](const std::vector<PathInfo>& fwd, valhalla::Location& turn,
                           bool& fell_back) -> std::vector<PathInfo> {
+    const auto t_rejoin = ledger_clock::now();
     cost->clear_used_edges();
     const double total_dist = std::max(1.0f, fwd.back().path_distance);
     std::vector<uint64_t> vals;
@@ -1459,8 +1474,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     cost->set_user_avoid_edges(avoid_baseline);
     if (!hard.empty())
       cost->AddUserAvoidEdges(hard);
+    rejoin_ms += ms_since(t_rejoin);
     bidir_astar.Clear();
     std::vector<std::vector<PathInfo>> paths;
+    const auto t_astar = ledger_clock::now();
     try {
       paths = bidir_astar.GetBestPath(turn, start, *reader, mode_costing, mode, options);
     } catch (const std::exception&) {
@@ -1468,6 +1485,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       // either way the fallback below decides.
       paths.clear();
     }
+    astar_ms += ms_since(t_astar);
     if (paths.empty() && !hard.empty()) {
       // Re-poke the interrupt first: if the try above swallowed a client disconnect,
       // this rethrows instead of paying a second A*.
@@ -1478,7 +1496,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       ++fallback_count;
       cost->set_user_avoid_edges(avoid_baseline);
       bidir_astar.Clear();
+      const auto t_fb = ledger_clock::now();
       paths = bidir_astar.GetBestPath(turn, start, *reader, mode_costing, mode, options);
+      astar_fb_ms += ms_since(t_fb);
     }
     cost->set_user_avoid_edges(avoid_baseline);
     cost->clear_used_edges();
@@ -1528,8 +1548,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       widened = true;
       attempt_cap = attempts + want;
       const auto& sll = options.locations(0).ll();
+      const auto t_scan = ledger_clock::now();
       auto wide = expander.ScanBand(*reader, PointLL{sll.lng(), sll.lat()}, target,
                                     kFlexLoFrac, kFlexHiFrac);
+      scan_ms += ms_since(t_scan);
       const uint32_t base = static_cast<uint32_t>(cands.size());
       for (const auto& t : wide)
         if (queued.insert(t.node).second)
@@ -1557,7 +1579,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       continue;
     // Trap-aware walk-back (ADR-0037): a tip inside a dead-end stub retreats to the
     // nearest junction with a probed, genuine way out.
+    const auto t_walkback = ledger_clock::now();
     fwd = walk_back_trapped_tip(std::move(fwd), *reader);
+    walkback_ms += ms_since(t_walkback);
     // ADR-0037: the forward leg's arrival edge closes the return U-turn door in
     // correlate_node and guarantees the destination trim edge (#53). The turnaround is
     // derived from the built leg's tip, not the harvest record.
@@ -1610,8 +1634,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // mirror apex sits far off-seam, where a window sees no palindrome at all — v3f
     // leaked 25 wrapped bounces exactly this way — so fallbacks always get the full
     // decode.
+    const auto t_seam = ledger_clock::now();
     const double stub = fell_back ? seam_stub_m(fwd, ret, *reader, 0.0)
                                   : seam_stub_m(fwd, ret, *reader, kSeamWindowM);
+    seam_ms += ms_since(t_seam);
     if (stub >= kSeamStubRejectM) {
       if (dirty_loops.size() < want)
         dirty_loops.push_back({std::move(fwd), std::move(ret), std::move(turn),
@@ -1649,6 +1675,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   valhalla::Trip& trip = *request.mutable_trip();
   trip.mutable_routes()->Reserve(static_cast<int>(loops.size()));
   std::vector<std::string> algorithms;
+  const auto t_build = ledger_clock::now();
   for (auto& lp : loops) {
     auto* route = trip.mutable_routes()->Add();
     route->mutable_legs()->Reserve(2);
@@ -1664,6 +1691,18 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       TripLegBuilder::Build(options, controller, *reader, mode_costing, lp.ret.begin(),
                             lp.ret.end(), o, d, leg, algorithms, interrupt, {}, {});
     }
+  }
+  build_ms = ms_since(t_build);
+  if (roundtrip_stage_timing) {
+    auto ms = [](double v) { return std::to_string(static_cast<int>(v)); };
+    LOG_INFO("roundtrip timing: harvest=" + ms(harvest_ms) + " scan=" + ms(scan_ms) +
+             " walkback=" + ms(walkback_ms) + " rejoin=" + ms(rejoin_ms) +
+             " astar=" + ms(astar_ms) + " astar_fb=" + ms(astar_fb_ms) +
+             " seam=" + ms(seam_ms) + " build=" + ms(build_ms) +
+             " (ms) attempts=" + std::to_string(attempts) +
+             " fallbacks=" + std::to_string(fallback_count) +
+             " loops=" + std::to_string(loops.size()) +
+             " dirty=" + std::to_string(dirty_loops.size()) + (widened ? " widened" : ""));
   }
 }
 } // namespace thor
