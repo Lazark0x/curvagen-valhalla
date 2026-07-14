@@ -1171,6 +1171,26 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         chosen.push_back(rest[i]);
   }
 
+  // Refill queue (ADR-0037 build-until-full): hardening, walk-back, and return-leg
+  // failures all strike AFTER selection, so a fixed chosen-set systematically
+  // under-fills the bank. Candidates are consumed from an ordered queue until `want`
+  // loops are actually built: the seed-varied sector picks first, then the
+  // curviness-sorted rest of the band.
+  std::vector<uint32_t> queue = chosen;
+  std::unordered_set<uint64_t> queued;
+  {
+    for (uint32_t c : chosen)
+      queued.insert(cands[c].node);
+    std::vector<uint32_t> rest;
+    for (uint32_t i : uniq)
+      if (queued.insert(cands[i].node).second)
+        rest.push_back(i);
+    std::sort(rest.begin(), rest.end(), [&](uint32_t a, uint32_t c) {
+      return cands[a].curviness_per_km > cands[c].curviness_per_km;
+    });
+    queue.insert(queue.end(), rest.begin(), rest.end());
+  }
+
   // Return-leg router (ADR-0037 hard-excluded return): the forward leg's edges (both
   // directions) are hard-excluded from the return search, so the loop must close on
   // fresh roads — except within the Start Exemption, where the network-forced first
@@ -1185,11 +1205,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // Request-level avoids (loki avoid_locations) survive the per-candidate swaps.
   const auto avoid_baseline = cost->user_avoid_edges();
   uint32_t fallback_count = 0;
-  auto route_return = [&](uint32_t fwd_label, valhalla::Location& turn,
+  auto route_return = [&](const std::vector<PathInfo>& fwd, valhalla::Location& turn,
                           bool& fell_back) -> std::vector<PathInfo> {
     cost->clear_used_edges();
-    const auto& labels = expander.labels();
-    const double total_dist = std::max<uint32_t>(1, labels[fwd_label].path_distance());
+    const double total_dist = std::max(1.0f, fwd.back().path_distance);
     std::vector<uint64_t> vals;
     std::vector<sif::AvoidEdge> hard;
     struct NodeAt {
@@ -1197,13 +1216,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       double dist;
     };
     std::vector<NodeAt> path_nodes;
-    for (uint32_t l = fwd_label; l != baldr::kInvalidLabel; l = labels[l].predecessor()) {
-      const GraphId e = labels[l].edgeid();
+    // Walked on the BUILT forward path (not the label chain): edges the walk-back
+    // dropped from the leg are neither excluded nor leashed.
+    for (const auto& pi : fwd) {
+      const GraphId e = pi.edgeid;
       vals.push_back(e.value);
       const GraphId opp = reader->GetOpposingEdgeId(e);
       if (opp.is_valid())
         vals.push_back(opp.value);
-      if (static_cast<double>(labels[l].path_distance()) > kStartExemptionMeters) {
+      if (static_cast<double>(pi.path_distance) > kStartExemptionMeters) {
         hard.push_back({e, 0.0});
         if (opp.is_valid())
           hard.push_back({opp, 0.0});
@@ -1211,7 +1232,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       graph_tile_ptr tile = reader->GetGraphTile(e);
       if (tile)
         path_nodes.push_back(
-            {tile->directededge(e)->endnode(), static_cast<double>(labels[l].path_distance())});
+            {tile->directededge(e)->endnode(), static_cast<double>(pi.path_distance)});
     }
     cost->mark_edges_used(vals);
 
@@ -1275,27 +1296,43 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     return paths.empty() ? std::vector<PathInfo>{} : paths.front();
   };
 
-  auto node_for = [&](uint32_t cand_index) -> baldr::GraphId {
-    return baldr::GraphId(cands[cand_index].node);
-  };
-
-  // 3) Build each chosen loop: forward leg from the tree + leashed return, with a one-shot
-  //    distance correction (re-pick a turnaround at ~target-return from the SAME tree).
+  // 3) Build loops from the queue until `want` are built (ADR-0037 build-until-full):
+  //    forward leg from the tree + hard-excluded/leashed return. Per-candidate failures
+  //    (sink/tip skips, no return) consume the next queue entry instead of shrinking
+  //    the fill. Built turnarounds keep the T9 min-separation among themselves.
   struct Loop {
     std::vector<PathInfo> fwd, ret;
     valhalla::Location turn;
     float curviness;
     // Fallback Loop tag (ADR-0037): the return leg came from the soft-leash retry, so
-    // it may reuse forward edges anywhere. T3's Defect Gate reads this to give the
+    // it may reuse forward edges anywhere. The Defect Gate reads this to give the
     // loop a full-leg decode (a seam-window verdict provably leaks wrapped bounces).
     bool fallback;
   };
   std::vector<Loop> loops;
-  for (uint32_t ci : chosen) {
+  std::vector<PointLL> built_lls;
+  auto built_separated = [&](const PointLL& ll) {
+    for (const auto& b : built_lls)
+      if (static_cast<double>(ll.Distance(b)) < min_separation_m)
+        return false;
+    return true;
+  };
+  for (size_t qi = 0; qi < queue.size() && loops.size() < want; ++qi) {
+    const uint32_t ci = queue[qi];
+    if (!built_separated(cands[ci].ll))
+      continue;
+    std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
+    if (fwd.empty())
+      continue;
     // ADR-0037: the forward leg's arrival edge closes the return U-turn door in
-    // correlate_node and guarantees the destination trim edge (#53).
-    const GraphId arrival(expander.labels()[cands[ci].label_index].edgeid());
-    valhalla::Location turn = correlate_node(node_for(ci), *reader, arrival);
+    // correlate_node and guarantees the destination trim edge (#53). The turnaround is
+    // derived from the built leg's tip, not the harvest record.
+    const GraphId arrival = fwd.back().edgeid;
+    graph_tile_ptr arrival_tile = reader->GetGraphTile(arrival);
+    if (!arrival_tile)
+      continue;
+    valhalla::Location turn =
+        correlate_node(arrival_tile->directededge(arrival)->endnode(), *reader, arrival);
     // The return leg needs at least one NON-U-turn outbound edge: a dead-end tip whose
     // only exit was the dropped U-turn door is a forced spike, and a one-way sink has
     // no exit at all — both fail this candidate alone (the #44 contract; bidir A*
@@ -1305,11 +1342,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       outbound += pe.begin_node() ? 1 : 0;
     if (outbound == 0)
       continue;
-    std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
     std::vector<PathInfo> ret;
     bool fell_back = false;
     try {
-      ret = route_return(cands[ci].label_index, turn, fell_back);
+      ret = route_return(fwd, turn, fell_back);
     } catch (const std::exception& e) {
       // A return leg that cannot route fails this candidate only — the same
       // contract as the empty-path skip below. Re-poke the interrupt so a
@@ -1319,10 +1355,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       LOG_WARN("roundtrip: return leg failed, candidate skipped: " + std::string(e.what()));
       continue;
     }
-    if (ret.empty() || fwd.empty())
+    if (ret.empty())
       continue;
     // Distance comes from the harvest band (turnaround at target/2 ±18% => loop ~target ±18%);
     // no global re-pick correction, which would converge distinct candidates onto one loop.
+    built_lls.push_back(cands[ci].ll);
     loops.push_back({std::move(fwd), std::move(ret), std::move(turn),
                      cands[ci].curviness_per_km, fell_back});
   }
