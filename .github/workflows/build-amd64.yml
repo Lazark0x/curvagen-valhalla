@@ -7,7 +7,7 @@ name: build-amd64
 
 on:
   push:
-    branches: [engine-first-phase2]
+    branches: [engine-first-phase2, curvature-costing]
   workflow_dispatch: {}
 
 jobs:
