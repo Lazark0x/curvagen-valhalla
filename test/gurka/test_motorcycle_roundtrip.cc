@@ -830,6 +830,115 @@ TEST_F(MotorcycleRoundTripSecondViaLadder, NoViaCandidateKeepsTheOneViaLoop) {
   EXPECT_EQ(count["CD"], 1);
 }
 
+// The only in-band candidate C closes a 30.6 km loop at a 20 km target (its sole way
+// home is the long N arc) — err 0.53, far outside tolerance. The ADR-0037 §2 one-shot
+// distance correction must re-aim at the compensated distance (~6.5 km): candidate B
+// in the same bearing sector closes a 21 km loop over the M arc instead.
+class MotorcycleRoundTripDistCorrection : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+A-----B---C
+
+
+
+
+
+
+   M
+
+     N
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
+        {"BM", {{"highway", "secondary"}}}, {"MA", {{"highway", "secondary"}}},
+        {"CN", {{"highway", "secondary"}}}, {"NA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {},
+                            "test/data/motorcycle_roundtrip_distcorr");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "B", "C")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "C", "B")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripDistCorrection::map = {};
+
+TEST_F(MotorcycleRoundTripDistCorrection, OffTargetBuildReAimedOnce) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "20000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u);
+  bool corrected_arc = false;
+  for (const auto& edge : paths[0]) {
+    EXPECT_NE(edge, "CN") << "the 53%-off build was served uncorrected";
+    corrected_arc |= (edge == "BM");
+  }
+  EXPECT_TRUE(corrected_arc) << "expected the re-aimed B loop over the M arc";
+}
+
+// The same off-target build with NO candidate in the bearing sector: the correction
+// finds nothing and the original loop must stand — a distance miss never costs the
+// rider the route.
+class MotorcycleRoundTripDistCorrectionKeep : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+A---------C
+
+
+
+
+
+
+     N
+    )";
+    const gurka::ways ways = {
+        {"AC", {{"highway", "secondary"}}},
+        {"CN", {{"highway", "secondary"}}},
+        {"NA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {},
+                            "test/data/motorcycle_roundtrip_distcorr_keep");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "A", "C")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "C", "A")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripDistCorrectionKeep::map = {};
+
+TEST_F(MotorcycleRoundTripDistCorrectionKeep, NoReAimCandidateKeepsTheBuild) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "20000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u) << "an uncorrectable distance miss must not cost the route";
+  bool long_arc = false;
+  for (const auto& edge : paths[0])
+    long_arc |= (edge == "CN");
+  EXPECT_TRUE(long_arc) << "expected the original off-target loop kept";
+}
+
 // Progress-graded rejoin (ADR-0037): the return leg should not shadow the forward
 // corridor home on the cheapest crossing. From turnaround T two fresh returns exist:
 //   R1 crosses corridor node M near the start (edges QM + MX, 22.8 km — shortest)
@@ -876,8 +985,11 @@ H---G
 gurka::map MotorcycleRoundTripRejoin::map = {};
 
 TEST_F(MotorcycleRoundTripRejoin, GradedRejoinSteersOffTheCorridorCrossing) {
+  // Target keeps both return variants inside the distance-correction tolerance
+  // (R1 ~38.8 km, R2 ~40 km at 38 km => err <= 0.06) so this map isolates the
+  // rejoin grading and the correction stays silent.
   const std::unordered_map<std::string, std::string> base = {
-      {"/roundtrip/target_distance", "32000"},
+      {"/roundtrip/target_distance", "38000"},
       {"/roundtrip/num_candidates", "1"},
   };
   auto count_edge = [](const std::vector<std::string>& path, const std::string& name) {
