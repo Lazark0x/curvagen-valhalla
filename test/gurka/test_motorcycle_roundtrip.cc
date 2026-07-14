@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <map>
 #include <set>
 
@@ -215,7 +216,7 @@ TEST_F(MotorcycleRoundTripBounce, BouncedChainNotHarvested) {
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
                                  {{"/roundtrip/target_distance", "18000"},
                                   {"/roundtrip/num_candidates", "1"},
-                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
   const auto paths = gurka::detail::get_paths(result);
   ASSERT_GE(paths.size(), 1u);
   // The bounced chain (curviest, rides the spur twice) must not be served: no loop
@@ -226,13 +227,13 @@ TEST_F(MotorcycleRoundTripBounce, BouncedChainNotHarvested) {
 }
 
 TEST_F(MotorcycleRoundTripBounce, HardExclusionForcesFreshReturn) {
-  // With the leash OFF (reuse_penalty 1.0) retracing the 9 km corridor home is cheaper
-  // than the 15 km D-E-F-A road — only the hard exclusion (ADR-0037) can force the
-  // fresh return. Every edge of the loop must be ridden exactly once.
+  // With the leash OFF (reuse_penalty 0.0 -> reuse factor 1.0) retracing the 9 km
+  // corridor home is cheaper than the 15 km D-E-F-A road — only ADR-0037 return
+  // hardening (U-turn door + hard exclusion) can force the fresh return. Every edge of the loop must be ridden exactly once.
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
                                  {{"/roundtrip/target_distance", "18000"},
                                   {"/roundtrip/num_candidates", "1"},
-                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
   const auto paths = gurka::detail::get_paths(result);
   ASSERT_GE(paths.size(), 1u);
   std::set<std::string> uniq(paths[0].begin(), paths[0].end());
@@ -282,7 +283,7 @@ TEST_F(MotorcycleRoundTripCulDeSac, StartExemptionClosesTheLoop) {
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
                                  {{"/roundtrip/target_distance", "18000"},
                                   {"/roundtrip/num_candidates", "2"},
-                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
   const auto paths = gurka::detail::get_paths(result);
   ASSERT_GE(paths.size(), 1u) << "cul-de-sac start must not fail the request";
   std::map<std::string, int> count;
@@ -303,7 +304,7 @@ TEST_F(MotorcycleRoundTripCulDeSac, HierarchyJunctionTurnaroundNotSkipped) {
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
                                  {{"/roundtrip/target_distance", "20000"},
                                   {"/roundtrip/num_candidates", "1"},
-                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
   const auto paths = gurka::detail::get_paths(result);
   ASSERT_GE(paths.size(), 1u) << "junction turnaround was skipped as exitless";
   std::map<std::string, int> count;
@@ -347,11 +348,84 @@ protected:
 };
 gurka::map MotorcycleRoundTripNoFreshReturn::map = {};
 
+// Progress-graded rejoin (ADR-0037): the return leg should not shadow the forward
+// corridor home on the cheapest crossing. From turnaround T two fresh returns exist:
+//   R1 crosses corridor node M near the start (edges QM + MX, 22.8 km — shortest)
+//   R2 detours wide via G-H (24 km, touches no forward-path junction)
+// With the leash off the grading is off (it scales off the leash surcharge) and R1
+// wins on length. With the leash on, M sits at 4/16 of the forward leg, so its
+// junction edges carry ~1.75x and the return must take the wide detour R2.
+class MotorcycleRoundTripRejoin : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+  W-X
+
+A---M------B----T
+
+    Q------R----S
+
+H---G
+    )";
+    const gurka::ways ways = {
+        {"AM", {{"highway", "secondary"}}}, {"MB", {{"highway", "secondary"}}},
+        {"BT", {{"highway", "secondary"}}}, {"TS", {{"highway", "secondary"}}},
+        {"RS", {{"highway", "secondary"}}}, {"QR", {{"highway", "secondary"}}},
+        {"QM", {{"highway", "secondary"}}}, {"MX", {{"highway", "secondary"}}},
+        {"XW", {{"highway", "secondary"}}}, {"WA", {{"highway", "secondary"}}},
+        {"QG", {{"highway", "secondary"}}}, {"GH", {{"highway", "secondary"}}},
+        {"HA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_rejoin");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "B", "T")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "T", "B")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripRejoin::map = {};
+
+TEST_F(MotorcycleRoundTripRejoin, GradedRejoinSteersOffTheCorridorCrossing) {
+  const std::unordered_map<std::string, std::string> base = {
+      {"/roundtrip/target_distance", "32000"},
+      {"/roundtrip/num_candidates", "1"},
+  };
+  auto count_edge = [](const std::vector<std::string>& path, const std::string& name) {
+    return std::count(path.begin(), path.end(), name);
+  };
+
+  // Leash off -> grading off -> shortest fresh return crosses the corridor at M.
+  auto off = base;
+  off["/costing_options/motorcycle/reuse_penalty"] = "0.0";
+  auto r_off = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle", off);
+  const auto p_off = gurka::detail::get_paths(r_off);
+  ASSERT_GE(p_off.size(), 1u);
+  EXPECT_GE(count_edge(p_off[0], "QM"), 1) << "ungraded return should take the short crossing";
+
+  // Leash on -> near-start junction edges graded -> the wide detour wins.
+  auto on = base;
+  on["/costing_options/motorcycle/reuse_penalty"] = "0.5";
+  auto r_on = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle", on);
+  const auto p_on = gurka::detail::get_paths(r_on);
+  ASSERT_GE(p_on.size(), 1u);
+  EXPECT_EQ(count_edge(p_on[0], "QM"), 0)
+      << "graded return still crossed the corridor at the near-start junction";
+  EXPECT_GE(count_edge(p_on[0], "QG"), 1) << "graded return should take the wide detour";
+}
+
 TEST_F(MotorcycleRoundTripNoFreshReturn, FallbackLoopServedNotFailed) {
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
                                  {{"/roundtrip/target_distance", "22000"},
                                   {"/roundtrip/num_candidates", "1"},
-                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
   const auto paths = gurka::detail::get_paths(result);
   ASSERT_GE(paths.size(), 1u) << "no-fresh-return cell must fall back, not 442";
   std::map<std::string, int> count;
@@ -405,7 +479,7 @@ TEST_F(MotorcycleRoundTripOneWayArrival, OneWayArrivalDoesNotKillTheFill) {
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
                                  {{"/roundtrip/target_distance", "14000"},
                                   {"/roundtrip/num_candidates", "1"},
-                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
   const auto paths = gurka::detail::get_paths(result);
   ASSERT_GE(paths.size(), 1u) << "one-way arrival killed the whole request (#53)";
   // The served loop rides the one-way approach out and the F-E road home.
@@ -454,7 +528,7 @@ TEST_F(MotorcycleRoundTripDeadEndTip, TipTurnaroundSkippedCleanLoopServed) {
   auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
                                  {{"/roundtrip/target_distance", "20000"},
                                   {"/roundtrip/num_candidates", "2"},
-                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
   const auto paths = gurka::detail::get_paths(result);
   ASSERT_GE(paths.size(), 1u) << "tip skip must not kill the request";
   // No served loop may enter the dead-end spur: a tip turnaround is a forced spike.

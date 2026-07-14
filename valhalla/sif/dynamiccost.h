@@ -1263,6 +1263,15 @@ protected:
     if (reuse_factor_ > 1.0f && edgeid != baldr::kInvalidGraphId &&
         used_edges_.find(edgeid.value) != used_edges_.end())
       factor *= reuse_factor_;
+    // ADR-0037 progress-graded rejoin: junction edges hanging off the forward corridor
+    // carry a graded penalty, so the return leg is nudged off shadowing the outbound
+    // leg home on parallel streets — strongest near the start where lollipop stems
+    // form, fading to nothing at the turnaround.
+    if (!rejoin_factor_edges_.empty() && edgeid != baldr::kInvalidGraphId) {
+      auto it = rejoin_factor_edges_.find(edgeid.value);
+      if (it != rejoin_factor_edges_.end())
+        factor *= it->second;
+    }
     return factor;
   }
 
@@ -1275,8 +1284,22 @@ public:
   }
 
   /// ADR-0031: reset the used-edge set at the start of a route request.
+  /// Also drops the ADR-0037 rejoin grades — they are derived from the same
+  /// forward leg and must never outlive it.
   void clear_used_edges() {
     used_edges_.clear();
+    rejoin_factor_edges_.clear();
+  }
+
+  /// ADR-0037: per-edge graded rejoin factors (edge GraphId::value -> multiplier),
+  /// read by EdgeFactor alongside the reuse leash; cleared with clear_used_edges().
+  void mark_rejoin_edges(std::unordered_map<uint64_t, float>&& factors) {
+    rejoin_factor_edges_ = std::move(factors);
+  }
+
+  /// ADR-0037: the leash multiplier (1.0 = off) so thor can grade rejoin tiers off it.
+  float reuse_factor() const {
+    return reuse_factor_;
   }
 
   /// ADR-0037 hard-excluded return: the round-trip action swaps a per-candidate
@@ -1426,6 +1449,8 @@ protected:
   // ADR-0031 edge-reuse leash state (per request).
   std::unordered_set<uint64_t> used_edges_;
   float reuse_factor_ = 1.0f; // 1.0 = off; >1 multiplies the cost of a re-ridden edge
+  // ADR-0037 progress-graded corridor-rejoin multipliers (edge value -> factor).
+  std::unordered_map<uint64_t, float> rejoin_factor_edges_;
 
   /**
    * Get the base transition costs (and ferry factor) from the costing options.
