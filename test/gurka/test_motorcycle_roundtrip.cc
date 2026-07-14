@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <map>
 #include <set>
 
 using namespace valhalla;
@@ -222,6 +223,123 @@ TEST_F(MotorcycleRoundTripBounce, BouncedChainNotHarvested) {
   for (const auto& path : paths)
     for (const auto& edge : path)
       EXPECT_NE(edge, "BX") << "a harvested chain bounced through the dead-end spur";
+}
+
+TEST_F(MotorcycleRoundTripBounce, HardExclusionForcesFreshReturn) {
+  // With the leash OFF (reuse_penalty 1.0) retracing the 9 km corridor home is cheaper
+  // than the 15 km D-E-F-A road — only the hard exclusion (ADR-0037) can force the
+  // fresh return. Every edge of the loop must be ridden exactly once.
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "18000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u);
+  std::set<std::string> uniq(paths[0].begin(), paths[0].end());
+  EXPECT_EQ(uniq.size(), paths[0].size())
+      << "an edge was ridden twice — the return leg reused the forward corridor";
+}
+
+// A cul-de-sac start: A's only access is the 1 km edge AB — shorter than the Start
+// Exemption (ADR-0037 §3), so the return may ride it home even though every other
+// forward edge is hard-excluded. The primary-class corridor makes RETRACING strictly
+// cheaper than the fresh secondary road, so if the exemption were missing (whole
+// forward leg excluded -> no route -> Fallback Loop retry with no exclusion at all)
+// the return would retrace the corridor — visible as BC/CD ridden twice.
+class MotorcycleRoundTripCulDeSac : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      AB------C
+       |      |
+       E------D
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}},
+        {"BC", {{"highway", "primary"}}},
+        {"CD", {{"highway", "primary"}}},
+        {"ED", {{"highway", "secondary"}}},
+        {"BE", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_culdesac");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "C", "D")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "D", "C")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripCulDeSac::map = {};
+
+TEST_F(MotorcycleRoundTripCulDeSac, StartExemptionClosesTheLoop) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "18000"},
+                                  {"/roundtrip/num_candidates", "2"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u) << "cul-de-sac start must not fail the request";
+  std::map<std::string, int> count;
+  for (const auto& edge : paths[0])
+    ++count[edge];
+  EXPECT_EQ(count["AB"], 2) << "the exempt access road must carry the loop out and home";
+  for (const auto& [name, n] : count)
+    if (name != "AB")
+      EXPECT_EQ(n, 1) << "non-exempt edge " << name
+                      << " was reused — exemption missing (fallback retraced the corridor)";
+}
+
+// No fresh road home exists: the corridor is the only connection to A, so the
+// hard-excluded pass finds nothing and the ONE soft-leash retry must serve a
+// Fallback Loop instead of failing the cell (clean-first, dirty-last-resort).
+class MotorcycleRoundTripNoFreshReturn : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      A--------B-T
+               | |
+               C-Y
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BT", {{"highway", "secondary"}}},
+        {"TY", {{"highway", "secondary"}}}, {"YC", {{"highway", "secondary"}}},
+        {"CB", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {},
+                            "test/data/motorcycle_roundtrip_nofresh");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy;
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "B", "T")));
+    curvy.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "T", "B")));
+    test::customize_edges(map.config,
+                          [&curvy](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(curvy.begin(), curvy.end(), edgeid) != curvy.end())
+                              edge.set_curvature(15);
+                          });
+  }
+};
+gurka::map MotorcycleRoundTripNoFreshReturn::map = {};
+
+TEST_F(MotorcycleRoundTripNoFreshReturn, FallbackLoopServedNotFailed) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "22000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u) << "no-fresh-return cell must fall back, not 442";
+  std::map<std::string, int> count;
+  for (const auto& edge : paths[0])
+    ++count[edge];
+  EXPECT_EQ(count["AB"], 2) << "the Fallback Loop must ride the only road home";
 }
 
 // The #53 bank-fill death shape: the forward leg arrives at the turnaround over a
