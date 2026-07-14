@@ -996,6 +996,12 @@ constexpr float kRejoinGradeShare = 0.5f;
 constexpr float kFlexLoFrac = 0.55f;
 constexpr float kFlexHiFrac = 1.18f;
 
+// ADR-0037 attempt budget (#54 candidate 5): total build attempts are capped so a
+// pathological cell stops churning A* runs. The lazy widen grants a FRESH +want budget
+// when it fires — the cap must never starve a cell before the widen has had its shot
+// (the proto-v3f lesson: 32 underfilled cells, dirty served, spikes back).
+constexpr uint32_t kAttemptSlack = 8;
+
 // ADR-0037 Defect Gate: a built loop carrying an exact-mirror stub >= this at the seam
 // is rejected and its slot refilled (the harness spike meter's own threshold).
 constexpr double kSeamStubRejectM = 30.0;
@@ -1362,29 +1368,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     queue.insert(queue.end(), rest.begin(), rest.end());
   }
 
-  // Distance Flex (ADR-0037): the same expansion tree re-scanned in the widened band
-  // feeds the queue's tail, node-deduped against everything already queued — a clean
-  // off-target loop beats a defective on-target one, and a cell whose primary band is
-  // empty can still serve. T4 makes this scan lazy (run only when the primary stalls).
-  {
-    const auto& sll = options.locations(0).ll();
-    auto wide = expander.ScanBand(*reader, PointLL{sll.lng(), sll.lat()}, target,
-                                  kFlexLoFrac, kFlexHiFrac);
-    const uint32_t base = static_cast<uint32_t>(cands.size());
-    for (const auto& t : wide)
-      if (queued.insert(t.node).second)
-        cands.push_back(t);
-    std::vector<uint32_t> widx;
-    for (uint32_t i = base; i < static_cast<uint32_t>(cands.size()); ++i)
-      widx.push_back(i);
-    std::sort(widx.begin(), widx.end(), [&](uint32_t a, uint32_t c) {
-      return cands[a].curviness_per_km > cands[c].curviness_per_km;
-    });
-    queue.insert(queue.end(), widx.begin(), widx.end());
-  }
-  if (queue.empty())
-    throw valhalla_exception_t{442}; // nothing in either band -> 422 to the client
-
   // Return-leg router (ADR-0037 hard-excluded return): the forward leg's edges (both
   // directions) are hard-excluded from the return search, so the loop must close on
   // fresh roads — except within the Start Exemption, where the network-forced first
@@ -1517,10 +1500,46 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         return false;
     return true;
   };
-  for (size_t qi = 0; qi < queue.size() && loops.size() < want; ++qi) {
-    const uint32_t ci = queue[qi];
+  // Distance Flex, lazy (ADR-0037 / #54 candidate 6): the widened re-scan of the same
+  // expansion tree runs only when the primary path stalls — queue dry OR attempt budget
+  // dry with loops still missing — and grants a fresh +want budget so the flex pool can
+  // actually fill hard cells. For every cell the primary queue fills, the re-scan never
+  // runs and the loop set is byte-identical to the eager version's (same append order).
+  uint32_t attempts = 0;
+  uint32_t attempt_cap = want + kAttemptSlack;
+  bool widened = false;
+  size_t qi = 0;
+  while (true) {
+    if (loops.size() >= want)
+      break;
+    if ((qi >= queue.size() || attempts >= attempt_cap) && !widened) {
+      widened = true;
+      attempt_cap = attempts + want;
+      const auto& sll = options.locations(0).ll();
+      auto wide = expander.ScanBand(*reader, PointLL{sll.lng(), sll.lat()}, target,
+                                    kFlexLoFrac, kFlexHiFrac);
+      const uint32_t base = static_cast<uint32_t>(cands.size());
+      for (const auto& t : wide)
+        if (queued.insert(t.node).second)
+          cands.push_back(t);
+      std::vector<uint32_t> widx;
+      for (uint32_t i = base; i < static_cast<uint32_t>(cands.size()); ++i)
+        widx.push_back(i);
+      std::sort(widx.begin(), widx.end(), [&](uint32_t a, uint32_t c) {
+        return cands[a].curviness_per_km > cands[c].curviness_per_km;
+      });
+      queue.insert(queue.end(), widx.begin(), widx.end());
+    }
+    if (qi >= queue.size() || attempts >= attempt_cap) {
+      if (attempts >= attempt_cap)
+        LOG_INFO("roundtrip: attempt cap (" + std::to_string(attempt_cap) + ") hit with " +
+                 std::to_string(loops.size()) + " loop(s) built");
+      break;
+    }
+    const uint32_t ci = queue[qi++];
     if (!built_separated(cands[ci].ll))
       continue;
+    ++attempts;
     std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
     if (fwd.empty())
       continue;
