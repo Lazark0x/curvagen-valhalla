@@ -27,6 +27,13 @@ PICKS = [
     ("G novisad 300km — 27km stub in flatland", "novisad_d300_c0.5_s101.json", 4),
     ("H djerdap 100km — textbook seam U-turn 4.3km", "djerdap_d100_c0.5_s7.json", 2),
     ("I vlasina 200km — 26.5km stub + 5 bulbs", "vlasina_d200_c0.5_s11.json", 5),
+    # v1.2 residual worst-cases (ADR-0037 T7 bounce families, curvagen #61/#62):
+    ("J vlasina 50km c0.5 — worst residual stem 0.74 (forced-stem class)",
+     "vlasina_d50_c0.5_s101.json", 1),
+    ("K vlasina 50km c0.8 — residual stem 0.21", "vlasina_d50_c0.8_s11.json", 6),
+    ("L djerdap 20km — dist_err 8.36 (187km fresh return, no length cap)",
+     "djerdap_d20_c0.5_s7.json", 9),
+    ("M vlasina 20km — reuse 0.88 residual", "vlasina_d20_c0.5_s101.json", 4),
 ]
 
 KEEP = ("loop_km", "distance_error", "spike_count", "max_stub_km", "edge_reuse_geom",
