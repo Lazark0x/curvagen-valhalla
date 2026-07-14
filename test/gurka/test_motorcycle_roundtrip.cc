@@ -168,6 +168,44 @@ TEST_F(MotorcycleRoundTripCluster, CandidatesAreGeometricallyDistinct) {
       << "duplicate loop geometry — the turnaround separation guard failed";
 }
 
+// A 14 km rectangle asked for a 20 km loop, with the reverse arm one-wayed so the far
+// corner cannot be reached the long way round: the primary harvest band (8.2–11.8 km)
+// holds no viable turnaround — D sits at 7 km, C at 9 km is too close to the start
+// (straight-line guard). Pre-flex engines 442 here; the ADR-0037 Distance Flex band
+// (0.55–1.18 x target/2) reaches down to D and serves the clean 14 km loop instead.
+class MotorcycleRoundTripFlex : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      A----B
+      |    |
+      C----D
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}},
+        {"BD", {{"highway", "secondary"}}},
+        // one-way: rideable D->C (the return), not C->D (the long reverse arm).
+        {"DC", {{"highway", "secondary"}, {"oneway", "yes"}}},
+        {"CA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_flex");
+  }
+};
+gurka::map MotorcycleRoundTripFlex::map = {};
+
+TEST_F(MotorcycleRoundTripFlex, FlexServesWhenPrimaryBandIsEmpty) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "20000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u) << "empty primary band must fall back to the flex band";
+  std::set<std::string> uniq(paths[0].begin(), paths[0].end());
+  EXPECT_EQ(uniq.size(), paths[0].size()) << "flex fill must still be a clean loop";
+}
+
 // The one-way sink is the CURVIEST candidate and K=1: selection picks it, hardening
 // skips it, and without the refill queue (ADR-0037 build-until-full) the request dies
 // 442 even though a clean rectangle loop exists right there in the band.

@@ -989,6 +989,13 @@ constexpr double kStartExemptionMeters = 1500.0;
 // near the seam is how loops legitimately close.
 constexpr float kRejoinGradeShare = 0.5f;
 
+// ADR-0037 Distance Flex: the widened harvest band (fractions of target/2) feeding the
+// refill queue's tail — a clean off-target loop beats a defective on-target one. The
+// measured ScanBand (wayfinder #50/#54); mostly-shorter by design, so flex fills lean
+// under target rather than over.
+constexpr float kFlexLoFrac = 0.55f;
+constexpr float kFlexHiFrac = 1.18f;
+
 // Reconstruct the forward PathInfo (start -> turnaround) from the expansion label tree.
 // Walk the predecessor chain (mirror centroid path reconstruction), then reverse to
 // start->turnaround order. Each leg's costs are cumulative from the start, which is the
@@ -1092,11 +1099,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   auto* cost = mode_costing[static_cast<uint32_t>(mode)].get();
   cost->clear_used_edges();
 
-  // 1) One forward expansion + harvest turnarounds (Task A4).
+  // 1) One forward expansion + harvest turnarounds (Task A4). An empty primary band is
+  //    no longer fatal here — the Distance Flex scan below may still fill the queue.
   RoundTripExpansion expander;
   auto cands = expander.Harvest(request, *reader, mode_costing, mode, target);
-  if (cands.empty())
-    throw valhalla_exception_t{442}; // no path / no candidates -> 422 to the client
 
   // 2) Dedup turnarounds by node (best curviness per node) so candidates are genuinely
   //    distinct loops, then bearing-bucket for diversity. The shuffle seed rotates the bucket
@@ -1190,6 +1196,29 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     });
     queue.insert(queue.end(), rest.begin(), rest.end());
   }
+
+  // Distance Flex (ADR-0037): the same expansion tree re-scanned in the widened band
+  // feeds the queue's tail, node-deduped against everything already queued — a clean
+  // off-target loop beats a defective on-target one, and a cell whose primary band is
+  // empty can still serve. T4 makes this scan lazy (run only when the primary stalls).
+  {
+    const auto& sll = options.locations(0).ll();
+    auto wide = expander.ScanBand(*reader, PointLL{sll.lng(), sll.lat()}, target,
+                                  kFlexLoFrac, kFlexHiFrac);
+    const uint32_t base = static_cast<uint32_t>(cands.size());
+    for (const auto& t : wide)
+      if (queued.insert(t.node).second)
+        cands.push_back(t);
+    std::vector<uint32_t> widx;
+    for (uint32_t i = base; i < static_cast<uint32_t>(cands.size()); ++i)
+      widx.push_back(i);
+    std::sort(widx.begin(), widx.end(), [&](uint32_t a, uint32_t c) {
+      return cands[a].curviness_per_km > cands[c].curviness_per_km;
+    });
+    queue.insert(queue.end(), widx.begin(), widx.end());
+  }
+  if (queue.empty())
+    throw valhalla_exception_t{442}; // nothing in either band -> 422 to the client
 
   // Return-leg router (ADR-0037 hard-excluded return): the forward leg's edges (both
   // directions) are hard-excluded from the return search, so the loop must close on
