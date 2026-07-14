@@ -68,8 +68,18 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
   const auto& start_ll_pb = api.options().locations(0).ll();
   const PointLL start_ll{start_ll_pb.lng(), start_ll_pb.lat()};
 
-  const uint32_t lo = static_cast<uint32_t>(target_half * (1.0f - kDistanceBand));
-  const uint32_t hi = static_cast<uint32_t>(target_half * (1.0f + kDistanceBand));
+  return ScanBand(reader, start_ll, target_distance_m, 1.0f - kDistanceBand,
+                  1.0f + kDistanceBand);
+}
+
+std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
+                                                     const PointLL& start_ll,
+                                                     double target_distance_m,
+                                                     float lo_frac,
+                                                     float hi_frac) {
+  const double target_half = target_distance_m * 0.5;
+  const uint32_t lo = static_cast<uint32_t>(target_half * lo_frac);
+  const uint32_t hi = static_cast<uint32_t>(target_half * hi_frac);
 
   std::vector<Turnaround> out;
   for (uint32_t i = 0; i < bdedgelabels_.size(); ++i) {
@@ -116,7 +126,9 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
       continue;
 
     // Reject turnarounds whose node sits near the start (there-and-back / tiny loop).
-    if (static_cast<double>(start_ll.Distance(node_ll)) < target_half * kMinStraightFraction)
+    // Proportional to the candidate's own path distance so the widened flex band's
+    // shorter candidates are judged fairly (default band: pd ~ target_half — unchanged).
+    if (static_cast<double>(start_ll.Distance(node_ll)) < pd * kMinStraightFraction)
       continue;
 
     Turnaround t;
