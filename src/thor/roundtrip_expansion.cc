@@ -81,48 +81,77 @@ std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
   const uint32_t lo = static_cast<uint32_t>(target_half * lo_frac);
   const uint32_t hi = static_cast<uint32_t>(target_half * hi_frac);
 
+  // Post-hoc curviness-per-km + bounce rejection (ADR-0037 turnaround hardening: the
+  // costing's own U-turn test — pred.opp_local_idx() == edge.localedgeidx() — admits
+  // U-turns at dead ends, so a chain can legally ride into a spur and bounce back; a
+  // bounced chain bakes the out-and-back stub into the forward leg).
+  // A per-label chain walk makes this O(labels x chain depth) with a tile lookup per
+  // step — the measured harvest tail on 200-300 km requests (wayfinder #54). Chains
+  // share their prefixes, so the sums memoize once per label instead: lazy DP over the
+  // predecessor forest. An unresolvable tile skips that step's contribution and bounce
+  // test, exactly like the walk did.
+  const uint32_t n = static_cast<uint32_t>(bdedgelabels_.size());
+  constexpr double kUnresolved = -1.0;
+  std::vector<double> curv_sum(n, kUnresolved);
+  std::vector<double> len_sum(n, 0.0);
+  std::vector<uint8_t> bounced(n, 0);
+  std::vector<uint32_t> chain;
+  auto resolve = [&](uint32_t leaf) {
+    chain.clear();
+    for (uint32_t j = leaf; j != kInvalidLabel && curv_sum[j] == kUnresolved;
+         j = bdedgelabels_[j].predecessor())
+      chain.push_back(j);
+    for (auto it = chain.rbegin(); it != chain.rend(); ++it) {
+      const uint32_t k = *it;
+      const uint32_t pred = bdedgelabels_[k].predecessor();
+      const double base_curv = pred != kInvalidLabel ? curv_sum[pred] : 0.0;
+      const double base_len = pred != kInvalidLabel ? len_sum[pred] : 0.0;
+      const uint8_t base_bounced = pred != kInvalidLabel ? bounced[pred] : 0;
+      const GraphId eid = bdedgelabels_[k].edgeid();
+      graph_tile_ptr tile = reader.GetGraphTile(eid);
+      if (!tile) {
+        curv_sum[k] = base_curv;
+        len_sum[k] = base_len;
+        bounced[k] = base_bounced;
+        continue;
+      }
+      const DirectedEdge* de = tile->directededge(eid);
+      const bool bounce_here = pred != kInvalidLabel &&
+                               bdedgelabels_[pred].opp_local_idx() == de->localedgeidx();
+      bounced[k] = base_bounced || bounce_here ? 1 : 0;
+      curv_sum[k] = base_curv + static_cast<double>(de->curvature()) * de->length();
+      len_sum[k] = base_len + de->length();
+    }
+  };
+
   std::vector<Turnaround> out;
-  for (uint32_t i = 0; i < bdedgelabels_.size(); ++i) {
+  for (uint32_t i = 0; i < n; ++i) {
     const uint32_t pd = bdedgelabels_[i].path_distance();
     if (pd < lo || pd > hi)
       continue;
+    resolve(i);
+    if (bounced[i] || len_sum[i] <= 0.0)
+      continue;
 
-    // Post-hoc curviness-per-km: walk the predecessor chain summing curvature*len.
-    // The same walk rejects bounced chains (ADR-0037 turnaround hardening): the
-    // costing's own U-turn test (pred.opp_local_idx() == edge.localedgeidx()) admits
-    // U-turns at dead ends, so a chain can legally ride into a spur and bounce back —
-    // and harvesting it bakes the out-and-back stub into the forward leg, a spike no
-    // return leg can undo.
-    double turn_sum = 0.0, len_sum = 0.0;
+    // The turnaround node = end node of the label's leading edge; endnode may live in
+    // a different tile than the edge. Walk past unresolvable tiles like the sums do.
     PointLL node_ll = start_ll;
     GraphId turn_node;
     bool got_node = false;
-    bool bounced = false;
-    for (uint32_t l = i; l != kInvalidLabel; l = bdedgelabels_[l].predecessor()) {
+    for (uint32_t l = i; l != kInvalidLabel && !got_node;
+         l = bdedgelabels_[l].predecessor()) {
       const GraphId eid = bdedgelabels_[l].edgeid();
       graph_tile_ptr tile = reader.GetGraphTile(eid);
       if (!tile)
         continue;
-      const DirectedEdge* de = tile->directededge(eid);
-      const uint32_t pred = bdedgelabels_[l].predecessor();
-      if (pred != kInvalidLabel &&
-          bdedgelabels_[pred].opp_local_idx() == de->localedgeidx()) {
-        bounced = true;
-        break;
-      }
-      turn_sum += static_cast<double>(de->curvature()) * de->length();
-      len_sum += de->length();
-      if (!got_node) { // the turnaround node = end node of its leading edge
-        // endnode may live in a different tile than the edge; fetch its own tile.
-        turn_node = de->endnode();
-        graph_tile_ptr ntile = reader.GetGraphTile(turn_node);
-        if (ntile) {
-          node_ll = ntile->get_node_ll(turn_node);
-          got_node = true;
-        }
+      turn_node = tile->directededge(eid)->endnode();
+      graph_tile_ptr ntile = reader.GetGraphTile(turn_node);
+      if (ntile) {
+        node_ll = ntile->get_node_ll(turn_node);
+        got_node = true;
       }
     }
-    if (bounced || len_sum <= 0.0 || !got_node)
+    if (!got_node)
       continue;
 
     // Reject turnarounds whose node sits near the start (there-and-back / tiny loop).
@@ -136,7 +165,7 @@ std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
     t.path_distance = pd;
     t.bearing_deg = static_cast<float>(start_ll.Heading(node_ll)); // 0..360
     // curvature() is 0..15; normalise to 0..1 per km-equivalent for ranking only.
-    t.curviness_per_km = static_cast<float>(turn_sum / len_sum / 15.0);
+    t.curviness_per_km = static_cast<float>(curv_sum[i] / len_sum[i] / 15.0);
     t.node = turn_node.value;
     t.ll = node_ll;
     out.push_back(t);
