@@ -985,6 +985,15 @@ void thor_worker_t::path_depart_at(Api& api, const std::string& costing) {
 
 namespace {
 
+// ADR-0037 §3 Start Exemption: path-distance radius around the start inside which the
+// return leg may reuse the forward leg's edges. The first stretch of a ride is often
+// network-forced (dead-end village starts, single access roads) — barring it turns
+// every such start into a Fallback Loop. Spec'd constant: the loopqual harness's
+// metrics-v1.2 PARAM (curvagen #55) is pinned to this exact value — change them
+// together, never one alone. Granularity is the edge label: an edge whose cumulative
+// path distance exceeds the radius is excluded whole.
+constexpr double kStartExemptionMeters = 1500.0;
+
 // Reconstruct the forward PathInfo (start -> turnaround) from the expansion label tree.
 // Walk the predecessor chain (mirror centroid path reconstruction), then reverse to
 // start->turnaround order. Each leg's costs are cumulative from the start, which is the
@@ -1153,24 +1162,64 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         chosen.push_back(rest[i]);
   }
 
-  // Return-leg router: seed the reuse leash with the forward leg's edges (both directions),
-  // route turnaround -> start on fresh roads, then clear the leash for the next candidate.
+  // Return-leg router (ADR-0037 hard-excluded return): the forward leg's edges (both
+  // directions) are hard-excluded from the return search, so the loop must close on
+  // fresh roads — except within the Start Exemption, where the network-forced first
+  // stretch may carry the loop home. Every forward edge stays soft-leashed as before
+  // (the leash is what bites on the exempted stretch). If no route home exists under
+  // exclusion, one retry under the soft leash alone serves a Fallback Loop — tagged on
+  // the Loop and counted, so the build-time Defect Gate (T3) can give fallbacks the
+  // full-leg decode and the harness can gate-count them.
   bidir_astar.set_interrupt(interrupt);
   cost->set_allow_destination_only(true);
   cost->set_pass(0);
-  auto route_return = [&](uint32_t fwd_label, valhalla::Location& turn) -> std::vector<PathInfo> {
+  // Request-level avoids (loki avoid_locations) survive the per-candidate swaps.
+  const auto avoid_baseline = cost->user_avoid_edges();
+  uint32_t fallback_count = 0;
+  auto route_return = [&](uint32_t fwd_label, valhalla::Location& turn,
+                          bool& fell_back) -> std::vector<PathInfo> {
     cost->clear_used_edges();
+    const auto& labels = expander.labels();
     std::vector<uint64_t> vals;
-    for (uint32_t l = fwd_label; l != baldr::kInvalidLabel; l = expander.labels()[l].predecessor()) {
-      const GraphId e = expander.labels()[l].edgeid();
+    std::vector<sif::AvoidEdge> hard;
+    for (uint32_t l = fwd_label; l != baldr::kInvalidLabel; l = labels[l].predecessor()) {
+      const GraphId e = labels[l].edgeid();
       vals.push_back(e.value);
       const GraphId opp = reader->GetOpposingEdgeId(e);
       if (opp.is_valid())
         vals.push_back(opp.value);
+      if (static_cast<double>(labels[l].path_distance()) > kStartExemptionMeters) {
+        hard.push_back({e, 0.0});
+        if (opp.is_valid())
+          hard.push_back({opp, 0.0});
+      }
     }
     cost->mark_edges_used(vals);
+    cost->set_user_avoid_edges(avoid_baseline);
+    if (!hard.empty())
+      cost->AddUserAvoidEdges(hard);
     bidir_astar.Clear();
-    auto paths = bidir_astar.GetBestPath(turn, start, *reader, mode_costing, mode, options);
+    std::vector<std::vector<PathInfo>> paths;
+    try {
+      paths = bidir_astar.GetBestPath(turn, start, *reader, mode_costing, mode, options);
+    } catch (const std::exception&) {
+      // "No route home under exclusion" can surface as a throw or as an empty result;
+      // either way the fallback below decides.
+      paths.clear();
+    }
+    if (paths.empty() && !hard.empty()) {
+      // Re-poke the interrupt first: if the try above swallowed a client disconnect,
+      // this rethrows instead of paying a second A*.
+      if (interrupt)
+        (*interrupt)();
+      // Fallback Loop: no fresh-road route home in this network — retry on the leash.
+      fell_back = true;
+      ++fallback_count;
+      cost->set_user_avoid_edges(avoid_baseline);
+      bidir_astar.Clear();
+      paths = bidir_astar.GetBestPath(turn, start, *reader, mode_costing, mode, options);
+    }
+    cost->set_user_avoid_edges(avoid_baseline);
     cost->clear_used_edges();
     return paths.empty() ? std::vector<PathInfo>{} : paths.front();
   };
@@ -1185,6 +1234,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::vector<PathInfo> fwd, ret;
     valhalla::Location turn;
     float curviness;
+    // Fallback Loop tag (ADR-0037): the return leg came from the soft-leash retry, so
+    // it may reuse forward edges anywhere. T3's Defect Gate reads this to give the
+    // loop a full-leg decode (a seam-window verdict provably leaks wrapped bounces).
+    bool fallback;
   };
   std::vector<Loop> loops;
   for (uint32_t ci : chosen) {
@@ -1203,8 +1256,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       continue;
     std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
     std::vector<PathInfo> ret;
+    bool fell_back = false;
     try {
-      ret = route_return(cands[ci].label_index, turn);
+      ret = route_return(cands[ci].label_index, turn, fell_back);
     } catch (const std::exception& e) {
       // A return leg that cannot route fails this candidate only — the same
       // contract as the empty-path skip below. Re-poke the interrupt so a
@@ -1218,9 +1272,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       continue;
     // Distance comes from the harvest band (turnaround at target/2 ±18% => loop ~target ±18%);
     // no global re-pick correction, which would converge distinct candidates onto one loop.
-    loops.push_back(
-        {std::move(fwd), std::move(ret), std::move(turn), cands[ci].curviness_per_km});
+    loops.push_back({std::move(fwd), std::move(ret), std::move(turn),
+                     cands[ci].curviness_per_km, fell_back});
   }
+  if (fallback_count > 0)
+    LOG_INFO("roundtrip: " + std::to_string(fallback_count) +
+             " candidate(s) fell back to the soft leash (Fallback Loop)");
   if (loops.empty())
     throw valhalla_exception_t{442};
 

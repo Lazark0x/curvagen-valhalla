@@ -1289,6 +1289,17 @@ public:
     used_edges_.clear();
   }
 
+  /// ADR-0037 hard-excluded return: the round-trip action swaps a per-candidate
+  /// exclusion set in and out around each return-leg search (and drops it for the
+  /// Fallback Loop retry). The getter snapshots the request-level avoids (loki
+  /// avoid_locations) so the swaps never lose them.
+  const std::unordered_map<baldr::GraphId, float>& user_avoid_edges() const {
+    return user_exclude_edges_;
+  }
+  void set_user_avoid_edges(std::unordered_map<baldr::GraphId, float> edges) {
+    user_exclude_edges_ = std::move(edges);
+  }
+
 protected:
 
   /**
