@@ -1,0 +1,7 @@
+#!/bin/bash
+# loopqual — loop-quality eval harness CLI (curvagen wayfinder #48).
+# Uses the sibling venv when present (needed for YAML corpora), else python3.
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="$DIR/venv/bin/python"
+[ -x "$PY" ] || PY=python3
+exec "$PY" "$DIR/cli.py" "$@"
