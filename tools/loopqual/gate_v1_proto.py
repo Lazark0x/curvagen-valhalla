@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""PROTOTYPE (wayfinder #50, throwaway) — Gate v1 checker.
+"""Gate v1.2 checker (originally the #50 prototype instrument).
+
+Gate v1.2 thresholds (2026-07-14): locked to the Andrey-approved T8 done-run
+(curvagen #61/#62, engine curvagen-valhalla:t6 @ 9ca37c5f3) with a small
+ratchet above the approved values — the gate's job is now to catch any
+regression from the ACCEPTED quality, not to relitigate it. The v1-era
+absolute thresholds were calibrated on v1 meter semantics in #49; the
+approval resolves the T7 expected-red bounce for gates 3-7.
 
 Gate v1 thresholds live in curvagen issue #49 (and the coming v3 ADR); they are
 deliberately NOT part of the loopqual harness (`compare` stays a neutral meter).
@@ -60,7 +67,10 @@ def main(base_dir, cand_dir):
         row("2 spike_ge_30m <= 2%", lvl, "<= 2%", f"{b30:.1%}", f"{c30:.2%}", c30 <= 0.02)
 
         # 3/4 reuse banded means
-        for gate_no, dists, thr in (("3", (20000, 50000), 0.08), ("4", (100000, 200000, 300000), 0.03)):
+        # v1.2 locked: approved run reads 0.111 @20, 0.091/0.088 @50, 0.046 @100,
+        # 0.045 @200 c0.8 — ratcheted to 0.12 / 0.10 / 0.05.
+        for gate_no, dists, thr in (("3", (20000,), 0.12), ("3", (50000,), 0.10),
+                                    ("4", (100000, 200000, 300000), 0.05)):
             for dm in dists:
                 cd = [l["edge_reuse_geom"] for l in cl if l["distance_m"] == dm]
                 bd = [l["edge_reuse_geom"] for l in bl if l["distance_m"] == dm]
@@ -73,28 +83,38 @@ def main(base_dir, cand_dir):
         # 5 reuse tail
         ct = sum(1 for l in cl if l["edge_reuse_geom"] > 0.30) / n
         bt = sum(1 for l in bl if l["edge_reuse_geom"] > 0.30) / len(bl) if bl else 0
-        row("5 reuse>0.30 loops <= 1%", lvl, "<= 1%", f"{bt:.1%}", f"{ct:.2%}", ct <= 0.01)
+        # v1.2 locked: approved 5.9%/7.3% -> ratchet 8%.
+        row("5 reuse>0.30 loops <= 8%", lvl, "<= 8%", f"{bt:.1%}", f"{ct:.2%}", ct <= 0.08)
 
         # 6 lollipop overall + worst cell
         clf = sum(1 for l in cl if l["is_lollipop"]) / n
         blf = sum(1 for l in bl if l["is_lollipop"]) / len(bl) if bl else 0
-        row("6a lollipop overall <= 1%", lvl, "<= 1%", f"{blf:.1%}", f"{clf:.2%}", clf <= 0.01)
+        # v1.2 locked: approved 1.80%/1.82% (vlasina forced-stem residual accepted
+        # visually in T8) -> ratchet 2%.
+        row("6a lollipop overall <= 2%", lvl, "<= 2%", f"{blf:.1%}", f"{clf:.2%}", clf <= 0.02)
         cells = defaultdict(list)
         for l in cl:
             cells[(l["origin"], l["distance_m"])].append(l["is_lollipop"])
         worst_cell, worst = max(
             ((k, sum(v) / len(v)) for k, v in cells.items()), key=lambda kv: kv[1])
-        row(f"6b lollipop worst cell <= 10% ({worst_cell[0]}-{worst_cell[1]//1000}km)",
-            lvl, "<= 10%", "-", f"{worst:.1%}", worst <= 0.10)
+        # v1.2 locked: worst cell = the accepted forced-stem class (approved at
+        # 50%/20.8%) -> ratchet 55%.
+        row(f"6b lollipop worst cell <= 55% ({worst_cell[0]}-{worst_cell[1]//1000}km)",
+            lvl, "<= 55%", "-", f"{worst:.1%}", worst <= 0.55)
 
         # 7 distance_error
         cde = [l["distance_error"] for l in cl]
         bde = [l["distance_error"] for l in bl]
-        row("7 dist_err mean <= 0.20", lvl, "<= 0.20",
-            f"{st.mean(bde):.4f}" if bde else "-", f"{st.mean(cde):.4f}", st.mean(cde) <= 0.20)
-        row("7 dist_err p90 <= 0.42", lvl, "<= 0.42",
+        # v1.2 locked, per-level honesty (the recorded ADR clause; c0.8 fails the
+        # 0.20 bar at BASELINE): approved run reads mean 0.214/0.312, p90 0.390/0.630
+        # -> ratchets 0.22/0.32 and 0.42/0.65.
+        mean_thr, p90_thr = (0.22, 0.42) if c <= 0.5 else (0.32, 0.65)
+        row(f"7 dist_err mean <= {mean_thr}", lvl, f"<= {mean_thr}",
+            f"{st.mean(bde):.4f}" if bde else "-", f"{st.mean(cde):.4f}",
+            st.mean(cde) <= mean_thr)
+        row(f"7 dist_err p90 <= {p90_thr}", lvl, f"<= {p90_thr}",
             f"{quant(bde, 0.9):.4f}" if bde else "-", f"{quant(cde, 0.9):.4f}",
-            quant(cde, 0.9) <= 0.42)
+            quant(cde, 0.9) <= p90_thr)
 
         # 8 curviness held
         ccv = st.mean([l["curviness_geom_clean"] for l in cl])
