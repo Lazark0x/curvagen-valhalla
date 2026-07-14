@@ -537,6 +537,62 @@ TEST_F(MotorcycleRoundTripDirtyLastResort, DirtyLoopServedWhenNothingCleanExists
   EXPECT_TRUE(rode_corridor) << "the last-resort loop should be the corridor loop";
 }
 
+// Adjacent turnarounds B and D converge onto a byte-identical loop (the door-drop
+// detour, the T2 dedup case). With B and C ranked as the top two picks and K=2, the
+// duplicate must be detected AT BUILD TIME so the queue refills the slot with the
+// genuinely distinct C loop — a post-build dedup would silently serve 1 of 2.
+class MotorcycleRoundTripDedupRefill : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      A------------B-C
+                   | |
+                   D-E
+                   | |
+                   F-G
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
+        {"BD", {{"highway", "secondary"}}}, {"CE", {{"highway", "secondary"}}},
+        {"DE", {{"highway", "secondary"}}}, {"DF", {{"highway", "secondary"}}},
+        {"EG", {{"highway", "secondary"}}}, {"FG", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 500);
+    map = gurka::buildtiles(layout, ways, {}, {},
+                            "test/data/motorcycle_roundtrip_dedup_refill");
+
+    // Rank B (1.0) over D (0.99) over C (0.87): the converging pair (B, D) is the
+    // top-2 pick. Curvature edits change harvest RANKING only — the request sends no
+    // prefer_curvature, so routing costs and the measured tie-breaks stay put.
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> curvy15, curvy14;
+    curvy15.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "A", "B")));
+    curvy15.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "B", "A")));
+    curvy14.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "B", "D")));
+    curvy14.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, "D", "B")));
+    test::customize_edges(map.config, [&curvy15, &curvy14](const baldr::GraphId& edgeid,
+                                                           baldr::DirectedEdge& edge) {
+      if (std::find(curvy15.begin(), curvy15.end(), edgeid) != curvy15.end())
+        edge.set_curvature(15);
+      else if (std::find(curvy14.begin(), curvy14.end(), edgeid) != curvy14.end())
+        edge.set_curvature(14);
+    });
+  }
+};
+gurka::map MotorcycleRoundTripDedupRefill::map = {};
+
+TEST_F(MotorcycleRoundTripDedupRefill, ConvergedDuplicateRefillsInsteadOfShrinkingFill) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "14000"},
+                                  {"/roundtrip/num_candidates", "2"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  EXPECT_EQ(paths.size(), 2u) << "duplicate convergence must refill, not shrink the fill";
+  std::set<std::vector<std::string>> uniq(paths.begin(), paths.end());
+  EXPECT_EQ(uniq.size(), paths.size()) << "identical alternates served";
+}
+
 // The harvest lands INSIDE a curvy dead-end stub (C-P-Q): the chain carries no U-turn,
 // so bounce rejection cannot see it, and every loop built from the stub bounces on the
 // return. The junction C below the stub sits outside both harvest bands, so no refill
