@@ -69,7 +69,8 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
                           : std::make_shared<baldr::GraphReader>(config.get_child("mjolnir"))),
       matcher_factory(config, reader), controller{},
       allow_hierarchy_limits_modifications(
-          config.get<bool>("service_limits.hierarchy_limits.allow_modification", false)) {
+          config.get<bool>("service_limits.hierarchy_limits.allow_modification", false)),
+      roundtrip_stage_timing(config.get<bool>("thor.roundtrip_stage_timing", false)) {
 
   // Select the matrix algorithm based on the conf file (defaults to
   // select_optimal if not present)
