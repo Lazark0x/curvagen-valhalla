@@ -295,6 +295,24 @@ TEST_F(MotorcycleRoundTripCulDeSac, StartExemptionClosesTheLoop) {
                       << " was reused — exemption missing (fallback retraced the corridor)";
 }
 
+TEST_F(MotorcycleRoundTripCulDeSac, HierarchyJunctionTurnaroundNotSkipped) {
+  // At this target the only in-band candidate is D reached over the PRIMARY corridor —
+  // a level-0 node whose secondary exit (DE) lives on its level-1 twin. correlate_node
+  // must surface the whole physical junction's outbound set, or the non-U-turn
+  // outbound guard reads D as exitless and the request 442s.
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "20000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "1.0"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u) << "junction turnaround was skipped as exitless";
+  std::map<std::string, int> count;
+  for (const auto& edge : paths[0])
+    ++count[edge];
+  EXPECT_EQ(count["CD"], 1) << "the U-turn door must stay closed at the junction";
+  EXPECT_EQ(count["ED"], 1) << "the return must leave over the level-1 twin's exit";
+}
+
 // No fresh road home exists: the corridor is the only connection to A, so the
 // hard-excluded pass finds nothing and the ONE soft-leash retry must serve a
 // Fallback Loop instead of failing the cell (clean-first, dirty-last-resort).
