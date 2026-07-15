@@ -151,6 +151,22 @@ protected:
   // the box, so it stays wired rather than compiled out.
   bool roundtrip_stage_timing;
 
+  // wayfinder #46 cross-candidate distinctness. roundtrip_xcand_penalty: each built
+  // loop's fresh-road edges soft-surcharge later candidates' return legs, pushing the
+  // bank off shared corridors. roundtrip_sharing_filter: reject a built loop that shares
+  // more than roundtrip_sharing_frac of its length with an already-kept one and refill
+  // the slot. Both config-gated, default off, so the bank-distinctness fix can be A/B'd.
+  bool roundtrip_xcand_penalty;
+  bool roundtrip_sharing_filter;
+  // Tuning for the two knobs above (config "thor.roundtrip_*"; defaults are the swept
+  // ship values). xcand_strength = soft surcharge added per prior loop that rode an edge;
+  // xcand_cap = max prior-use count that surcharge grows with (the ATMOS per-edge-increase
+  // cap, so a genuinely-single corridor stays routable); sharing_frac = the fresh-road
+  // overlap above which the filter calls a loop a near-duplicate.
+  double roundtrip_xcand_strength;
+  uint32_t roundtrip_xcand_cap;
+  double roundtrip_sharing_frac;
+
 private:
   std::string service_name() const override {
     return "thor";
