@@ -70,7 +70,12 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       matcher_factory(config, reader), controller{},
       allow_hierarchy_limits_modifications(
           config.get<bool>("service_limits.hierarchy_limits.allow_modification", false)),
-      roundtrip_stage_timing(config.get<bool>("thor.roundtrip_stage_timing", false)) {
+      roundtrip_stage_timing(config.get<bool>("thor.roundtrip_stage_timing", false)),
+      roundtrip_xcand_penalty(config.get<bool>("thor.roundtrip_xcand_penalty", false)),
+      roundtrip_sharing_filter(config.get<bool>("thor.roundtrip_sharing_filter", false)),
+      roundtrip_xcand_strength(config.get<double>("thor.roundtrip_xcand_strength", 0.5)),
+      roundtrip_xcand_cap(config.get<uint32_t>("thor.roundtrip_xcand_cap", 4)),
+      roundtrip_sharing_frac(config.get<double>("thor.roundtrip_sharing_frac", 0.6)) {
 
   // Select the matrix algorithm based on the conf file (defaults to
   // select_optimal if not present)

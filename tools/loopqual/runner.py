@@ -237,9 +237,11 @@ def analyze_responses(responses_dir: Path, requested_by_file=None):
         else:
             candidates = [resp["trip"]] + [a["trip"] for a in resp.get("alternates", [])]
             make = Loop.from_engine_trip
-        for slot, candidate in enumerate(candidates):
-            loop = make(candidate, meta, slot)
+        bank = [make(candidate, meta, slot) for slot, candidate in enumerate(candidates)]
+        dist = metrics.bank_distinctness(bank)  # per-bank, parallel to `bank`
+        for slot, loop in enumerate(bank):
             record = metrics.analyze_loop(loop)
+            record.update(dist[slot])
             record["file"] = fn.name
             records.append(record)
     return records, failures
@@ -378,6 +380,22 @@ def summarize(loops):
         "distance_error_p90": round(quant(derr, 0.9), 4),
         "distance_error_max": round(max(derr), 4),
     }
+    ov = [l["max_pair_overlap"] for l in loops if "max_pair_overlap" in l]
+    if ov:
+        ovr = [l["max_pair_overlap_raw"] for l in loops]
+        ct25 = [l["common_trunk_frac_25"] for l in loops]
+        ct75 = [l["common_trunk_frac_75"] for l in loops]
+        block.update({
+            "bank_overlap_mean": round(st.mean(ov), 4),
+            "bank_overlap_p50": round(quant(ov, 0.5), 4),
+            "bank_overlap_p90": round(quant(ov, 0.9), 4),
+            "bank_overlap_raw_mean": round(st.mean(ovr), 4),
+            "near_dup_gt_050_frac": round(sum(1 for v in ov if v > 0.50) / n, 4),
+            "near_dup_gt_060_frac": round(sum(1 for v in ov if v > 0.60) / n, 4),
+            "near_dup_gt_070_frac": round(sum(1 for v in ov if v > 0.70) / n, 4),
+            "common_trunk_frac_25_mean": round(st.mean(ct25), 4),
+            "common_trunk_frac_75_mean": round(st.mean(ct75), 4),
+        })
     if way:
         block["edge_reuse_way_mean"] = round(st.mean(way), 4)
         block["edge_reuse_way_n"] = len(way)
@@ -424,6 +442,9 @@ HEADLINE_ROWS = [
     ("compactness_mean", "compactness mean (IQ)", "num"),
     ("distance_error_mean", "distance_error mean", "pct"),
     ("curviness_retention_mean", "curviness_retention mean", "num"),
+    ("bank_overlap_mean", "bank_overlap mean (near-dup vs best twin)", "num"),
+    ("near_dup_gt_060_frac", "loops >60% overlap with a bank twin", "pct"),
+    ("common_trunk_frac_25_mean", "loop frac on ≥25%-of-bank trunk", "num"),
 ]
 
 

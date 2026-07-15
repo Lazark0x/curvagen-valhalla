@@ -123,6 +123,22 @@ def main(base_dir, cand_dir):
         row("8 curviness_geom_clean >= 0.95x base", lvl, ">= 0.95x",
             f"{bcv:.1f}", f"{ccv:.1f} ({ccv / bcv:.3f}x)" if bcv else f"{ccv:.1f}", ok)
 
+        # 9 bank distinctness (renumbered; latency->10, failures->11) (wayfinder #46) — the cross-candidate axis v1.2 could
+        # not see. Regression gate: a candidate must not retread its bank more than
+        # baseline (lower is better). New in v1.3, so only meaningful once BOTH runs
+        # carry the metric; skipped if the baseline predates it.
+        cov = [l["max_pair_overlap"] for l in cl if "max_pair_overlap" in l]
+        bov = [l["max_pair_overlap"] for l in bl if "max_pair_overlap" in l]
+        if cov and bov:
+            cm, bm = st.mean(cov), st.mean(bov)
+            row("9 bank_overlap_mean <= 1.02x base", lvl, "<= 1.02x",
+                f"{bm:.3f}", f"{cm:.3f} ({cm / bm:.3f}x)" if bm else f"{cm:.3f}",
+                bm == 0 or cm <= 1.02 * bm)
+            cnd = sum(1 for v in cov if v > 0.6) / len(cov)
+            bnd = sum(1 for v in bov if v > 0.6) / len(bov)
+            row("9 near_dup>0.6 frac <= base+2pp", lvl, "<= base+2pp",
+                f"{bnd:.1%}", f"{cnd:.1%}", cnd <= bnd + 0.02)
+
     # 8b ordering guard — ADVISORY since Gate v1.2 (ADR-0037 §3): the baseline
     # itself fails it, so it cannot gate a candidate. Whether the curviness
     # knob's upper range buys the rider anything is a costing-calibration
@@ -134,16 +150,16 @@ def main(base_dir, cand_dir):
                      "", f"{m08:.1f} vs {m05:.1f}",
                      "ADVISORY-PASS" if m08 > m05 else "ADVISORY-MISS"))
 
-    # 9 latency (rig ratio)
+    # 10 latency (rig ratio)
     for q in ("latency_p50_s", "latency_p95_s"):
         b, cnd = b_report["run"].get(q), c_report["run"].get(q)
         if b and cnd:
-            row(f"9 {q} <= 1.10x base", "all", "<= 1.10x", f"{b:.2f}s",
+            row(f"10 {q} <= 1.10x base", "all", "<= 1.10x", f"{b:.2f}s",
                 f"{cnd:.2f}s ({cnd / b:.2f}x)", cnd <= 1.10 * b)
 
-    # 10 failures
+    # 11 failures
     bf, cf = len(b_report.get("failures", [])), len(c_report.get("failures", []))
-    row("10 failures (done-run: 0; interim <= base)", "all", "0 / <=14",
+    row("11 failures (done-run: 0; interim <= base)", "all", "0 / <=14",
         str(bf), str(cf), cf <= bf)
 
     w = max(len(r[0]) for r in rows)

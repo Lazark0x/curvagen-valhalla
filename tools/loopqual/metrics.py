@@ -38,7 +38,7 @@ import math
 #   exemption; the geometric reuse meter discounts reuse inside it, the discount
 #   zone capped at the constant per loop end (no blank check). edge_reuse_way
 #   keeps v1 semantics (informative cross-check, not a gate input).
-METRICS_VERSION = "v1.2"
+METRICS_VERSION = "v1.3"
 
 PARAMS = {
     # ADR-0037 §3 Start Exemption: path-distance radius around the start inside
@@ -565,6 +565,85 @@ def compactness(loop: Loop) -> float:
     area = abs(area2) / 2.0
     perimeter = loop.total_m + seg_len_m(pts[-1], pts[0])
     return 4.0 * math.pi * area / (perimeter * perimeter) if perimeter else 0.0
+
+
+# --- cross-candidate bank distinctness (wayfinder #46) ----------------------
+
+
+def _loop_edge_index(loop: Loop, exemption_m: float):
+    """(keyset, [(undirected_key, seg_len, in_exemption)]) for a loop.
+
+    Undirected 1e-5 grid key == edge_reuse_geom's key. A segment is in the
+    Start Exemption when its midpoint lies within exemption_m of ride start or
+    ride end — the shared forced start stem, excluded from avoidable overlap.
+    """
+    keyset = set()
+    segs = []
+    for i in range(len(loop.pts) - 1):
+        a, b = loop.pts[i], loop.pts[i + 1]
+        k = (a, b) if a <= b else (b, a)
+        keyset.add(k)
+        mid = (loop.cum[i] + loop.cum[i + 1]) / 2.0
+        in_ex = mid < exemption_m or mid > loop.total_m - exemption_m
+        segs.append((k, loop.seg_lens[i], in_ex))
+    return keyset, segs
+
+
+def bank_distinctness(loops, exemption_m: float = PARAMS["start_exemption_m"]):
+    """Near-duplication WITHIN one served bank of K — the cross-candidate axis
+    no per-loop metric sees (wayfinder #46).
+
+    Per loop: `max_pair_overlap` = the largest length-weighted undirected-edge
+    overlap against any sibling, i.e. the fraction of THIS loop that retreads
+    its nearest twin, exemption-discounted (the shared forced start stem does
+    not count — same zone as edge_reuse_geom). Also `max_pair_overlap_raw`
+    (undiscounted), `best_twin_sep_m` (turnaround great-circle gap to that twin
+    — near == the min-separation guard's blind spot; far == distinct
+    turnarounds sharing corridor), and `common_trunk_frac_{25,33,50,75}` (loop
+    fraction on edges used by >= that share of the bank — the forced-spine vs
+    pairwise-avoidable decomposition).
+
+    Returns a list parallel to `loops`; each entry merges into that loop's
+    record. Banks of <2 loops yield zeros.
+    """
+    from collections import Counter
+    n = len(loops)
+    idx = [_loop_edge_index(L, exemption_m) for L in loops]
+    tas = [grid_to_ll(L.pts[L.seam_index]) if L.pts else (0.0, 0.0) for L in loops]
+    freq = Counter()  # distinct loops containing each undirected key
+    for keyset, _ in idx:
+        freq.update(keyset)
+    out = []
+    for i, L in enumerate(loops):
+        keyset_i, segs_i = idx[i]
+        rec = {"max_pair_overlap": 0.0, "max_pair_overlap_raw": 0.0, "best_twin_sep_m": 0.0}
+        if n >= 2 and L.total_m:
+            best = best_raw = best_sep = 0.0
+            for j in range(n):
+                if j == i:
+                    continue
+                keyset_j = idx[j][0]
+                shared = shared_raw = 0.0
+                for k, sl, in_ex in segs_i:
+                    if k in keyset_j:
+                        shared_raw += sl
+                        if not in_ex:
+                            shared += sl
+                frac = shared / L.total_m
+                if frac > best:
+                    best, best_sep = frac, haversine_m(tas[i], tas[j])
+                if shared_raw / L.total_m > best_raw:
+                    best_raw = shared_raw / L.total_m
+            rec["max_pair_overlap"] = round(best, 4)
+            rec["max_pair_overlap_raw"] = round(best_raw, 4)
+            rec["best_twin_sep_m"] = round(best_sep, 1)
+        for share, tag in ((0.75, "75"), (0.5, "50"), (0.33, "33"), (0.25, "25")):
+            thr = max(2, int(share * n + 0.999))
+            clen = (sum(sl for k, sl, ex in segs_i if not ex and freq[k] >= thr)
+                    if L.total_m else 0.0)
+            rec[f"common_trunk_frac_{tag}"] = round(clen / L.total_m, 4) if L.total_m else 0.0
+        out.append(rec)
+    return out
 
 
 # --- per-loop record --------------------------------------------------------
