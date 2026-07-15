@@ -1600,6 +1600,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   uint32_t fallback_count = 0;
   uint32_t second_via_count = 0;
   double secondvia_ms = 0;
+  // Cross-candidate corridor memory (wayfinder #46): directed-edge value -> number of
+  // already-committed loops that rode it (both directions, outside the Start Exemption
+  // disk). Grows as the bank fills; read by route_leg to surcharge shared corridors.
+  std::unordered_map<uint64_t, uint32_t> bank_edge_count;
   // Generalized corridor-aware leg router (ADR-0037): routes from -> to with the given
   // corridor hard-excluded beyond the Start Exemption, soft-leashed everywhere, and its
   // junction edges progress-grade-penalized. The round-trip return is corridor=forward
@@ -1639,10 +1643,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // Progress-graded rejoin (ADR-0037): junction edges hanging off forward-path nodes
     // get a penalty graded by how far along the forward leg the node sits. Edges on the
     // forward path itself are skipped — the leash and the hard exclusion own those.
+    std::unordered_map<uint64_t, float> rejoin;
     const float leash_surcharge = cost->reuse_factor() - 1.0f;
     if (leash_surcharge > 0.f) {
       const std::unordered_set<uint64_t> corridor_set(vals.begin(), vals.end());
-      std::unordered_map<uint64_t, float> rejoin;
       for (const auto& pn : path_nodes) {
         graph_tile_ptr ntile = reader->GetGraphTile(pn.node);
         if (!ntile)
@@ -1665,8 +1669,21 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
           }
         }
       }
-      cost->mark_rejoin_edges(std::move(rejoin));
     }
+    // Cross-candidate corridor penalty (wayfinder #46): every edge earlier loops in this
+    // bank already rode carries a soft surcharge on THIS return leg, graded by the
+    // prior-use count and capped. Merged into the rejoin tier (max wins) so EdgeFactor
+    // needs one lookup. The bank memory holds only edges outside the Start Exemption, so
+    // the network-forced start stem is never surcharged (it must stay routable home).
+    for (const auto& [ev, cnt] : bank_edge_count) {
+      const float f = 1.0f + static_cast<float>(roundtrip_xcand_strength) *
+                                 static_cast<float>(std::min(cnt, roundtrip_xcand_cap));
+      auto it = rejoin.emplace(ev, f);
+      if (!it.second && f > it.first->second)
+        it.first->second = f;
+    }
+    if (!rejoin.empty())
+      cost->mark_rejoin_edges(std::move(rejoin));
     cost->set_user_avoid_edges(avoid_baseline);
     if (!hard.empty())
       cost->AddUserAvoidEdges(hard);
@@ -1724,6 +1741,33 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // detour loop. Skipping the duplicate here lets the queue refill the slot with a
   // genuinely distinct loop instead of silently shrinking the fill at serialization.
   std::set<std::vector<uint64_t>> served_sigs;
+  // Item 4 sharing filter (wayfinder #46): each kept loop's undirected fresh-road edge
+  // keys -> length, for the K×K near-dup overlap test. Filled only when the filter is on.
+  std::vector<std::unordered_map<uint64_t, double>> built_keylens;
+  // A loop's undirected fresh-road edge-key -> length (Start-Exemption edges dropped so
+  // the forced start stem never reads as shared); returns the loop's total length.
+  auto loop_keylen = [&](const Loop& L, std::unordered_map<uint64_t, double>& kl) -> double {
+    const double fwd_total = static_cast<double>(L.fwd.back().path_distance);
+    const double ret_total = static_cast<double>(L.ret.back().path_distance);
+    auto add = [&](const std::vector<PathInfo>& leg, bool is_ret, double total) {
+      double p = 0.0;
+      for (const auto& pi : leg) {
+        const double cum = static_cast<double>(pi.path_distance);
+        const double seglen = cum - p;
+        p = cum;
+        const double from_start = is_ret ? (total - cum) : cum;
+        if (from_start <= kStartExemptionMeters)
+          continue;
+        const GraphId e = pi.edgeid;
+        const GraphId opp = reader->GetOpposingEdgeId(e);
+        const uint64_t key = (opp.is_valid() && opp.value < e.value) ? opp.value : e.value;
+        kl[key] += seglen;
+      }
+    };
+    add(L.fwd, false, fwd_total);
+    add(L.ret, true, ret_total);
+    return fwd_total + ret_total;
+  };
   std::vector<PointLL> built_lls;
   std::unordered_set<uint64_t> built_nodes; // the distance-correction node guard
   uint32_t correction_count = 0;
@@ -2027,8 +2071,56 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       if (!served_sigs.insert(std::move(sig)).second)
         continue; // identical to an already-built loop — refill from the queue
     }
+    // Item 4 near-dup sharing filter (wayfinder #46): reject a loop that retreads more
+    // than kSharingRejectFrac of its fresh-road length onto an already-kept loop, and
+    // refill the slot from the queue — the byte-identical dedup above generalized from
+    // "identical" to "near-identical". Where the network offers fewer than K distinct
+    // corridors the bank honestly under-fills rather than serving twins.
+    if (roundtrip_sharing_filter) {
+      std::unordered_map<uint64_t, double> kl;
+      const double total = loop_keylen(*built, kl);
+      bool near_dup = false;
+      if (total > 0.0) {
+        for (const auto& prev : built_keylens) {
+          double shared = 0.0;
+          for (const auto& [k, len] : kl)
+            if (prev.count(k))
+              shared += len;
+          if (shared / total > roundtrip_sharing_frac) {
+            near_dup = true;
+            break;
+          }
+        }
+      }
+      if (near_dup)
+        continue; // refill from the queue
+      built_keylens.push_back(std::move(kl));
+    }
     built_lls.push_back(cands[serve_ci].ll);
     built_nodes.insert(cands[serve_ci].node);
+    // Register this loop's fresh-road edges in the cross-candidate memory (wayfinder
+    // #46), each edge counted once per loop so the count grades by distinct prior loops.
+    // Forward distance runs from the start; return distance is rebased to the ride end
+    // (= start), so both exemption tests mean "outside the shared start disk" and the
+    // network-forced start stem is never remembered.
+    if (roundtrip_xcand_penalty) {
+      const double ret_total = static_cast<double>(built->ret.back().path_distance);
+      std::unordered_set<uint64_t> loop_edges;
+      auto note = [&](const GraphId& e) {
+        loop_edges.insert(e.value);
+        const GraphId opp = reader->GetOpposingEdgeId(e);
+        if (opp.is_valid())
+          loop_edges.insert(opp.value);
+      };
+      for (const auto& pi : built->fwd)
+        if (static_cast<double>(pi.path_distance) > kStartExemptionMeters)
+          note(pi.edgeid);
+      for (const auto& pi : built->ret)
+        if (ret_total - static_cast<double>(pi.path_distance) > kStartExemptionMeters)
+          note(pi.edgeid);
+      for (uint64_t ev : loop_edges)
+        ++bank_edge_count[ev];
+    }
     loops.push_back(std::move(*built));
   }
   if (fallback_count > 0)
