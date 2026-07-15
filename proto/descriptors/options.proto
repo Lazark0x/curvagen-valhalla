@@ -362,7 +362,7 @@ message Costing {
       float low_class_factor = 97;
     }
     oneof has_prefer_curvature {
-      float prefer_curvature = 98;
+      float prefer_curvature = 101;
     }
     oneof has_reuse_penalty {
       float reuse_penalty = 98;
