@@ -1,6 +1,7 @@
 #include "thor/worker.h"
 #include "midgard/logging.h"
 #include "thor/isochrone.h"
+#include "thor/road_twin_index.h"
 
 #include <boost/property_tree/ptree.hpp>
 
@@ -77,7 +78,19 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_sharing_filter(config.get<bool>("thor.roundtrip_sharing_filter", false)),
       roundtrip_xcand_strength(config.get<double>("thor.roundtrip_xcand_strength", 0.5)),
       roundtrip_xcand_cap(config.get<uint32_t>("thor.roundtrip_xcand_cap", 4)),
-      roundtrip_sharing_frac(config.get<double>("thor.roundtrip_sharing_frac", 0.6)) {
+      roundtrip_sharing_frac(config.get<double>("thor.roundtrip_sharing_frac", 0.6)),
+      roundtrip_road_identity(config.get<bool>("thor.roundtrip_road_identity", true)),
+      roundtrip_parallel_tier(config.get<bool>("thor.roundtrip_parallel_tier", true)),
+      roundtrip_twin_radius_m(config.get<double>("thor.roundtrip_twin_radius_m", 30.0)),
+      roundtrip_parallel_radius_m(config.get<double>("thor.roundtrip_parallel_radius_m", 80.0)),
+      roundtrip_simple_chains(config.get<bool>("thor.roundtrip_simple_chains", true)) {
+
+  // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10): build the road-identity sidecar at
+  // engine start (first thor worker; later workers hit the cached instance) so the
+  // per-request path never pays for it.  Logs size + build time at INFO.
+  if (roundtrip_road_identity)
+    RoadTwinIndex::get(*reader, roundtrip_twin_radius_m, roundtrip_parallel_radius_m,
+                       roundtrip_parallel_tier);
 
   // Select the matrix algorithm based on the conf file (defaults to
   // select_optimal if not present)

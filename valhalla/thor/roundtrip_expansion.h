@@ -2,6 +2,7 @@
 #define VALHALLA_THOR_ROUNDTRIP_EXPANSION_H_
 
 #include "thor/dijkstras.h"
+#include "thor/road_twin_index.h"
 
 #include <cstdint>
 #include <vector>
@@ -48,6 +49,20 @@ public:
     return bdedgelabels_;
   }
 
+  // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10) — F01 harvest hygiene.  With this on,
+  // ScanBand rejects a candidate whose label chain is not SIMPLE: an undirected edge
+  // (or, when the sidecar is supplied, its twin) revisited anywhere in the chain.  That
+  // is the ring-reversal class: ride out, turn round on a roundabout/triangle/village
+  // loop, ride back — a legal reversal that bounce rejection cannot see and that bakes
+  // an out-and-back stub with a bulb at its tip into the FORWARD leg.
+  void set_chain_simplicity(bool reject_nonsimple, const RoadTwinIndex* twins) {
+    reject_nonsimple_ = reject_nonsimple;
+    twin_index_ = twins;
+  }
+  uint32_t nonsimple_rejected() const {
+    return nonsimple_rejected_;
+  }
+
 protected:
   // We only need the settled label tree, not per-node expansion callbacks.
   void ExpandingNode(baldr::GraphReader&,
@@ -62,9 +77,16 @@ protected:
   void GetExpansionHints(uint32_t& bucket_count,
                          uint32_t& edge_label_reservation) const override;
 
+  // proto/v4-p1 F01: fill nonsimple_ for every settled label in one forest pass.
+  void ComputeChainSimplicity(baldr::GraphReader& reader);
+
 private:
   float max_meters_ = 0.0f;   // = target/2 * 1.2
   float near_radius_ = 0.0f;  // explore all road levels within this radius; arterials-only beyond
+  bool reject_nonsimple_ = false;                  // proto/v4-p1 F01
+  const RoadTwinIndex* twin_index_ = nullptr;      // proto/v4-p1 F01 (twin-aware)
+  uint32_t nonsimple_rejected_ = 0;                // proto/v4-p1 ledger counter
+  std::vector<uint8_t> nonsimple_;                 // proto/v4-p1 per-label chain flag
 };
 
 } // namespace thor

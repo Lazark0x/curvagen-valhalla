@@ -2,6 +2,7 @@
 #include "midgard/logging.h"
 #include "proto/common.pb.h"
 #include "thor/route_matcher.h"
+#include "thor/road_twin_index.h"
 #include "thor/roundtrip_expansion.h"
 #include "thor/triplegbuilder.h"
 #include "thor/worker.h"
@@ -1017,19 +1018,14 @@ constexpr float kFlexHiFrac = 1.18f;
 // (the proto-v3f lesson: 32 underfilled cells, dirty served, spikes back).
 constexpr uint32_t kAttemptSlack = 8;
 
-// ADR-0037 §2 Second Via: the Defect Gate's decode adds the loopqual metrics-v1.2 stem
-// check (tools/loopqual/metrics.py, curvagen #55) — corridor-proximity stem, discounted
-// by the Start Exemption. A clean loop whose stem fraction exceeds the lollipop
-// threshold is rebuilt two-lobed: a second via bearing-diverse from the turnaround,
-// opposite half-sector, drawn from the same (widened) candidate band. The ladder keeps
-// the one-via loop whenever the two-lobe build fails — never a no-route over shape.
-constexpr double kSecondViaStemFrac = 0.10;   // = PARAMS["lollipop_stem_frac_threshold"]
-constexpr double kStemCorridorRadiusM = 40.0; // = PARAMS["lollipop_corridor_radius_m"]
-constexpr double kStemGapM = 120.0;           // = PARAMS["lollipop_gap_m"]
-constexpr double kStemMinM = 150.0;           // = PARAMS["lollipop_min_stem_m"]
-// Build-time tunables (ADR §2 pins the principle; these are ours to tune):
-constexpr float kSecondViaSectorDeg = 180.0f; // eligible V2 sector width around bearing+180
-constexpr uint32_t kSecondViaRetries = 2;     // V2 candidates tried before keeping one-via
+// PROTOTYPE proto/v4-p1 (curvagen-valhalla#10): SECOND VIA IS DELETED.  The census
+// (defect atlas v2 §7.2) found it structurally unreachable on rider demand — 0 rebuilds
+// in 320 Belgrade requests, passes-home 0.1 % of 6 622 loops — while the audit's G4
+// pinned it as a figure-8 through the rider's home whose leg C falls back to no
+// exclusion at all (F06).  Its constants (kSecondViaStemFrac / kStemCorridorRadiusM /
+// kStemGapM / kStemMinM / kSecondViaSectorDeg / kSecondViaRetries), the stem_fraction()
+// detector that only it used, its ledger line and its three gurka tests go with it.
+// ADR-0037 keeps the record.
 
 // ADR-0037 §2 node-guarded one-shot distance correction (ADR-0033's deferred
 // "maintainer's call", now called): a built loop landing outside tolerance gets ONE
@@ -1248,137 +1244,6 @@ bool decode_leg_grid(const std::vector<PathInfo>& leg,
   return true;
 }
 
-// ADR-0037 §2: the metrics-v1.2 stem check, mirrored from the loopqual harness
-// (corridor_stats in tools/loopqual/metrics.py). stem_out = length of the maximal leg0
-// PREFIX whose points lie within the corridor radius of leg1 (unshared gaps <= kStemGapM
-// tolerated); stem_back = same for the leg1 SUFFIX vs leg0. Each stem is discounted by
-// the Start Exemption (the network-forced first stretch is designed behavior), stems
-// under kStemMinM zero out, and the result is (stem_out + stem_back) / loop length.
-// Distances run in a local equirectangular frame (fine at corridor scale).
-double stem_fraction(const std::vector<PathInfo>& fwd,
-                     const std::vector<PathInfo>& ret,
-                     baldr::GraphReader& reader) {
-  // A lollipop stem lives at the ride's START: the forward PREFIX shadowed by the
-  // return SUFFIX. Decoding whole legs for it made every clean loop pay an O(shape)
-  // decode + corridor hash (measured against gate 9 once the distance correction's
-  // rebuilds landed on top). Slice both legs to a start-side window first — a stem
-  // reaching the window edge is over the trigger threshold by construction, so the
-  // check stays trigger-exact; the (rare) mid-loop shadow the harness's full-leg
-  // meter would fold into a stem is deliberately out of the engine's window.
-  const float total_est = fwd.back().path_distance + ret.back().path_distance;
-  const float window_m = static_cast<float>(kStartExemptionMeters) +
-                         static_cast<float>(kSecondViaStemFrac) * total_est + 1000.0f;
-  std::vector<PathInfo> fwd_win;
-  for (const auto& pi : fwd) {
-    fwd_win.push_back(pi);
-    if (pi.path_distance > window_m)
-      break;
-  }
-  const float ret_total = ret.back().path_distance;
-  size_t ret_from = 0;
-  while (ret_from + 1 < ret.size() &&
-         ret_total - ret[ret_from].path_distance > window_m)
-    ++ret_from;
-  const std::vector<PathInfo> ret_win(ret.begin() + ret_from, ret.end());
-
-  std::vector<std::pair<int64_t, int64_t>> leg0, leg1;
-  if (!decode_leg_grid(fwd_win, reader, leg0) || !decode_leg_grid(ret_win, reader, leg1))
-    return 0.0;
-  if (leg0.size() < 2 || leg1.size() < 2)
-    return 0.0;
-
-  const double coslat = std::cos(leg0.front().first * 1e-5 * midgard::kRadPerDeg);
-  const double m_per_unit_lat = 1e-5 * midgard::kMetersPerDegreeLat;
-  const double m_per_unit_lon = m_per_unit_lat * coslat;
-  auto dist_m = [&](const std::pair<int64_t, int64_t>& a, const std::pair<int64_t, int64_t>& b) {
-    const double dy = (a.first - b.first) * m_per_unit_lat;
-    const double dx = (a.second - b.second) * m_per_unit_lon;
-    return std::sqrt(dx * dx + dy * dy);
-  };
-  auto seg_lens = [&](const std::vector<std::pair<int64_t, int64_t>>& leg) {
-    std::vector<double> out;
-    out.reserve(leg.size() - 1);
-    for (size_t i = 0; i + 1 < leg.size(); ++i)
-      out.push_back(dist_m(leg[i], leg[i + 1]));
-    return out;
-  };
-  const std::vector<double> len0 = seg_lens(leg0), len1 = seg_lens(leg1);
-  const double total_m = static_cast<double>(total_est); // fraction is of the FULL loop
-  if (total_m <= 0.0)
-    return 0.0;
-
-  // Cell hash at ~corridor-radius pitch; a point is "shared" when any point of the
-  // other leg sits within the radius (3x3 neighborhood scan, like the harness _grid).
-  const int64_t cell_lat = std::max<int64_t>(1, llround(kStemCorridorRadiusM / m_per_unit_lat));
-  const int64_t cell_lon = std::max<int64_t>(1, llround(kStemCorridorRadiusM / m_per_unit_lon));
-  auto build_hash = [&](const std::vector<std::pair<int64_t, int64_t>>& leg) {
-    std::unordered_map<uint64_t, std::vector<std::pair<int64_t, int64_t>>> g;
-    for (const auto& k : leg)
-      g[static_cast<uint64_t>(k.first / cell_lat) << 32 |
-        (static_cast<uint64_t>(k.second / cell_lon) & 0xffffffffu)]
-          .push_back(k);
-    return g;
-  };
-  auto shared_mask = [&](const std::vector<std::pair<int64_t, int64_t>>& leg_a,
-                         const std::unordered_map<uint64_t, std::vector<std::pair<int64_t, int64_t>>>& g) {
-    std::vector<bool> mask;
-    mask.reserve(leg_a.size());
-    for (const auto& k : leg_a) {
-      bool found = false;
-      const int64_t ci = k.first / cell_lat, cj = k.second / cell_lon;
-      for (int64_t di = -1; di <= 1 && !found; ++di)
-        for (int64_t dj = -1; dj <= 1 && !found; ++dj) {
-          auto it = g.find(static_cast<uint64_t>(ci + di) << 32 |
-                           (static_cast<uint64_t>(cj + dj) & 0xffffffffu));
-          if (it == g.end())
-            continue;
-          for (const auto& o : it->second)
-            if (dist_m(k, o) <= kStemCorridorRadiusM) {
-              found = true;
-              break;
-            }
-        }
-      mask.push_back(found);
-    }
-    return mask;
-  };
-  // Walk while shared, tolerating unshared gaps <= kStemGapM (harness prefix_len).
-  auto prefix_len = [&](const std::vector<bool>& mask, const std::vector<double>& lens) {
-    double length = 0.0, last_shared = 0.0, gap = 0.0;
-    for (size_t i = 0; i < lens.size(); ++i) {
-      if (mask[i + 1]) {
-        length += gap + lens[i];
-        gap = 0.0;
-        last_shared = length;
-      } else {
-        gap += lens[i];
-        if (gap > kStemGapM)
-          break;
-      }
-    }
-    return last_shared;
-  };
-
-  const auto g1 = build_hash(leg1);
-  const auto m0 = shared_mask(leg0, g1);
-  double stem_out =
-      (m0[0] || (m0.size() > 1 && m0[1])) ? prefix_len(m0, len0) : 0.0;
-  const auto g0 = build_hash(leg0);
-  auto m1 = shared_mask(leg1, g0);
-  std::reverse(m1.begin(), m1.end());
-  std::vector<double> len1r(len1.rbegin(), len1.rend());
-  double stem_back = (m1[0] || (m1.size() > 1 && m1[1])) ? prefix_len(m1, len1r) : 0.0;
-
-  // v1.2: only stem beyond the Start Exemption counts; sub-minimum stems zero out.
-  stem_out = std::max(0.0, stem_out - kStartExemptionMeters);
-  stem_back = std::max(0.0, stem_back - kStartExemptionMeters);
-  if (stem_out < kStemMinM)
-    stem_out = 0.0;
-  if (stem_back < kStemMinM)
-    stem_back = 0.0;
-  return (stem_out + stem_back) / total_m;
-}
-
 // ADR-0037 Defect Gate detector: decode both legs onto the 1e-5 grid and measure the
 // longest exact-mirror stub whose interval covers the seam — the cross-leg retrace that
 // survives every forward-side guard (a fallback return riding back down a dead-end
@@ -1486,7 +1351,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
 
   // 1) One forward expansion + harvest turnarounds (Task A4). An empty primary band is
   //    no longer fatal here — the Distance Flex scan below may still fill the queue.
+  // proto/v4-p1: the road-identity sidecar (built at engine start; this is a cached
+  // lookup).  `twin_index == nullptr` restores exact v3 behaviour.
+  const RoadTwinIndex* twin_index =
+      roundtrip_road_identity ? &RoadTwinIndex::get(*reader, roundtrip_twin_radius_m,
+                                                    roundtrip_parallel_radius_m,
+                                                    roundtrip_parallel_tier)
+                              : nullptr;
+  const bool parallel_tier = roundtrip_parallel_tier;
+
   RoundTripExpansion expander;
+  expander.set_chain_simplicity(roundtrip_simple_chains, twin_index);
   const auto t_harvest = ledger_clock::now();
   auto cands = expander.Harvest(request, *reader, mode_costing, mode, target);
   harvest_ms = ms_since(t_harvest);
@@ -1598,8 +1473,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // Request-level avoids (loki avoid_locations) survive the per-candidate swaps.
   const auto avoid_baseline = cost->user_avoid_edges();
   uint32_t fallback_count = 0;
-  uint32_t second_via_count = 0;
-  double secondvia_ms = 0;
+  // proto/v4-p1 road-identity ledger counters.
+  uint32_t twins_excluded = 0, parallels_leashed = 0, identity_legs = 0;
   // Cross-candidate corridor memory (wayfinder #46): directed-edge value -> number of
   // already-committed loops that rode it (both directions, outside the Start Exemption
   // disk). Grows as the bank fills; read by route_leg to surcharge shared corridors.
@@ -1620,24 +1495,77 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       double dist;
     };
     std::vector<NodeAt> path_nodes;
+    // proto/v4-p1 TIERED ROAD IDENTITY.  corridor_vals = the corridor and its TWINS
+    // (the opposite carriageway, sidecar radius <= 30 m) — one physical road, so the
+    // twin gets exactly the corridor's treatment: leashed everywhere, hard-excluded
+    // beyond the Start Exemption.  PARALLELS (30-80 m) are a different road that
+    // shadows this one: they join the soft leash and the progress-graded rejoin map,
+    // which nudges the return off them without boxing it in.
+    std::vector<uint64_t> corridor_vals;
+    std::vector<std::pair<uint64_t, double>> parallel_at; // edge value -> corridor distance
+    std::vector<uint64_t> tw, par;
     // Walked on the BUILT corridor (not the label chain): edges the walk-back
     // dropped from the leg are neither excluded nor leashed.
     for (const auto& pi : corridor) {
       const GraphId e = pi.edgeid;
       vals.push_back(e.value);
+      corridor_vals.push_back(e.value);
       const GraphId opp = reader->GetOpposingEdgeId(e);
-      if (opp.is_valid())
+      if (opp.is_valid()) {
         vals.push_back(opp.value);
-      if (static_cast<double>(pi.path_distance) > kStartExemptionMeters) {
+        corridor_vals.push_back(opp.value);
+      }
+      const bool beyond = static_cast<double>(pi.path_distance) > kStartExemptionMeters;
+      if (beyond) {
         hard.push_back({e, 0.0});
         if (opp.is_valid())
           hard.push_back({opp, 0.0});
       }
       graph_tile_ptr tile = reader->GetGraphTile(e);
-      if (tile)
-        path_nodes.push_back(
-            {tile->directededge(e)->endnode(), static_cast<double>(pi.path_distance)});
+      if (!tile)
+        continue;
+      const DirectedEdge* de = tile->directededge(e);
+      path_nodes.push_back({de->endnode(), static_cast<double>(pi.path_distance)});
+      if (!twin_index)
+        continue;
+      const uint64_t canon = RoadTwinIndex::canonical_id(de, e, opp);
+      tw.clear();
+      twin_index->append_twins(canon, tw);
+      for (uint64_t cv : tw) {
+        const GraphId t(cv);
+        const GraphId topp = reader->GetOpposingEdgeId(t);
+        vals.push_back(t.value);
+        corridor_vals.push_back(t.value);
+        if (topp.is_valid()) {
+          vals.push_back(topp.value);
+          corridor_vals.push_back(topp.value);
+        }
+        if (beyond) {
+          hard.push_back({t, 0.0});
+          if (topp.is_valid())
+            hard.push_back({topp, 0.0});
+          ++twins_excluded;
+        }
+      }
+      if (!parallel_tier)
+        continue;
+      par.clear();
+      twin_index->append_parallels(canon, par);
+      const double at = static_cast<double>(pi.path_distance);
+      for (uint64_t cv : par) {
+        const GraphId t(cv);
+        const GraphId topp = reader->GetOpposingEdgeId(t);
+        vals.push_back(t.value);
+        parallel_at.emplace_back(t.value, at);
+        if (topp.is_valid()) {
+          vals.push_back(topp.value);
+          parallel_at.emplace_back(topp.value, at);
+        }
+        ++parallels_leashed;
+      }
     }
+    if (twin_index)
+      ++identity_legs;
     cost->mark_edges_used(vals);
 
     // Progress-graded rejoin (ADR-0037): junction edges hanging off forward-path nodes
@@ -1646,29 +1574,38 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::unordered_map<uint64_t, float> rejoin;
     const float leash_surcharge = cost->reuse_factor() - 1.0f;
     if (leash_surcharge > 0.f) {
-      const std::unordered_set<uint64_t> corridor_set(vals.begin(), vals.end());
+      const std::unordered_set<uint64_t> corridor_set(corridor_vals.begin(),
+                                                      corridor_vals.end());
+      auto grade_at = [&](double dist) {
+        return 1.0f + leash_surcharge * kRejoinGradeShare *
+                          static_cast<float>(1.0 - std::min(1.0, dist / total_dist));
+      };
+      auto bump = [&](uint64_t ev, float grade) {
+        if (corridor_set.count(ev))
+          return;
+        auto it = rejoin.emplace(ev, grade);
+        if (!it.second && grade > it.first->second)
+          it.first->second = grade;
+      };
       for (const auto& pn : path_nodes) {
-        graph_tile_ptr ntile = reader->GetGraphTile(pn.node);
-        if (!ntile)
-          continue;
-        const NodeInfo* ni = ntile->node(pn.node);
-        const float grade = 1.0f + leash_surcharge * kRejoinGradeShare *
-                                       static_cast<float>(1.0 - std::min(1.0, pn.dist / total_dist));
-        for (uint32_t i = 0; i < ni->edge_count(); ++i) {
-          const GraphId eid(pn.node.tileid(), pn.node.level(), ni->edge_index() + i);
-          if (!corridor_set.count(eid.value)) {
-            auto it = rejoin.emplace(eid.value, grade);
-            if (!it.second && grade > it.first->second)
-              it.first->second = grade;
-          }
+        const float grade = grade_at(pn.dist);
+        // proto/v4-p1 F04: the rejoin map is built over the PHYSICAL junction — all
+        // hierarchy levels — exactly as correlate_node and the walk-back already are.
+        // v3 read only the corridor node's own level, so a primary corridor got no
+        // grade on its secondary/tertiary exits and a secondary corridor none on its
+        // unclassified ones: the anti-shadow mechanism was absent at precisely the
+        // class-mixed rural junctions where stems form.
+        for_each_junction_edge(pn.node, *reader, [&](const GraphId& eid) {
+          bump(eid.value, grade);
           const GraphId opp = reader->GetOpposingEdgeId(eid);
-          if (opp.is_valid() && !corridor_set.count(opp.value)) {
-            auto it = rejoin.emplace(opp.value, grade);
-            if (!it.second && grade > it.first->second)
-              it.first->second = grade;
-          }
-        }
+          if (opp.is_valid())
+            bump(opp.value, grade);
+        });
       }
+      // proto/v4-p1: the parallel tier — a road 30-80 m from the corridor carries the
+      // same progress grade as the corridor stretch it shadows.
+      for (const auto& [ev, dist] : parallel_at)
+        bump(ev, grade_at(dist));
     }
     // Cross-candidate corridor penalty (wayfinder #46): every edge earlier loops in this
     // bank already rode carries a soft surcharge on THIS return leg, graded by the
@@ -1730,9 +1667,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // it may reuse forward edges anywhere. The Defect Gate reads this to give the
     // loop a full-leg decode (a seam-window verdict provably leaks wrapped bounces).
     bool fallback;
-    // Second Via tag: this loop was rebuilt two-lobed for shape. Shape outranks
-    // distance — the distance correction never re-aims a two-lobe loop away.
-    bool second_via;
   };
   std::vector<Loop> loops;
   std::vector<Loop> dirty_loops;
@@ -1863,123 +1797,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (stub >= kSeamStubRejectM) {
       if (dirty_loops.size() < want)
         dirty_loops.push_back({std::move(fwd), std::move(ret), std::move(turn),
-                               cands[ci].curviness_per_km, fell_back, false});
+                               cands[ci].curviness_per_km, fell_back});
       return std::nullopt;
     }
 
-    bool via_built = false;
-    // ADR-0037 §2 Second Via: the gate's decode adds the metrics-v1.2 stem check; a
-    // clean loop over the lollipop threshold is rebuilt two-lobed — same forward leg,
-    // return re-routed through a bearing-diverse second via from the opposite
-    // half-sector of the (widened) candidate band, spliced back into the single
-    // return leg the 2-leg serialization contract expects. The ladder keeps the
-    // one-via loop whenever the rebuild fails: never a no-route over shape.
-    {
-      const auto t_sv = ledger_clock::now();
-      if (stem_fraction(fwd, ret, *reader) > kSecondViaStemFrac) {
-        widen_pool();
-        std::vector<uint32_t> v2s;
-        for (uint32_t i = 0; i < static_cast<uint32_t>(cands.size()); ++i) {
-          if (cands[i].node == cands[ci].node)
-            continue;
-          // Angular separation from the turnaround's bearing (0..180); eligible when
-          // it lands inside the opposite half-sector: within kSecondViaSectorDeg/2 of
-          // dead-opposite, i.e. separation >= 180 - width/2.
-          const float sep = std::fabs(
-              std::fmod(cands[i].bearing_deg - cands[ci].bearing_deg + 540.0f, 360.0f) - 180.0f);
-          if (sep >= 180.0f - kSecondViaSectorDeg / 2.0f)
-            v2s.push_back(i);
-        }
-        std::sort(v2s.begin(), v2s.end(), [&](uint32_t a, uint32_t c) {
-          return cands[a].curviness_per_km > cands[c].curviness_per_km;
-        });
-        uint32_t tried = 0;
-        for (uint32_t vi : v2s) {
-          if (tried++ >= kSecondViaRetries)
-            break;
-          // Leg B: turnaround -> V2, the forward corridor excluded/leashed. V2 is a
-          // plain destination here (no arrival edge yet, so no U-turn door to drop).
-          valhalla::Location v2 = correlate_node(GraphId(cands[vi].node), *reader, GraphId{});
-          // A sink V2 (no accessible edges) would hand bidir A* an empty destination
-          // correlation — the #44 crash class, destination side.
-          if (v2.correlation().edges().empty())
-            continue;
-          bool fb_b = false;
-          std::vector<PathInfo> leg_b;
-          try {
-            leg_b = route_leg(fwd, turn, v2, fb_b);
-          } catch (const std::exception&) {
-            if (interrupt)
-              (*interrupt)();
-            continue;
-          }
-          if (leg_b.empty())
-            continue;
-          // V2 becomes a turnaround for leg C: same origin hardening as any other.
-          const GraphId arrival2 = leg_b.back().edgeid;
-          graph_tile_ptr a2_tile = reader->GetGraphTile(arrival2);
-          if (!a2_tile)
-            continue;
-          valhalla::Location turn2 =
-              correlate_node(a2_tile->directededge(arrival2)->endnode(), *reader, arrival2);
-          uint32_t outbound2 = 0;
-          for (const auto& pe : turn2.correlation().edges())
-            outbound2 += pe.begin_node() ? 1 : 0;
-          if (outbound2 == 0)
-            continue;
-          // Leg C corridor = forward + leg B, path distances rebased to ride order so
-          // the Start Exemption keeps meaning "near the ride's start".
-          std::vector<PathInfo> corridor = fwd;
-          corridor.reserve(fwd.size() + leg_b.size());
-          const float fwd_total = fwd.back().path_distance;
-          for (PathInfo pi : leg_b) {
-            pi.path_distance += fwd_total;
-            corridor.push_back(pi);
-          }
-          bool fb_c = false;
-          std::vector<PathInfo> leg_c;
-          try {
-            leg_c = route_leg(corridor, turn2, start, fb_c);
-          } catch (const std::exception&) {
-            if (interrupt)
-              (*interrupt)();
-            continue;
-          }
-          if (leg_c.empty())
-            continue;
-          // Splice B+C into one return leg (response seam stays the turnaround).
-          std::vector<PathInfo> ret2 = leg_b;
-          ret2.reserve(leg_b.size() + leg_c.size());
-          const sif::Cost b_cost = leg_b.back().elapsed_cost;
-          const float b_dist = leg_b.back().path_distance;
-          for (PathInfo pi : leg_c) {
-            pi.elapsed_cost += b_cost;
-            pi.path_distance += b_dist;
-            ret2.push_back(pi);
-          }
-          // The rebuild must beat the gate at BOTH junctions — full decodes; the
-          // seam-window reasoning does not extend to a mid-return via — and clear
-          // the stem check it was triggered by.
-          if (seam_stub_m(fwd, ret2, *reader, 0.0) >= kSeamStubRejectM)
-            continue;
-          if (seam_stub_m(corridor, leg_c, *reader, 0.0) >= kSeamStubRejectM)
-            continue;
-          if (stem_fraction(fwd, ret2, *reader) > kSecondViaStemFrac)
-            continue;
-          ret = std::move(ret2);
-          fell_back = fb_b || fb_c;
-          via_built = true;
-          ++second_via_count;
-          break;
-        }
-        // Ladder exhausted => the one-via loop stands.
-      }
-      secondvia_ms += ms_since(t_sv);
-    }
-
-
     return Loop{std::move(fwd), std::move(ret), std::move(turn),
-                cands[ci].curviness_per_km, fell_back, via_built};
+                cands[ci].curviness_per_km, fell_back};
   };
 
   // Distance Flex, lazy (ADR-0037 / #54 candidate 6): the widened re-scan of the same
@@ -2020,11 +1843,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     const double actual_m = static_cast<double>(built->fwd.back().path_distance) +
                             static_cast<double>(built->ret.back().path_distance);
     const double dist_err = std::fabs(actual_m - target) / target;
-    // Two-lobe loops are exempt (shape outranks distance). Fallback Loops fire only on
-    // extreme misses — see kDistCorrFallbackThr.
+    // Fallback Loops fire only on extreme misses — see kDistCorrFallbackThr.
+    // (proto/v4-p1: the two-lobe exemption went with Second Via.)
     const double fire_thr = built->fallback ? kDistCorrFallbackThr : kDistCorrTolerance;
-    if (dist_err > fire_thr && !built->second_via &&
-        correction_count < kMaxCorrectionsPerRequest) {
+    if (dist_err > fire_thr && correction_count < kMaxCorrectionsPerRequest) {
       widen_pool();
       const double comp_pd = std::clamp(cands[ci].path_distance * target / actual_m,
                                         target * 0.5 * kFlexLoFrac,
@@ -2106,11 +1928,30 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (roundtrip_xcand_penalty) {
       const double ret_total = static_cast<double>(built->ret.back().path_distance);
       std::unordered_set<uint64_t> loop_edges;
+      std::vector<uint64_t> tws;
+      // proto/v4-p1: the cross-candidate surcharge set keys on TWINS too — a later
+      // candidate that rides the opposite carriageway of a committed loop is riding
+      // the same physical road and must pay the same surcharge.
       auto note = [&](const GraphId& e) {
         loop_edges.insert(e.value);
         const GraphId opp = reader->GetOpposingEdgeId(e);
         if (opp.is_valid())
           loop_edges.insert(opp.value);
+        if (!twin_index)
+          return;
+        graph_tile_ptr tile = reader->GetGraphTile(e);
+        if (!tile)
+          return;
+        tws.clear();
+        twin_index->append_twins(RoadTwinIndex::canonical_id(tile->directededge(e), e, opp),
+                                 tws);
+        for (uint64_t cv : tws) {
+          const GraphId t(cv);
+          loop_edges.insert(t.value);
+          const GraphId topp = reader->GetOpposingEdgeId(t);
+          if (topp.is_valid())
+            loop_edges.insert(topp.value);
+        }
       };
       for (const auto& pi : built->fwd)
         if (static_cast<double>(pi.path_distance) > kStartExemptionMeters)
@@ -2126,9 +1967,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (fallback_count > 0)
     LOG_INFO("roundtrip: " + std::to_string(fallback_count) +
              " candidate(s) fell back to the soft leash (Fallback Loop)");
-  if (second_via_count > 0)
-    LOG_INFO("roundtrip: Second Via rebuilt " + std::to_string(second_via_count) +
-             " over-stem loop(s) two-lobed");
+  // proto/v4-p1 road-identity ledger.
+  LOG_INFO("roundtrip identity: twins_excluded=" + std::to_string(twins_excluded) +
+           " parallels_leashed=" + std::to_string(parallels_leashed) + " over " +
+           std::to_string(identity_legs) + " leg(s); f01_chain_rejects=" +
+           std::to_string(expander.nonsimple_rejected()) +
+           (twin_index ? (parallel_tier ? " [twins+parallels]" : " [twins only]")
+                       : " [identity off]"));
   if (correction_count > 0)
     LOG_INFO("roundtrip: distance correction re-aimed " + std::to_string(correction_count) +
              " off-target build(s)");
@@ -2145,9 +1990,29 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (loops.empty())
     throw valhalla_exception_t{442};
 
-  // 4) Engine ranks best-first by curviness-per-km (distance gated, reuse leashed).
-  std::stable_sort(loops.begin(), loops.end(),
-                   [](const Loop& a, const Loop& b) { return a.curviness > b.curviness; });
+  // 4) proto/v4-p1 RANKING (F20, partial): hard-exclude successes rank ahead of
+  //    Fallback Loops, then curviness-per-km, stable.  v3 sorted on curviness alone —
+  //    the HARVEST CHAIN's score — which put a soft-leash return with a curvy forward
+  //    leg ahead of a clean loop, and the census measured 25.6 % of served candidates
+  //    as Fallbacks with the direct-serve slots 0-2 the worst on every axis the score
+  //    can see.  Clean-first is the one axis P1 adds; ranking the BUILT loop (return
+  //    leg, distance error, self-overlap) is P2's job.
+  std::stable_sort(loops.begin(), loops.end(), [](const Loop& a, const Loop& b) {
+    if (a.fallback != b.fallback)
+      return !a.fallback;
+    return a.curviness > b.curviness;
+  });
+
+  {
+    // proto/v4-p1: surface the served order so the ranking change is auditable in the
+    // ledger the way the fallback/gate counts already are.
+    std::string order;
+    for (size_t li = 0; li < loops.size(); ++li)
+      order += (li ? " " : "") + std::to_string(li) + ":" +
+               (loops[li].fallback ? "fb" : "cl") + "/" +
+               std::to_string(static_cast<int>(loops[li].curviness * 1000.0f));
+    LOG_INFO("roundtrip ranking: clean-first then curviness — " + order);
+  }
 
   // 5) Serialize each loop as a 2-leg TripRoute (start -> turnaround -> start). Pass fresh
   //    Location copies per leg since TripLegBuilder mutates origin/destination.
@@ -2177,10 +2042,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     LOG_INFO("roundtrip timing: harvest=" + ms(harvest_ms) + " scan=" + ms(scan_ms) +
              " walkback=" + ms(walkback_ms) + " rejoin=" + ms(rejoin_ms) +
              " astar=" + ms(astar_ms) + " astar_fb=" + ms(astar_fb_ms) +
-             " seam=" + ms(seam_ms) + " secondvia=" + ms(secondvia_ms) +
-             " build=" + ms(build_ms) +
+             " seam=" + ms(seam_ms) + " build=" + ms(build_ms) +
              " (ms) attempts=" + std::to_string(attempts) +
-             " second_vias=" + std::to_string(second_via_count) +
              " corrections=" + std::to_string(correction_count) +
              " fallbacks=" + std::to_string(fallback_count) +
              " loops=" + std::to_string(loops.size()) +

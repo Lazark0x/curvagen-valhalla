@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <unordered_map>
 
 using namespace valhalla::baldr;
 using namespace valhalla::sif;
@@ -80,6 +81,12 @@ std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
   const double target_half = target_distance_m * 0.5;
   const uint32_t lo = static_cast<uint32_t>(target_half * lo_frac);
   const uint32_t hi = static_cast<uint32_t>(target_half * hi_frac);
+
+  // proto/v4-p1 F01: one pass over the whole label forest, before any candidate is
+  // considered.  Per-candidate chain walks are O(candidates x chain depth) and cost
+  // ~1 s on a 50 km Belgrade request (measured); this is O(labels).
+  if (reject_nonsimple_ && nonsimple_.size() != bdedgelabels_.size())
+    ComputeChainSimplicity(reader);
 
   // Post-hoc curviness-per-km + bounce rejection (ADR-0037 turnaround hardening: the
   // costing's own U-turn test — pred.opp_local_idx() == edge.localedgeidx() — admits
@@ -160,6 +167,12 @@ std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
     if (static_cast<double>(start_ll.Distance(node_ll)) < pd * kMinStraightFraction)
       continue;
 
+    // proto/v4-p1 F01: reject non-simple chains (precomputed in one forest pass).
+    if (reject_nonsimple_ && nonsimple_[i]) {
+      ++nonsimple_rejected_;
+      continue;
+    }
+
     Turnaround t;
     t.label_index = i;
     t.path_distance = pd;
@@ -171,6 +184,98 @@ std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
     out.push_back(t);
   }
   return out;
+}
+
+
+// proto/v4-p1 F01 — chain simplicity over the whole settled forest.
+//
+// A label's predecessor chain is the forward leg the candidate would ride.  It is
+// NON-SIMPLE when an undirected road segment (or, with the sidecar, its twin) appears
+// twice: ride out, reverse legally on a roundabout / triangle junction / village loop,
+// ride back.  ADR-0037 bounce rejection only sees an IMMEDIATE U-turn, so this class
+// walks straight through it, wins the node-dedup and the curviness rank (the retraced
+// curvy kilometres count twice), and bakes an out-and-back stub with a bulb at its tip
+// into the FORWARD leg where neither the Defect Gate nor the stem check can see it.
+//
+// Because predecessor(k) < k always (a label is created after its predecessor settles),
+// the labels form a forest.  One DFS carrying the canonical ids of the current
+// root-to-node path in a small hash map answers "does this edge already appear above
+// me" in O(1) per label, and the flag inherits down the chain.
+void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader) {
+  const uint32_t n = static_cast<uint32_t>(bdedgelabels_.size());
+  nonsimple_.assign(n, 0);
+  if (n == 0)
+    return;
+
+  // Canonical (forward) directed-edge id per label — the undirected identity key AND
+  // the sidecar's lookup key.  Only the reverse-facing half needs an opposing lookup.
+  std::vector<uint64_t> canon(n, 0);
+  for (uint32_t k = 0; k < n; ++k) {
+    const GraphId eid = bdedgelabels_[k].edgeid();
+    graph_tile_ptr tile = reader.GetGraphTile(eid);
+    if (!tile)
+      continue;
+    const DirectedEdge* de = tile->directededge(eid);
+    canon[k] = de->forward() ? eid.value : reader.GetOpposingEdgeId(eid).value;
+  }
+
+  // children lists (reverse order so a child list comes out ascending)
+  constexpr uint32_t kEnter = 0xfffffffeu;
+  std::vector<uint32_t> child_head(n, kInvalidLabel), child_next(n, kInvalidLabel);
+  std::vector<uint32_t> roots;
+  for (uint32_t k = n; k-- > 0;) {
+    const uint32_t p = bdedgelabels_[k].predecessor();
+    if (p == kInvalidLabel) {
+      roots.push_back(k);
+    } else {
+      child_next[k] = child_head[p];
+      child_head[p] = k;
+    }
+  }
+
+  std::unordered_map<uint64_t, uint32_t> onpath;
+  std::vector<std::pair<uint32_t, uint32_t>> stack; // (label, child cursor | kEnter)
+  std::vector<uint64_t> tw;
+  for (uint32_t r : roots) {
+    stack.emplace_back(r, kEnter);
+    while (!stack.empty()) {
+      const size_t top = stack.size() - 1;
+      const uint32_t k = stack[top].first;
+      if (stack[top].second == kEnter) {
+        const uint64_t c = canon[k];
+        bool bad = false;
+        if (c) {
+          if (onpath.count(c)) {
+            bad = true;
+          } else if (twin_index_) {
+            tw.clear();
+            twin_index_->append_twins(c, tw);
+            for (uint64_t t : tw)
+              if (onpath.count(t)) {
+                bad = true;
+                break;
+              }
+          }
+          ++onpath[c];
+        }
+        const uint32_t p = bdedgelabels_[k].predecessor();
+        nonsimple_[k] = (bad || (p != kInvalidLabel && nonsimple_[p])) ? 1 : 0;
+        stack[top].second = child_head[k];
+      } else if (stack[top].second != kInvalidLabel) {
+        const uint32_t ch = stack[top].second;
+        stack[top].second = child_next[ch];
+        stack.emplace_back(ch, kEnter);
+      } else {
+        const uint64_t c = canon[k];
+        if (c) {
+          auto it = onpath.find(c);
+          if (it != onpath.end() && --it->second == 0)
+            onpath.erase(it);
+        }
+        stack.pop_back();
+      }
+    }
+  }
 }
 
 } // namespace thor

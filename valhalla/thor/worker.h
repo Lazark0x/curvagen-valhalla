@@ -167,6 +167,20 @@ protected:
   uint32_t roundtrip_xcand_cap;
   double roundtrip_sharing_frac;
 
+  // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10) — tiered road identity.  The
+  // twin/parallel sidecar (thor::RoadTwinIndex) is built once per process at engine
+  // start and read by roundtrip_impl: twins of a hard-excluded corridor edge are
+  // hard-excluded too, parallels join the soft leash + progress-graded rejoin tier.
+  // roundtrip_road_identity turns the whole mechanism off (v3 behaviour);
+  // roundtrip_parallel_tier turns the parallel tier off (the "twins only" variant).
+  bool roundtrip_road_identity;
+  bool roundtrip_parallel_tier;
+  double roundtrip_twin_radius_m;
+  double roundtrip_parallel_radius_m;
+  // PROTOTYPE proto/v4-p1 — F01: reject harvest chains that revisit an undirected edge
+  // (or its twin).  Config-gated so the before/after is one binary.
+  bool roundtrip_simple_chains;
+
 private:
   std::string service_name() const override {
     return "thor";
