@@ -34,6 +34,14 @@ Item by item:
 
 **The distinctness call, apples to apples with the prod xcand penalty on at 0.2 (§9): P1.1 reads 1.096× `bank_overlap` and +7.8 pp `near_dup > 0.6` against the same engine with the penalty on — it does NOT pass the ≤ 1.02× ratchet.** It does, however, come out *better than the rig serves today* with the penalty off (0.980×, −2.4 pp). Whether ratchet 9 is a regression bar against prod or a floor on bank quality is the decision that goes back to Andrey.
 
+> **Read §15 and §16 before acting on anything above.** §15 swept the gate's refill budget and
+> found the knob **mis-scoped** — it was shared with ADR-0037's seam gate, so every bounded
+> budget met the latency bar by putting ≥ 500 m U-turn spikes back into the bank. §16 builds
+> the scoping, pins it with gurka P1.1d, and re-measures: **spikes back to 0.00 %, fills
+> 552/552, served slots 0–5 unchanged, every whole-bank quality row better than the shared
+> knee — and latency 1.227×, not 1.10×.** The 1.10× bar and `spike_ge_500m == 0` remain
+> mutually exclusive on this binary; closing that needs a harvest-time gate, not a knob.
+
 ---
 
 ## 0. Where the xcand knobs actually live (asked for explicitly)
@@ -701,6 +709,373 @@ slots 0–2, 4 in slots 3–5) for the latency bar. If that trade is unacceptabl
 open question 7 argues it should be — the answer is not a different budget value, it is scoping
 the budget to the geometry gate's rejects so the seam gate keeps refilling unconditionally.
 
+
+## 16. Budget scoping — the re-measure
+
+§15.5 ended on a one-line prescription: the refill budget is **shared** between ADR-0037's
+seam gate and P1.1's geometry gate, so bounding it starves both, and every bounded budget
+broke Gate v1.3's one true absolute. This section is that line built, pinned by gurka, and
+re-measured once on corpus-v2 against the same pinned baseline.
+
+**Binary:** `proto/v4-p1.1` @ `3528750d5` (the scoping commit on top of `a1d24909b` + §15's
+doc fold). **Config:** byte-identical to the sweep's knee — `md5 6583bc21…` for both
+`/tmp/v8003-scoped.json` and the sweep's `/tmp/v8003-b2-norungs.json`, so the *only*
+difference between §15's knee row and every §16 row is the binary. Nine full corpus-v2 runs
+(552 requests, K = 12), one engine at a time, 3 workers, **way pass on**, prod-equivalent
+Serbia tiles (`tileset_last_modified 1785932567`), baseline
+`valhalla-curvature:prod-equivalent-b4f514d7f` on :8004.
+
+### 16.1 The change
+
+`route_action.cc:2050-2093`. The reject branch was one predicate over three kinds; it is now
+two, and the seam kind is lifted out of the budget entirely:
+
+```cpp
+const bool seam_reject = stub >= kSeamStubRejectM;
+if (seam_reject || gate_twin || gate_bounce) {
+  L.gated = true;
+  L.seam_reject = seam_reject;
+  if (seam_reject) {                       // ADR-0037: unbudgeted, as it has always been
+    ++gate_seam_refills;
+    if (dirty_loops.size() < want) dirty_loops.push_back(std::move(L));
+    return std::nullopt;
+  }
+  if (gate_refills < gate_refill_budget) { // the GEOMETRY gate's budget, and only its
+    ++gate_refills;
+    if (dirty_loops.size() < want) dirty_loops.push_back(std::move(L));
+    return std::nullopt;
+  }
+  ++gate_kept;
+  if (gate_twin)   ++gate_denied_twinride;
+  if (gate_bounce) ++gate_denied_bounce;
+}
+```
+
+A loop that trips **both** gates counts as a seam reject: the spike is the more expensive
+defect, so it wins the tie and is always refilled.
+
+`thor.roundtrip_gate_refill_budget` keeps its name, its type and its `0 = unlimited`
+semantics; what it *bounds* is now the twin ride and the mid-return bounce only. The ledger
+keeps every per-kind reject counter and its aggregate `refilled/kept` and **appends** —
+never inserts, so §15's reader still parses both binaries — the unbudgeted seam refills and
+`refill_denied_by_budget` by kind:
+
+```
+roundtrip gate: rejected seam=1 twin_ride=1 return_bounce=1; refilled 1/2, kept-in-bank 0,
+  stashed 2; seam_refills 1 (unbudgeted), refill_denied_by_budget twin_ride=0 return_bounce=0
+```
+
+### 16.2 Gurka — 44 green
+
+`gurka_roundtrip_audit` **19/19**, `gurka_motorcycle_roundtrip` **22/22**,
+`gurka_roundtrip_distinctness` **3/3**.
+
+The new test is **P1.1d `RtP11ScopedRefillBudget.P11d_SeamRefillIsNotSpentByTheGeometryBudget`**
+(`test/gurka/test_roundtrip_audit.cc`). Its map is P1.1c's dual carriageway with two changes:
+a second corridor node so there are **two** twin-ride rejects, and a 450 m dead-end spur
+`B--S` off the far end.
+
+```
+A ==E==G==B--S       A=E=G=B one-way primary (curvature 15), 3 000 m
+D ==F=====C          D=F=C its twin, one-way the other way, 30 m south
+     ...             B--S a 450 m dead-end spur
+M-----N              A-M-N-A the clean lobe (curvature 6), harvested last
+```
+
+At `roundtrip_gate_refill_budget = 1`, `num_candidates = 3`: G (2 550 m) and B (3 000 m) can
+only get home along the twin, so the first spends the budget and the second is **kept** —
+the budget is provably exhausted *before* the spur candidate is built. S (3 450 m) can only
+get home by retracing `S→B`, a 450 m exact mirror across the seam. The served bank is
+
+```
+slot 0  legs[0] = AM MN     | legs[1] = NA               mirror 0 m   (the clean lobe)
+slot 1  legs[0] = AE EG GB  | legs[1] = BC CF FD DA      mirror 0 m   (kept, gated, last tier)
+slot 2  legs[0] = AE EG     | legs[1] = GB BC CF FD DA   mirror 0 m   (topped up from the stash)
+```
+
+— no `BS` anywhere and no mirror ≥ 30 m. **On the pre-scoping binary the exhausted shared
+budget keeps the spur loop and it lands in the bank with its 450 m spike, so this test is a
+genuine regression pin, not a tautology.** A second, spur-only map is built in the same
+fixture as the discrimination proof: with nothing else in the graph the spur loop is the only
+loop, the seam gate rejects it, the last resort serves it, and the test asserts the served
+ride really does carry a ≥ 30 m mirror (measured 3 450 m). Without that probe "no spur in the
+bank" could mean "the spur was never a candidate".
+
+### 16.3 The exact configuration measured
+
+```jsonc
+"thor": {
+  "roundtrip_gate_refill_budget": 2,   // now GEOMETRY-gate rejects only; seam always refills
+  "roundtrip_fallback_rungs": false,   // §15's knee: the ladder converts 2.1 % of failed legs
+  "roundtrip_stage_timing": true,      // the ledger instrument, on both engines
+
+  // left at their P1.1 defaults, listed so the served config is explicit:
+  "roundtrip_switchback_test": true,
+  "roundtrip_built_ranking": true,
+  "roundtrip_geometry_gate": true,
+  "roundtrip_gate_twin_ride_m": 500,
+  "roundtrip_gate_return_bounce_m": 30,
+  "roundtrip_f09_budget": true
+}
+```
+
+The xcand rows add `roundtrip_xcand_penalty true`, `_cap 4` and `_strength 0.2` (or `0.35`),
+on **both** engines for the 0.2 pair. The baseline is the rig's own `valhalla.json` with only
+`httpd.service.listen` and `thor.roundtrip_stage_timing` overridden — the mount is read-only,
+so the config is layered into `/tmp` inside each container exactly as §15 did it.
+
+### 16.4 Latency — paired, four baseline brackets, two instruments
+
+| run | wall p50 | wall p95 | engine stage ms | attempts/req |
+|---|---|---|---|---|
+| baseline bracket **G** | 1.239 s | 3.009 s | 848.4 | 12.62 |
+| baseline bracket **H** | 1.141 s | 3.006 s | 812.2 | 12.62 |
+| baseline bracket **I** | 1.156 s | 3.043 s | 800.4 | 12.62 |
+| baseline bracket **J** | 1.137 s | 2.846 s | 783.5 | 12.62 |
+| **baseline pooled (n = 4)** | **1.168 s** (sd 4.1 %) | **2.976 s** | **811.1** | **12.62** |
+| scoped knee, run 1 | 1.472 s | 3.278 s | 982.8 | 14.15 |
+| scoped knee, run 2 (tight) | 1.396 s | 3.126 s | 918.7 | 14.15 |
+| **scoped knee pooled (n = 2)** | **1.434 s** | **3.202 s** | **950.8** | **14.15** |
+| **ratio** | **1.227×** | **1.076×** | **1.172×** | +1.53 |
+
+The box behaved far better than in §15 — the four baseline brackets read within **4.1 % sd**
+against the sweep session's 10.5 %, so this pair *does* resolve the 1.10 × bar, and it says
+the scoped knee is **over it**. Both instruments agree to within 6 pp; the ordering is real.
+
+Where the extra 140 ms goes, baseline pooled → scoped pooled:
+
+| stage (mean ms/request) | baseline | scoped knee | Δ |
+|---|---|---|---|
+| harvest (expansion + `ScanBand` + F01 forest pass) | 76.6 | 95.5 | +18.9 |
+| widened `ScanBand` | 17.2 | 16.4 | −0.8 |
+| rejoin map build (+ twins, parallels) | 2.3 | 6.8 | +4.5 |
+| **return-leg A\*** | 522.3 | 623.7 | **+101.4** |
+| **fallback A\* (rung ladder off)** | 157.4 | 177.0 | **+19.7** |
+| seam decode | 1.4 | 1.5 | +0.1 |
+| Second Via (baseline) / geometry gate decode (P1.1) | 9.2 | 4.4 | −4.8 |
+| TripLegBuilder | 24.9 | 25.7 | +0.8 |
+| **total** | **811.1** | **950.8** | **+139.7 (1.172×)** |
+
+**The two A\* lines carry 87 % of it, and the cause is exactly the 537 seam refills the
+scoping gave back.** Attempts/request go 12.62 → 14.15, against §15's 13.51 for the shared
+budget 2 and 15.98 for unlimited: the scoped budget sits between them, because it buys the
+seam gate's replacement builds back at full price while keeping the geometry gate capped.
+**That is the price of the absolute, stated plainly: 1.104× → 1.227× wall.**
+
+### 16.5 Fills and the gate ledger
+
+| configuration | fills 12/12 | `underfill=cap` | `=queue` | rejects seam/twin/bounce | refilled (budgeted) | seam refills | kept in bank | denied by budget twin/bounce | topped up | rungs r0/r1/r2/none | failures |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| unlimited (§11) | 538/552 | 31 | 0 | 552 / 2 611 / 106 | 2 722 | — | 0 | — | 300 | 8303/67/3054/14 | 0 |
+| budget 2 + rungs off, **shared** (§15 knee) | **552/552** | 0 | 1 | 397 / 1 724 / 91 | 867 | — | 952 | — | 1 | 7805/0/2187/14 | 0 |
+| **budget 2 + rungs off, SCOPED** | **552/552** | **0** | **2** | **537 / 1 949 / 96** | **767** | **537** | **745** | **745 / 0** | **2** | **8020/0/2428/14** | **0** |
+
+Read the scoped row as the mechanism's own account of itself: **537 seam rejects, 537 seam
+refills — every single one, unbudgeted.** 767 geometry rejects bought a replacement inside the
+budget, 745 were denied it and kept in the last tier, and the denial is **entirely twin-ride**
+(`return_bounce=0`): the mid-return bounce is rare enough (96 per corpus, 0.17 per request)
+that it never reaches an exhausted budget. Reject counts sit between the shared budget's and
+unlimited's for the same reason attempts do — more replacement builds means more built
+candidates to judge.
+
+Fills stay **552/552**, `underfill=cap` **0**. Two requests end `underfill=queue` — genuinely
+network-forced — and the last-resort top-up fills them (2 loops), so the served bank is 12/12
+on every request. Failures **0 in all nine runs**.
+
+The engine is deterministic, as in §15.1: the two knee runs produced a **byte-identical**
+`loops.jsonl` (`sha256 73984212f5b9a82a…`) and identical ledger totals; only the wall clock
+differs. Every quality number below is therefore a single measurement with no sampling error.
+
+### 16.6 The absolute is back
+
+| | `spike_ge_500m` | `spike_ge_30m` | n spikes | max stub | `seam residue` mechanism |
+|---|---|---|---|---|---|
+| baseline `b4f514d7f` | 0.00 % | 0.00 % | 0 | 0 m | 0.5 % (census) |
+| P1.1 unlimited | 0.00 % | 0.00 % | 0 | 0 m | 0.0 % |
+| budget 2 + rungs off, **shared** | **2.08 %** | **2.52 %** | **167** | **23 814 m** | two loops in the worst-20 |
+| **budget 2 + rungs off, SCOPED** | **0.00 %** | **0.00 %** | **0** | **0 m** | **0.0 % / 0.00 % in every block** |
+
+`spike_ge_500m == 0` holds at **every curviness level** and in every block. `max_stub_km max`
+is `0.000`, not "small". The 167 spikes and the 23.8 km stub the sweep introduced are gone,
+and the mechanism classifier finds **no `seam residue` loop anywhere in the corpus**. §15.5's
+diagnosis is confirmed by construction: it was the shared budget, not the budget.
+
+### 16.7 Served-slot cleanliness, and the worst 20
+
+| | unlimited | shared b2+rungs off | **SCOPED** |
+|---|---|---|---|
+| **slots 0–2** near-mirror + same-pavement | 5.4 % | 5.7 % | **5.5 %** |
+| slots 0–2 D1b unseen mean m | 121 | 125 | **125** |
+| slots 0–2 D1b unseen ≥ 500 m | 8.9 % | 9.3 % | **9.2 %** |
+| slots 0–2 D1 same-pavement run ≥ 500 m | 11.4 % | 11.0 % | **11.4 %** |
+| **slots 3–5** near-mirror + same-pavement | 3.3 % | 3.1 % | **3.4 %** |
+| slots 3–5 D1b unseen mean m | 124 | 113 | **120** |
+| slots 3–5 D1b unseen ≥ 500 m | 8.6 % | 7.9 % | **8.5 %** |
+| slots 3–5 D1 same-pavement run ≥ 500 m | 7.4 % | 7.4 % | **7.9 %** |
+| slots 9–11 D1 same-pavement run ≥ 500 m | 9.0 % | 31.1 % | **22.2 %** |
+| slots 9–11 fallback-like heavy reuse | 8.8 % | 23.3 % | **22.6 %** |
+| ALL near-mirror + same-pavement / D1b mean m | 3.1 % / 108 | 2.9 % / 117 | **3.1 % / 117** |
+| `clean` (ALL) | 9.4 % | 8.9 % | **9.1 %** |
+| ring share (F22) | 43.4 %, 0.54/loop | 46.4 %, 0.61/loop | **45.6 %, 0.59/loop** |
+
+**Slots 0–5 are within ±0.4 pp and ±4 m of the unlimited run on every near-mirror and
+same-pavement metric** — the same tolerance §15.7 claimed for the shared knee, met again, and
+now with the spike meter clean as well. The deep bank sits at **22.2 %**, between unlimited's
+9.0 % and the shared budget's 31.1 %: the scoping buys back about a third of what the budget
+sold, because seam rejects no longer squat in the last tier.
+
+Worst 20 by D1b unseen near-mirror metres:
+
+| | shared b2 + rungs off | **SCOPED** |
+|---|---|---|
+| worst loop | 4 002 m / 10.2 % of a 39.4 km ride, slot 11 | **4 002 m / 10.2 %, slot 11** |
+| slot spread | 3–11, sixteen of twenty in slots 10–11 | **3–11, none in slots 0–2, two in slots 3–5** |
+| `seam residue` entries | **2** (novisad 20 km, 3 685 m, slot 10) | **0** |
+
+The two entries in slots 3–5 are zlatibor 200 km loops at 2 506 m — **1.0 % of a 240 km ride**.
+Eighteen of the twenty are F02 near-mirror, two are fallback-like reuse, none is a spike.
+
+### 16.8 Whole-bank quality
+
+census → P1.1 unlimited → shared knee → **SCOPED**:
+
+| detector | ALL | block A Vračar | block B demand |
+|---|---|---|---|
+| **D1b unseen near-mirror ≥ 500 m** | 49.6 → 7.6 → 7.8 → **7.8 %** | **61.1 → 0.4 → 1.6 → 1.5** | **64.1 → 8.1 → 8.1 → 8.2** |
+| **D1 same-pavement run ≥ 500 m** | 29.9 → 8.2 → 13.9 → **11.4 %** | **33.6 → 0.0 → 9.3 → 6.9** | **24.6 → 2.8 → 6.5 → 4.1** |
+| D4 Fallback proxy | 28.5 → 10.2 → 17.2 → **14.3 %** | 30.5 → 6.1 → 17.1 → **13.8** | 20.0 → 6.3 → 11.2 → **8.9** |
+| D3 ≥ 1 near-rejoin ring | 64.1 → 43.4 → 46.4 → **45.6 %** | 80.4 → 47.8 → 51.2 → **50.1** | 75.2 → 54.1 → 55.5 → **55.2** |
+| `edge_reuse_geom` mean | 0.0342 → 0.0097 → 0.0201 → **0.0155** | — | — |
+| `is_lollipop` | 0.74 → 0.89 → 1.16 → **0.92 %** | — | — |
+
+**The scoped knee is better than the shared knee on every whole-bank quality row**, not merely
+on the spike meter — because a refilled seam reject is a replacement build the whole bank gets
+to keep, and the shared budget was spending that build on nothing.
+
+Curviness retention, per level, against the pooled baseline (identical to the decimal in all
+four brackets):
+
+| level | baseline | scoped knee | retention |
+|---|---|---|---|
+| c0.5 | 287.1 | 290.0 | **1.010×** |
+| c0.7 | 206.3 | 219.9 | **1.066×** |
+| **c0.8** | 344.2 | 325.4 | **0.945×** |
+| c1.0 | 233.3 | 243.7 | **1.044×** |
+
+Unmoved, as §13.1 predicted: block C's c0.8 cost is the twin exclusion, and the gate's refill
+economics neither cause nor fix it.
+
+### 16.9 Ratchet 9, and what strength 0.35 buys
+
+Both engines fired with `roundtrip_xcand_penalty true`, `cap 4`, at the strength named.
+
+| | `bank_overlap_mean` | vs its own baseline | `near_dup > 0.6` | Δpp | `common_trunk_frac_75` |
+|---|---|---|---|---|---|
+| baseline `b4f514d7f`, **xcand off** (= the rig) | 0.4931 | — | 34.2 % | — | 0.0319 |
+| **SCOPED, xcand off** | 0.5442 | 1.104× | 46.4 % | +12.2 | 0.0534 |
+| baseline `b4f514d7f`, **xcand on 0.2** (= prod) | 0.4407 | — | 24.0 % | — | 0.0290 |
+| **SCOPED, xcand on 0.2** | **0.4795** | **1.088×** | **31.3 %** | **+7.3** | 0.0457 |
+| **SCOPED, xcand on 0.35** | **0.4418** | **1.002×** | **23.2 %** | **−0.8** | 0.0409 |
+
+**At 0.2 the ratchet still fails** — 1.088× against ≤ 1.02×, +7.3 pp against ≤ +2 pp (P1.1
+unlimited read 1.096× / +7.8 pp, so the scoping is a hair better and the shape is unchanged).
+Against *the rig as it serves today*, the scoped knee with the prod penalty on reads
+**0.972× and −2.9 pp** — better on both axes, as in §9.
+
+**At 0.35 the population ratchet passes.** `bank_overlap` 0.4418 vs prod's 0.4407 is
+**1.002×**, and `near_dup > 0.6` is **0.8 pp below** prod. Per level the picture is honest
+rather than clean:
+
+| level | base (0.2) | scoped 0.2 | scoped **0.35** | near_dup base → 0.2 → **0.35** |
+|---|---|---|---|---|
+| c0.5 | 0.4613 | 1.073× | **0.982×** ✓ | 27.5 → 33.9 → **25.2 %** (−2.3 pp ✓) |
+| c0.7 | 0.3800 | 1.069× | **0.965×** ✓ | 13.6 → 20.0 → **12.3 %** (−1.3 pp ✓) |
+| c0.8 | 0.5537 | 1.132× | **1.067×** ✗ | 46.4 → 57.6 → **48.4 %** (+2.0 pp) |
+| c1.0 | 0.3753 | 1.143× | **1.079×** ✗ | 12.1 → 21.7 → **15.6 %** (+3.5 pp ✗) |
+
+So **two of four levels still fail the per-level ratchet at 0.35, and both of them are the
+levels block C and the mountains live in** — but the population bar, which is what ratchet 9
+is written against, is met. Everything else holds at 0.35: fills **552/552**, failures **0**,
+`spike_ge_500m` **0.00 %**, and curviness comes out *above* the xcand-on baseline at every
+level except c0.8 (295.5 / 229.4 / 329.9 / 252.1 against 289.9 / 207.9 / 345.3 / 233.6).
+
+Latency in the xcand block (baseline `b4f514d7f` at 0.2 read 1.308 s p50 / 3.550 s p95 in the
+same block; **that run overlapped this session's detector pass and is the least trustworthy of
+the nine**, so both denominators are given):
+
+| run | wall p50 | p95 | × same-block xcand baseline | × pooled xcand-off baseline |
+|---|---|---|---|---|
+| SCOPED, xcand on 0.2 | 1.384 s | 3.314 s | 1.058× | 1.185× |
+| **SCOPED, xcand on 0.35** | **1.478 s** | **3.791 s** | **1.130×** | **1.265×** |
+
+**The answer to the question the ticket asked: yes, the distinctness gap can be bought back —
+and no, not within the latency ratchet.** Strength 0.35 costs another ~0.09 s p50 on top of a
+knee that is already at 1.227×, so it lands near **1.27×**. The two levers are not independent
+and ADR-0039 costed exactly this: distinctness is bought with A\* work, and the geometry gate
+has already spent that headroom.
+
+### 16.10 The provisional gate, re-run
+
+| # | gate | bar | baseline (same session) | **SCOPED knee** | verdict |
+|---|---|---|---|---|---|
+| 1 | D1b ≥ 500 m, **Vračar** | down ≥ 50 %, ≥ P1's | 61.1 % | **1.5 %** (−97.5 %) | **PASS** |
+| 2 | D1b ≥ 500 m, **demand** | down ≥ 50 %, ≥ P1's | 64.1 % | **8.2 %** (−87.2 %) | **PASS** |
+| 3 | D1 ride-fraction, **Vračar** (run ≥ 500 m) | down ≥ 50 %, ≥ P1's | 33.6 % | **6.9 %** (−79.5 %) | **PASS** |
+| 4 | D1 ride-fraction, **demand** | down ≥ 50 %, ≥ P1's | 24.6 % | **4.1 %** (−83.3 %) | **PASS** |
+| 5 | curviness retention, per level | ≥ 0.95× | 287.1 · 206.3 · 344.2 · 233.3 | 1.010 · 1.066 · **0.945** · 1.044 | **FAIL at c0.8** (unmoved since P1) |
+| 6 | latency p50 | ≤ 1.10× | 1.168 s (4 brackets, sd 4.1 %) | **1.434 s = 1.227×** | **FAIL** |
+| 6b | latency p95 | — | 2.976 s | 3.202 s = **1.076×** | pass |
+| 6c | engine-stage total | — | 811 ms | 951 ms = **1.172×** | — |
+| 7 | fills K = 12 on every request | 552/552 | 550/552 | **552/552**, `cap` 0, `queue` 2 | **PASS** |
+| 8 | failures | 0 | 0 | **0** (all nine runs) | **PASS** |
+| 9 | fallback share | report | D4 proxy 28.5 % (census) | rung-2 legs **23.2 %**; **D4 proxy 14.3 %** | **improved** |
+| 10 | exempt-zone stem | report | 12.5 % of loops / 0.13 % of ride | **14.6 % / 0.13 %**; D2 ≥ 5 % 2.2 % | **flat** |
+| 11 | **Gate v1.3 absolutes (1, 2, 3, 4, 5, 7)** | pass | pass | **pass at every level** — `spike_ge_500m` **0.00 %**, `spike_ge_30m` **0.00 %**, max stub **0 m** | **PASS** |
+| 11b | Gate v1.3 **6a** lollipop ≤ 2 % | pass | c0.8 1.3 % | c0.8 **3.39 %** (c0.5 1.14 %, c0.7/c1.0 0.00 %) | **FAIL at c0.8** (P1.1: 3.65 %) |
+| 11c | Gate v1.3 **6b** worst cell ≤ 55 % | pass | vlasina-50 km c0.5 48.3 % | **c0.5 50.0 % · c0.8 54.2 % — PASS at every level** | **PASS** (P1.1: c0.8 58.3 % FAIL) |
+| 11d | Gate v1.3 **9** distinctness ratchet | ≤ 1.02× / +2 pp | — | xcand off 1.104× / +12.2 pp; **on 0.2 1.088× / +7.3 pp**; **on 0.35 1.002× / −0.8 pp** | **FAIL at 0.2, population PASS at 0.35** |
+| 12 | served-slot cleanliness (0–2, 3–5) | report | — | **5.5 % / 3.4 %**; D1b mean **125 / 120 m** | §16.7 |
+| 13 | worst-20 D1b metres | report | max 48 596 m (slot 5) | **max 4 002 m (slot 11)**, 10.2 % of its ride, none in slots 0–2 | §16.7 |
+| 14 | ring share (F22) | report | 64.1 % of loops, 1.09 rings/loop | **45.6 %, 0.59 rings/loop** | improved |
+
+**Eight of the numbered bars pass outright, four fail — latency, c0.8 curviness, c0.8
+lollipop and distinctness at 0.2 — and the rest are reports, two of which improved.** Two bars flipped from FAIL
+to PASS against §12's P1.1 reading — **fills** (538 → 552/552) and **Gate v1.3 6b at c0.8**
+(58.3 → 54.2 %) — and one flipped back from the sweep's FAIL to PASS: **the ≥ 500 m absolute**.
+
+### 16.11 Verdict
+
+**The scoping does exactly what §15.5 said it would, and it costs exactly what the seam gate
+has always cost.**
+
+- `spike_ge_500m` / `spike_ge_30m` / max stub are **0.00 % / 0.00 % / 0 m** — the sweep's one
+  disqualifying regression is gone, at every level, in every block, with no `seam residue`
+  loop left in the corpus.
+- **fills 552/552**, `underfill=cap` 0, failures 0 — §15's fill win survives.
+- **served slots 0–5 within ±0.4 pp and ±4 m of the unlimited run**, and the deep bank at
+  22.2 % against the shared budget's 31.1 %. Every whole-bank quality row beats the shared
+  knee.
+- **latency 1.227× wall p50 / 1.172× engine stage** — the bar is 1.10× and this misses it,
+  with a baseline sd of 4.1 % that is tight enough for the miss to be real. p95 is 1.076×.
+
+The Pareto front §15.7 drew does **not** collapse to a single dominant point, and that is the
+correction this section makes to the sweep's own recommendation. What collapses is the
+*quality* axis: the scoped knee dominates the shared knee outright — same fills, same served
+slots, better whole-bank, zero spikes — so **no bounded shared budget should ever be shipped
+again**. What survives is the latency axis, and on it the three live options are:
+
+| point | wall p50 | spikes | fills | slots 9–11 D1 | when |
+|---|---|---|---|---|---|
+| unlimited | 1.62× | 0 | 538/552 | 9.0 % | the deep bank is worth 1.6× and short banks are acceptable |
+| **scoped budget 2 + rungs off** | **1.227×** | **0** | **552/552** | 22.2 % | **the best point that keeps every absolute** |
+| scoped + xcand 0.35 | ~1.27× | 0 | 552/552 | — | ratchet 9's population bar also has to be met |
+
+The 1.10× ratchet cannot be met by any configuration that also holds `spike_ge_500m == 0` on
+this binary — that is now measured twice, from both sides of the knob. Meeting it needs the
+*other* mechanism §14's open question 1 named: score the candidate's return corridor **before**
+building it, so the gate rejects at harvest time and the replacement build is never paid for.
+That is P2's work, and it is the only remaining lever that does not trade an absolute away.
+
 ## Appendix A — commands
 
 Branch tip: **`proto/v4-p1.1`**, see Appendix C. Nothing pushed; `curvature-costing` untouched.
@@ -767,6 +1142,38 @@ docker exec rt-p11-base python3 -c "import json; d=json.load(open('/custom_files
 python3 ~/.curvagen-scratch/p1.1/sweep_agg.py <run_dir> <engine.log>   # one JSON row per configuration
 ```
 
+**The §16 re-measure** (binary change — `proto/v4-p1.1` @ `3528750d5`; config identical to
+the sweep's knee, `md5 6583bc21…`):
+
+```bash
+docker start rt-p1-build
+docker cp src/thor/route_action.cc           rt-p1-build:/src/valhalla/src/thor/route_action.cc
+docker cp test/gurka/test_roundtrip_audit.cc rt-p1-build:/src/valhalla/test/gurka/test_roundtrip_audit.cc
+docker exec rt-p1-build bash -lc "cd /src/valhalla && make -C build -j4 valhalla_service \
+    gurka_roundtrip_audit gurka_motorcycle_roundtrip gurka_roundtrip_distinctness"
+docker exec rt-p1-build bash -lc "cd /src/valhalla/build && ./test/gurka/gurka_roundtrip_audit"   # 19/19
+
+# the knee config is a byte-identical copy of the sweep's, so the ONLY variable is the binary
+docker exec rt-p1-build bash -lc "cp /tmp/v8003-b2-norungs.json /tmp/v8003-scoped.json"
+docker exec rt-p1-build python3 -c "import json; b=json.load(open('/tmp/v8003-scoped.json')); \
+  b['thor'].update(roundtrip_xcand_penalty=True, roundtrip_xcand_strength=0.2, roundtrip_xcand_cap=4); \
+  json.dump(b, open('/tmp/v8003-scoped-xcand.json','w'))"      # ... and -xcand035 at 0.35
+
+~/.curvagen-scratch/p1.1/scoped_lib.sh            # run_p11 / run_base, WAY PASS ON (--trace-engine)
+~/.curvagen-scratch/p1.1/scoped-phase1.sh         # base G -> scoped knee -> base H
+~/.curvagen-scratch/p1.1/scoped-phase2.sh         # base I -> knee repeat -> base J (tight latency
+                                                  # block, nothing else may run), then the three
+                                                  # xcand runs (deterministic, analysis-tolerant)
+python3 ~/.curvagen-scratch/p1.1/stage_total.py <engine.log>...   # engine-stage total, BOTH ledger
+                                                  # dialects (b4f514d7f has secondvia=, P1.1 gate=)
+~/.curvagen-scratch/p1.1/sweep-analyse.sh p1-1-scoped-knee s16
+python3 gate_v1_proto.py results/census-v2-scoped-baseG results/p1-1-scoped-knee
+./loopqual compare results/<baseline>/report.json results/p1-1-scoped-knee/report.json
+```
+
+`sweep_agg.py` and `ledger_agg.py` gained one **additive** regex each for the appended
+`seam_refills … refill_denied_by_budget …` field, so both still read every pre-§16 ledger.
+
 **A trap worth recording:** a `loopqual run` started with `nohup ... &` from a tool shell dies with that shell, and its children keep firing at the engine after the parent is gone. One P1.1 corpus was measured while a stray runner hammered the same engine (p50 3.95 s, fire 641 s); §11's numbers come from a dedicated uncontended pair. Check `pgrep -f 'loopqual run'` before trusting any latency number on this box.
 
 ## Appendix B — artefacts
@@ -786,6 +1193,12 @@ python3 ~/.curvagen-scratch/p1.1/sweep_agg.py <run_dir> <engine.log>   # one JSO
 | `tools/loopqual/results/p1-1-sweep-b2-{repeat,tight}/` · `-b1-tight/` · `-b2-norungs-tight/` | §15.2's latency repeats — same ledger, different wall clock |
 | `tools/loopqual/results/census-v2-sweep-base{A..F}/` | the six baseline brackets; A/B bracket the session, C–D and E–F are the two tight interleaved blocks |
 | **`tools/loopqual/results/p1-1-sweep-summary.md`** | **the sweep summary: the knee, the Pareto front, the config snippet** |
+| **`tools/loopqual/results/p1-1-scoped-knee/`** · `-knee-tight/` | **§16's re-measure: the scoped budget at the knee config, and its latency repeat (byte-identical `loops.jsonl`)** |
+| `tools/loopqual/results/p1-1-scoped-knee/compare/` | §16's three `loopqual compare` tables: vs census-v2, vs P1.1 unlimited, vs the sweep's shared knee |
+| `tools/loopqual/results/census-v2-scoped-base{G,H,I,J}/` | §16's four baseline brackets (pooled p50 1.168 s, sd 4.1 %) |
+| `tools/loopqual/results/p1-1-scoped-xcandon/` · `-xcand035/` · `census-v2-scoped-xcandon/` | §16.9's ratchet-9 reads: both engines at xcand 0.2, plus the scoped engine at 0.35 |
+| `~/.curvagen-scratch/p1.1/{scoped_lib.sh,scoped-phase1.sh,scoped-phase2.sh,stage_total.py}` | the §16 driver and the two-dialect engine-stage instrument |
+| `~/.curvagen-scratch/p1.1/eng-{sc,sct,scx,scx35,base{G,H,I,J},basex}.log` · `agg-s16-*.txt` | §16's nine engine ledgers and its detector tables |
 | `~/.curvagen-scratch/p1.1/{sweep_lib.sh,sweep-phase*.sh,sweep-analyse.sh,sweep_agg.py,sweep_tables.py}` | the sweep driver and its aggregation |
 | `~/.curvagen-scratch/p1.1/eng-{b4,b2,b1,b2t,b1t,b2r,b2-norungs,b1nt,base*}.log` | one engine ledger per swept run |
 | `~/.curvagen-scratch/sw{4,2,1,2n,1n}*.jsonl` · `~/.curvagen-scratch/p1.1/agg-sw*-*.txt` | detector output and tables for the swept configurations |
@@ -794,15 +1207,17 @@ Container `rt-p1-build` (the P1.1 build + engine, :8003) is **stopped, not remov
 
 ## Appendix C — the branch
 
-`proto/v4-p1.1`, cut from `proto/v4-p1` @ `6fb8e37df`. Three `proto(v4-p1.1):` commits plus this document. Nothing pushed; `curvature-costing` is untouched and carries this document as an untracked file at the same path.
+`proto/v4-p1.1`, cut from `proto/v4-p1` @ `6fb8e37df`. **Tip `3528750d5`** — three
+`proto(v4-p1.1):` commits, this document, the §15 fold (`bb43822f4`) and the §16 scoping
+(`3528750d5`). Nothing pushed; `curvature-costing` is untouched and carries this document as
+an untracked file at the same path.
 
-**The branch copy of this document is stale.** §15 was written by the sweep session into the
-**untracked working-tree copy** on `curvature-costing`; the copy committed on `proto/v4-p1.1`
-@ `a1d24909b` still ends at Appendix C. The sweep changed no code, so the branch's *binary* is
-current — only its document is behind. Fold §15 into the branch when the parent session next
-commits there; nothing was pushed and no branch was switched to write it.
+**Document and binary are now in step.** §15 was written by the sweep session into the
+untracked working-tree copy and folded onto the branch as `bb43822f4`; §16 is the code the
+sweep's §15.5 prescribed, committed as `3528750d5` together with its gurka pin, and this
+section was written against that binary. No branch was pushed.
 
-Touched: `valhalla/thor/road_twin_index.h`, `src/thor/road_twin_index.cc`, `valhalla/thor/roundtrip_expansion.h`, `src/thor/roundtrip_expansion.cc`, `src/thor/route_action.cc`, `valhalla/thor/worker.h`, `src/thor/worker.cc`, `test/gurka/test_roundtrip_audit.cc`.
+Touched: `valhalla/thor/road_twin_index.h`, `src/thor/road_twin_index.cc`, `valhalla/thor/roundtrip_expansion.h`, `src/thor/roundtrip_expansion.cc`, `src/thor/route_action.cc`, `valhalla/thor/worker.h`, `src/thor/worker.cc`, `test/gurka/test_roundtrip_audit.cc`. (§16 touches only the last two of those: `src/thor/route_action.cc` and `test/gurka/test_roundtrip_audit.cc`.)
 
 Config surface added on top of P1's five knobs (all `thor.*`):
 
@@ -813,7 +1228,7 @@ Config surface added on top of P1's five knobs (all `thor.*`):
 | `roundtrip_geometry_gate` | `true` | the twin-ride and mid-return-mirror gate halves |
 | `roundtrip_gate_twin_ride_m` | `500` | twin metres beyond the Start Exemption that reject a loop |
 | `roundtrip_gate_return_bounce_m` | `30` | mid-return exact-mirror metres that reject a loop |
-| `roundtrip_gate_refill_budget` | `0` (unlimited) | gate rejects that may buy a replacement build |
+| `roundtrip_gate_refill_budget` | `0` (unlimited) | **GEOMETRY**-gate rejects that may buy a replacement build (§16 — seam rejects are never budgeted); pre-§16 this bounded seam rejects too |
 | `roundtrip_fallback_rungs` | `true` | the intermediate rung (twins released, corridor still barred) |
 | `roundtrip_fallback_parallel_rung` | `false` | the ticket-literal parallels-only rung, kept for the measurement |
 | `roundtrip_f09_budget` | `true` | the stall branch's fresh `+want` attempt budget |
