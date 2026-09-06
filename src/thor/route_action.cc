@@ -2176,9 +2176,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // Item 4 sharing filter (wayfinder #46): each kept loop's undirected fresh-road edge
   // keys -> length, for the K×K near-dup overlap test. Filled only when the filter is on.
   std::vector<std::unordered_map<uint64_t, double>> built_keylens;
+  uint32_t sharing_filter_rejects = 0; // proto/v4-p2 ledger
   // A loop's undirected fresh-road edge-key -> length (Start-Exemption edges dropped so
   // the forced start stem never reads as shared); returns the loop's total length.
-  auto loop_keylen = [&](const Loop& L, std::unordered_map<uint64_t, double>& kl) -> double {
+  auto loop_keylen = [&](const Loop& L, std::unordered_map<uint64_t, double>& kl,
+                         std::unordered_map<uint64_t, double>& kl_twins) -> double {
+    std::vector<uint64_t> tw;
     const double fwd_total = static_cast<double>(L.fwd.back().path_distance);
     const double ret_total = static_cast<double>(L.ret.back().path_distance);
     auto add = [&](const std::vector<PathInfo>& leg, bool is_ret, double total) {
@@ -2194,6 +2197,16 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         const GraphId opp = reader->GetOpposingEdgeId(e);
         const uint64_t key = (opp.is_valid() && opp.value < e.value) ? opp.value : e.value;
         kl[key] += seglen;
+        // proto/v4-p2: TWINS-AWARE keys — a later loop riding the other carriageway of
+        // a road this loop rode is riding the same road (the ticket's post-pass K x K
+        // filter).  The twin entries carry the road's metres so the overlap test reads
+        // them like the road itself; they are never counted in this loop's own total.
+        if (pairs && twin_index) {
+          tw.clear();
+          twin_index->append_twins(key, tw);
+          for (uint64_t t : tw)
+            kl_twins[t] += seglen;
+        }
       }
     };
     add(L.fwd, false, fwd_total);
@@ -3013,8 +3026,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // "identical" to "near-identical". Where the network offers fewer than K distinct
     // corridors the bank honestly under-fills rather than serving twins.
     if (roundtrip_sharing_filter) {
-      std::unordered_map<uint64_t, double> kl;
-      const double total = loop_keylen(*built, kl);
+      std::unordered_map<uint64_t, double> kl, kl_twins;
+      const double total = loop_keylen(*built, kl, kl_twins);
       bool near_dup = false;
       if (total > 0.0) {
         for (const auto& prev : built_keylens) {
@@ -3028,8 +3041,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
           }
         }
       }
-      if (near_dup)
+      if (near_dup) {
+        ++sharing_filter_rejects;
         continue; // refill from the queue
+      }
+      // the kept loop's roads AND their twins are what later loops are tested against
+      for (const auto& [t, len] : kl_twins)
+        kl.emplace(t, len);
       built_keylens.push_back(std::move(kl));
     }
     built_lls.push_back(cands[serve_ci].ll);
@@ -3164,6 +3182,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " twin_last_resort=" + std::to_string(pair_twin_last_resort) +
              " rescue=" + std::to_string(pair_rescue_loops) + "/" +
              std::to_string(pair_rescue_attempts) +
+             " built_share_rejects=" + std::to_string(sharing_filter_rejects) +
              " gate_fires=" + std::to_string(gate_seam + gate_twinride + gate_bouncehits) +
              " pair_ms=" + std::to_string(static_cast<int>(pair_pass_ms)) +
              " eval_ms=" + std::to_string(static_cast<int>(pair_eval_ms)) +
