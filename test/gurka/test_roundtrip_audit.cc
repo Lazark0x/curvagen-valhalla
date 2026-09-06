@@ -1899,3 +1899,215 @@ TEST_F(RtP11GeometryGate, P11c_TwinRiddenReturnIsRefilled) {
       << "the slot was not refilled with the clean M-N lobe; legs[0] = " << dump_path(fwd)
       << "| legs[1] = " << dump_path(ret);
 }
+
+// ---------------------------------------------------------------------------------
+// P1.1d (§16) — THE REFILL BUDGET IS SCOPED TO THE GEOMETRY GATE.
+//
+// The sweep (§15.5) measured what a budget SHARED with ADR-0037's seam gate costs:
+// once the budget is spent, a seam reject — an exact-mirror U-turn spike, the one
+// absolute Gate v1.3 forbids — is kept in the bank instead of refilled, and
+// `spike_ge_500m` went 0.00 -> 2.08 % at every bounded budget.  This map pins the fix.
+//
+//   A ==E==G==B--S            A=E=G=B is a one-way primary carriageway (curvature 15);
+//   D ==F=====C               D=F=C is its twin, one-way the other way, 30 m south;
+//        ...                  B--S is a 450 m dead-end spur off the far end;
+//   M-----N                   A-M-N-A is a clean, straight, uncurvy lobe (curvature 6).
+//
+// Every corridor turnaround in the harvest band (G at 2 550 m, B at 3 000 m) can only
+// get home along the twin carriageway, so each is a GEOMETRY-gate reject; S at 3 450 m
+// can only get home by first retracing B--S, so it is a SEAM reject with a 450 m
+// exact mirror at the seam.  A-M-N-A is the clean alternative.  With
+// `roundtrip_gate_refill_budget = 1` the first geometry reject spends the budget and
+// the second is kept, so the budget is provably EXHAUSTED before the spur candidate is
+// ever built.  The pin: the spur loop must STILL be refilled away.
+//
+// On the pre-§16 binary this test fails — the exhausted shared budget keeps the spur
+// loop, and a 450 m spike reaches the served bank while a clean loop exists.
+// ---------------------------------------------------------------------------------
+class RtP11ScopedRefillBudget : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static gurka::map spur_only;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+                                                                                                    A                                                 E                                  G              B              S
+                                                                                                    D                                                 F                                                 C
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    M                                                 N
+    )";
+    const gurka::ways ways = {
+        {"AE", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"EG", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"GB", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"CF", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"FD", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"BC", {{"highway", "primary"}}},
+        {"DA", {{"highway", "primary"}}},
+        // the dead-end spur: the only way off S is back down S--B, so any loop that
+        // turns around at S carries a 450 m exact mirror across the seam.
+        {"BS", {{"highway", "primary"}}},
+        // the clean lobe
+        {"AM", {{"highway", "secondary"}}},
+        {"MN", {{"highway", "secondary"}}},
+        {"NA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 30);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p11_scoped_budget");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> c15, c6;
+    // the corridor, its twin and the spur are the curvy roads, so the harvest queue
+    // offers them BEFORE the clean lobe and the gate actually has to work.
+    for (const auto& [a, b] : std::vector<std::pair<std::string, std::string>>{{"A", "E"},
+                                                                              {"E", "G"},
+                                                                              {"G", "B"},
+                                                                              {"C", "F"},
+                                                                              {"F", "D"},
+                                                                              {"B", "S"},
+                                                                              {"S", "B"}})
+      c15.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    for (const auto& [a, b] : std::vector<std::pair<std::string, std::string>>{{"A", "M"},
+                                                                              {"M", "A"},
+                                                                              {"M", "N"},
+                                                                              {"N", "M"},
+                                                                              {"N", "A"},
+                                                                              {"A", "N"}})
+      c6.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    test::customize_edges(map.config, [&c15, &c6](const baldr::GraphId& edgeid,
+                                                  baldr::DirectedEdge& edge) {
+      if (std::find(c15.begin(), c15.end(), edgeid) != c15.end())
+        edge.set_curvature(15);
+      if (std::find(c6.begin(), c6.end(), edgeid) != c6.end())
+        edge.set_curvature(6);
+    });
+
+    // The discrimination proof, on its own tiles: the same 3 000 m + 450 m geometry
+    // with NOTHING else in the graph.  Every loop here is an out-and-back mirror, the
+    // seam gate rejects them all, and ADR-0037's last resort must still serve one —
+    // which is what makes "S is a real seam reject with a >= 30 m stub" a measurement
+    // rather than an assumption.
+    const std::string spur_ascii = R"(
+A                                                                                                   B              S
+    )";
+    const gurka::ways spur_ways = {
+        {"AB", {{"highway", "primary"}}},
+        {"BS", {{"highway", "primary"}}},
+    };
+    const auto spur_layout = gurka::detail::map_to_coordinates(spur_ascii, 30);
+    spur_only =
+        gurka::buildtiles(spur_layout, spur_ways, {}, {}, "test/data/rt_p11_scoped_spur");
+  }
+
+  static valhalla::Api run(gurka::map& m, uint32_t budget, uint32_t k, const char* target) {
+    m.config.put("thor.roundtrip_gate_refill_budget", budget);
+    return gurka::do_action(valhalla::Options::route, m, {"A", "A"}, "motorcycle",
+                            {{"/roundtrip/target_distance", target},
+                             {"/roundtrip/num_candidates", std::to_string(k)},
+                             {"/costing_options/motorcycle/reuse_penalty", "0.8"},
+                             {"/costing_options/motorcycle/prefer_curvature", "0.5"}});
+  }
+};
+gurka::map RtP11ScopedRefillBudget::map = {};
+gurka::map RtP11ScopedRefillBudget::spur_only = {};
+
+TEST_F(RtP11ScopedRefillBudget, P11d_SeamRefillIsNotSpentByTheGeometryBudget) {
+  // (0) THE MAP IS DISCRIMINATING: the spur really does produce a >= 30 m seam stub,
+  //     and the seam gate really does reject it (it only reaches the bank at all
+  //     because it is the last resort on tiles that hold nothing else).
+  auto probe = run(spur_only, 1, 1, "6900");
+  ASSERT_GE(probe.trip().routes_size(), 1)
+      << "REGRESSION: the seam gate starved the only loop on the spur-only tiles";
+  const double probe_stub = self_mirror_stub_m(ride_shape(probe, 0));
+  std::cerr << "[P1.1d] spur-only probe legs[0] = " << dump_path(leg_names(probe, 0, 0))
+            << "| legs[1] = " << dump_path(leg_names(probe, 0, 1)) << ", mirror = " << probe_stub
+            << " m\n";
+  ASSERT_GE(probe_stub, 30.0) << "MAP NOT DISCRIMINATING: the spur geometry does not produce a "
+                                 "seam-gate stub at all, so the treatment below proves nothing";
+
+  // (1) THE TREATMENT.  budget = 1: the first geometry reject spends it, the second is
+  //     kept, and the spur's seam reject arrives at an exhausted budget.
+  auto result = run(map, 1, 3, "6000");
+  ASSERT_GE(result.trip().routes_size(), 1)
+      << "P1.1 REGRESSION: nothing was served with the budget scoped";
+  const int n = result.trip().routes_size();
+  bool twin_ride_served = false, clean_lobe_served = false;
+  double worst_stub = 0;
+  int spur_hits = 0;
+  for (int r = 0; r < n; ++r) {
+    const auto fwd = leg_names(result, r, 0);
+    const auto ret = leg_names(result, r, 1);
+    const double stub = self_mirror_stub_m(ride_shape(result, r));
+    worst_stub = std::max(worst_stub, stub);
+    spur_hits += count_name(fwd, "BS") + count_name(ret, "BS");
+    if (count_name(ret, "CF") + count_name(ret, "FD") >= 1)
+      twin_ride_served = true;
+    if (count_name(ret, "NA") + count_name(fwd, "AM") >= 1)
+      clean_lobe_served = true;
+    std::cerr << "[P1.1d] slot " << r << " legs[0] = " << dump_path(fwd) << "| legs[1] = "
+              << dump_path(ret) << ", mirror = " << stub << " m\n";
+  }
+
+  // the budget is EXHAUSTED — a geometry-gated loop was kept and sorted into the last
+  // tier rather than bought out with a replacement build.
+  EXPECT_TRUE(twin_ride_served)
+      << "MAP NOT DISCRIMINATING: no served return rides the twin carriageway, so the "
+         "geometry budget was never exhausted and the pin below is vacuous";
+  // ...and a clean loop existed the whole time.
+  EXPECT_TRUE(clean_lobe_served) << "the clean A-M-N-A lobe never reached the bank";
+
+  // THE PIN.  ADR-0037's seam refill is not the geometry gate's to spend.
+  EXPECT_EQ(spur_hits, 0)
+      << "SHARED-BUDGET REGRESSION (§15.5): an exhausted GEOMETRY budget kept a SEAM "
+         "reject, and the dead-end spur B--S reached the served bank";
+  EXPECT_LT(worst_stub, 30.0)
+      << "SHARED-BUDGET REGRESSION (§15.5): the served bank carries a " << worst_stub
+      << " m exact-mirror spike while a clean loop exists — the seam gate must refill "
+         "unconditionally at every budget";
+}

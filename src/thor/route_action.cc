@@ -1388,12 +1388,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // proto/v4-p1.1: the geometry Defect Gate's own budget (score + return-leg decode).
   double gate_ms = 0;
   uint32_t gate_seam = 0, gate_twinride = 0, gate_bouncehits = 0;
-  // proto/v4-p1.1: how many gate rejects may buy a replacement build in this request.
+  // proto/v4-p1.1: how many GEOMETRY-gate rejects may buy a replacement build in this
+  // request, how many were kept instead, and which shape the budget held back.
   uint32_t gate_refills = 0, gate_kept = 0;
+  uint32_t gate_denied_twinride = 0, gate_denied_bounce = 0;
+  // ADR-0037's seam rejects refill unconditionally and are counted apart, so
+  // "refilled n/budget" stays a statement about the budget (§16).
+  uint32_t gate_seam_refills = 0;
   // thor.roundtrip_gate_refill_budget: 0 (default) = unlimited, the ADR-0037 seam
-  // gate's own semantics.  A positive value caps how many rejects may buy a
-  // replacement build; the rest are kept in the bank's last tier.  The corpus runs
-  // both ways — see the latency section of the report.
+  // gate's own semantics.  A positive value caps how many GEOMETRY-gate rejects may
+  // buy a replacement build; the rest are kept in the bank's last tier.  The corpus
+  // runs both ways — see the latency section of the report.
   const uint32_t gate_refill_budget =
       roundtrip_gate_refill_budget ? roundtrip_gate_refill_budget : 0xffffffffu;
 
@@ -2056,9 +2061,26 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // rejects per request are stashed and refilled as ADR-0037 does; past it a gated
     // loop is kept, marked, and sorted into the last tier — behind every clean loop, so
     // it can only reach a slot a rider reads if the cell has nothing better anyway.
-    if (stub >= kSeamStubRejectM || gate_twin || gate_bounce) {
+    //
+    // THE BUDGET IS SCOPED TO THE GEOMETRY GATE (§16).  The budget shipped in the
+    // sweep was shared with ADR-0037's SEAM gate, and the sweep measured what that
+    // costs: a seam reject IS the >= 500 m exact-mirror U-turn spike that Gate v1.3's
+    // one absolute forbids, so starving its refill put `spike_ge_500m` 0.00 -> 2.08 %
+    // and a 23.8 km stub back into the bank at every bounded budget (§15.5).  A seam
+    // reject therefore neither consumes the budget nor can be denied by it — ADR-0037
+    // keeps its unconditional refill — and the budget bounds only the two shapes this
+    // iteration added, the twin ride and the mid-return bounce.  A loop that trips
+    // both gates counts as a seam reject: the spike is the more expensive defect.
+    const bool seam_reject = stub >= kSeamStubRejectM;
+    if (seam_reject || gate_twin || gate_bounce) {
       L.gated = true;
-      L.seam_reject = stub >= kSeamStubRejectM;
+      L.seam_reject = seam_reject;
+      if (seam_reject) {
+        ++gate_seam_refills;
+        if (dirty_loops.size() < want)
+          dirty_loops.push_back(std::move(L));
+        return std::nullopt;
+      }
       if (gate_refills < gate_refill_budget) {
         ++gate_refills;
         if (dirty_loops.size() < want)
@@ -2066,6 +2088,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         return std::nullopt;
       }
       ++gate_kept;
+      // Per-kind denial, so the ledger can say which shape the budget actually held
+      // back.  Both increment when a loop trips both geometry halves.
+      if (gate_twin)
+        ++gate_denied_twinride;
+      if (gate_bounce)
+        ++gate_denied_bounce;
     }
     return L;
   };
@@ -2260,7 +2288,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " return_bounce=" + std::to_string(gate_bouncehits) + "; refilled " +
              std::to_string(gate_refills) + "/" + std::to_string(gate_refill_budget) +
              ", kept-in-bank " + std::to_string(gate_kept) + ", stashed " +
-             std::to_string(dirty_loops.size()));
+             std::to_string(dirty_loops.size()) +
+             // §16: appended, never inserted — the sweep's ledger reader parses the
+             // prefix above and must keep working on both binaries.
+             "; seam_refills " + std::to_string(gate_seam_refills) +
+             " (unbudgeted), refill_denied_by_budget twin_ride=" +
+             std::to_string(gate_denied_twinride) +
+             " return_bounce=" + std::to_string(gate_denied_bounce));
   LOG_INFO("roundtrip rungs: r0=" + std::to_string(rung_hits[0]) +
            " r1=" + std::to_string(rung_hits[1]) + " r2=" + std::to_string(rung_hits[2]) +
            " none=" + std::to_string(rung_hits[3]) +
