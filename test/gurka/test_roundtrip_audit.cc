@@ -22,6 +22,7 @@
 
 #include "baldr/graphreader.h"
 #include "gurka.h"
+#include "thor/road_twin_index.h"
 #include "midgard/encoded.h"
 #include "midgard/pointll.h"
 #include "test.h"
@@ -255,13 +256,45 @@ TEST_F(RtAuditRingReversal, G1_ForwardLegIsNotEdgeSimple) {
   // (b) the map still discriminates: the served RIDE reaches the D-E-F ring.  (Before
   //     proto/v4-p1 the ring sat inside legs[0] because the harvest chain reversed on
   //     it; with non-simple chains rejected the ring is crossed once, at the seam.)
+  //
+  //     proto/v4-p1.1 REPAIR.  The ring loop reaches the ring only on a soft-leash
+  //     return that retraces the corridor, and the geometry Defect Gate now rejects
+  //     exactly that.  With the gate on the engine refills the single slot with the
+  //     clean B-G-A loop — the intended behaviour, and a better ride.  So (b) is now
+  //     asserted against the GATE-OFF control, which is what actually pins F01: the
+  //     ring is still reachable, the chain that reaches it is still edge-simple.
+  map.config.put("thor.roundtrip_geometry_gate", false);
+  auto ungated = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                  {{"/roundtrip/target_distance", "34000"},
+                                   {"/roundtrip/num_candidates", "1"},
+                                   {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  map.config.put("thor.roundtrip_geometry_gate", true);
+  ASSERT_GE(ungated.trip().routes_size(), 1) << "gate-off control served no loop";
+  const auto ufwd = leg_names(ungated, 0, 0);
+  const auto uret = leg_names(ungated, 0, 1);
+  std::cerr << "[G1] gate-off control legs[0] = " << dump_path(ufwd) << "\n";
+  std::cerr << "[G1] gate-off control legs[1] = " << dump_path(uret) << "\n";
+  for (const auto& [name, n] : name_counts(ufwd))
+    EXPECT_EQ(n, 1) << "F01 CONFIRMED in the gate-off control: forward leg rides " << name
+                    << " " << n << "x; legs[0] = " << dump_path(ufwd);
   const auto ride = [&] {
+    std::vector<std::string> v = ufwd;
+    v.insert(v.end(), uret.begin(), uret.end());
+    return name_counts(v);
+  }();
+  EXPECT_GE(ride.count("EF") ? ride.at("EF") : 0, 1)
+      << "expected the D-E-F ring somewhere in the gate-off control's ride";
+  // ...and with the gate on, the slot goes to the clean loop instead.
+  EXPECT_EQ(ride.count("BG") ? ride.at("BG") : 0, 0)
+      << "gate-off control took the clean arm too — the map no longer discriminates";
+  const auto gated_ride = [&] {
     std::vector<std::string> v = fwd;
     v.insert(v.end(), ret.begin(), ret.end());
     return name_counts(v);
   }();
-  EXPECT_GE(ride.count("EF") ? ride.at("EF") : 0, 1)
-      << "expected the D-E-F ring somewhere in the served ride";
+  EXPECT_GE(gated_ride.count("BG") ? gated_ride.at("BG") : 0, 1)
+      << "the geometry gate did not refill the slot with the clean B-G-A loop; ride = "
+      << dump_path(fwd) << "| " << dump_path(ret);
 }
 
 // G1 variant: a clean curvature-10 arm B-H (pd 16 km, in band) competes with the
@@ -779,15 +812,37 @@ class RtAuditRestrictedTurnNoWayRound : public ::testing::Test {
 protected:
   static gurka::map map;
   static void SetUpTestSuite() {
+    // proto/v4-p1.1: the map gains a SECOND, clean lobe (A-M-N-A, south-west).  The
+    // T lobe is unchanged and still has no way round — the bounce is still the only
+    // route home from T — but the cell now has an alternative, which is what the
+    // geometry Defect Gate needs to do its job: reject the bouncing loop and refill
+    // the slot.  Without an alternative the gate can only stash the loop and serve it
+    // as the last resort, and "no route" is not an option the engine may take.
+    // G6c below keeps the original degenerate map and pins exactly that contract.
     const std::string ascii_map = R"(
       A-----K-----T
             U
                 P
+
+
+
+             N
+
+
+
+
+
+      M
     )";
     const gurka::ways ways = {
         {"AK", {{"highway", "secondary"}}},
         {"KT", {{"highway", "secondary"}}},
         {"KU", {{"highway", "secondary"}}},
+        // proto/v4-p1.1: the clean lobe.  A-M is 13 km due south (pd 13 000, inside the
+        // +/-18 % band of target/2 = 13 500); M-N-A closes it on fresh road.
+        {"AM", {{"highway", "secondary"}}},
+        {"MN", {{"highway", "secondary"}}},
+        {"NA", {{"highway", "secondary"}}},
         // one-way T->P so the loop CANNOT simply be ridden the other way round:
         // after the restricted P->K->A turn the spur bounce is the only route home.
         {"TP", {{"highway", "secondary"}, {"oneway", "yes"}}},
@@ -843,12 +898,65 @@ TEST_F(RtAuditRestrictedTurnNoWayRound, G6b_IsTheDeadEndUTurnAvailableAtAll) {
   const double stub = self_mirror_stub_m(leg_shape(result, 0, 1));
   std::cerr << "[G6b] KU count in legs[1] = " << count_name(ret, "KU")
             << ", longest exact-mirror stub = " << stub << " m\n";
-  // PREDICTED FAIL: when the bounce is the ONLY way home it is served, and the Defect
-  // Gate does not see it — a mid-return mirror is outside the seam window (F13).
+  // proto/v4-p1.1: the geometry Defect Gate decodes the WHOLE return leg, so the
+  // mid-return mirror is now visible; the loop is rejected and the slot refilled with
+  // the clean A-M-N-A lobe.  Under P1 (seam window only) this served the bounce.
   EXPECT_EQ(count_name(ret, "KU"), 0)
-      << "F08 CONFIRMED: the return bounced into the dead-end spur K-U and the loop was "
+      << "F08 STILL OPEN: the return bounced into the dead-end spur K-U and the loop was "
          "served anyway — a mid-return exact mirror of "
       << stub << " m that the seam-window verdict cannot see. legs[1] = " << dump_path(ret);
+  EXPECT_LT(stub, 30.0) << "served return still carries a mid-leg exact mirror of " << stub
+                        << " m; legs[1] = " << dump_path(ret);
+}
+
+// ---------------------------------------------------------------------------------
+// G6c — the last-resort contract.  The ORIGINAL G6b map: one lobe, and after the
+// restricted turn the spur bounce is the only route home at all.  The gate rejects the
+// loop; there is nothing to refill it with; the engine must still serve it rather than
+// return a 442.  This is the boundary the gate must not cross.
+// ---------------------------------------------------------------------------------
+class RtAuditRestrictedTurnOnlyLoop : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      A-----K-----T
+            U
+                P
+    )";
+    const gurka::ways ways = {
+        {"AK", {{"highway", "secondary"}}},
+        {"KT", {{"highway", "secondary"}}},
+        {"KU", {{"highway", "secondary"}}},
+        {"TP", {{"highway", "secondary"}, {"oneway", "yes"}}},
+        {"PK", {{"highway", "secondary"}}},
+    };
+    const gurka::relations relations = {
+        {{
+             {gurka::way_member, "PK", "from"},
+             {gurka::way_member, "AK", "to"},
+             {gurka::node_member, "K", "via"},
+         },
+         {
+             {"type", "restriction"},
+             {"restriction", "no_left_turn"},
+         }},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, relations, "test/data/rt_audit_restricted_only_loop");
+  }
+};
+gurka::map RtAuditRestrictedTurnOnlyLoop::map = {};
+
+TEST_F(RtAuditRestrictedTurnOnlyLoop, G6c_GateNeverStarvesTheOnlyLoop) {
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "27000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.0"}});
+  ASSERT_GE(result.trip().routes_size(), 1)
+      << "P1.1 REGRESSION: the geometry gate rejected the cell's only loop and the "
+         "engine served nothing — dirty-last-resort must still fire";
+  std::cerr << "[G6c] legs[1] = " << dump_path(leg_names(result, 0, 1)) << "\n";
 }
 
 // ---------------------------------------------------------------------------------
@@ -1376,4 +1484,418 @@ TEST_F(RtP1CleanFirstRanking, P1c_HardExcludeSuccessOutranksTheFallback) {
   const auto slot1 = leg_names(result, 1, 1);
   EXPECT_GE(count_name(slot1, "AB"), 1)
       << "slot 1 is not the Fallback Loop; legs[1] = " << dump_path(slot1);
+}
+
+// =================================================================================
+// P1.1 (proto/v4-p1.1, curvagen-valhalla#12) — switchback-safe twins, built-loop
+// ranking, geometry Defect Gate.
+//
+//   P1.1a  the sidecar must not call a mountain hairpin pair a twin, and must still
+//          call a dual carriageway one (the P1 report §7.6 regression, block C);
+//   P1.1b  the served order comes from the BUILT loop, not the harvest chain (F20);
+//   P1.1c  a return that rides the forward corridor's twins is refilled, not served.
+// =================================================================================
+
+namespace {
+// The sidecar's view of one edge, for the switchback tests.
+std::vector<uint64_t> twins_of(baldr::GraphReader& reader,
+                               const gurka::nodelayout& layout,
+                               bool switchback_test,
+                               const std::string& a,
+                               const std::string& b) {
+  const auto& idx = valhalla::thor::RoadTwinIndex::get(reader, 30.0, 80.0, true, switchback_test);
+  const auto e = std::get<0>(gurka::findEdgeByNodes(reader, layout, a, b));
+  valhalla::baldr::graph_tile_ptr tile = reader.GetGraphTile(e);
+  const auto* de = tile->directededge(e);
+  const auto opp = reader.GetOpposingEdgeId(e);
+  std::vector<uint64_t> out;
+  idx.append_twins(valhalla::thor::RoadTwinIndex::canonical_id(de, e, opp), out);
+  return out;
+}
+uint64_t canon_of(baldr::GraphReader& reader,
+                  const gurka::nodelayout& layout,
+                  const std::string& a,
+                  const std::string& b) {
+  const auto e = std::get<0>(gurka::findEdgeByNodes(reader, layout, a, b));
+  valhalla::baldr::graph_tile_ptr tile = reader.GetGraphTile(e);
+  const auto* de = tile->directededge(e);
+  return valhalla::thor::RoadTwinIndex::canonical_id(de, e, reader.GetOpposingEdgeId(e));
+}
+uint64_t wayid_of(baldr::GraphReader& reader,
+                  const gurka::nodelayout& layout,
+                  const std::string& a,
+                  const std::string& b) {
+  const auto e = std::get<0>(gurka::findEdgeByNodes(reader, layout, a, b));
+  valhalla::baldr::graph_tile_ptr tile = reader.GetGraphTile(e);
+  return tile->edgeinfo(tile->directededge(e)).wayid();
+}
+bool has_canon(const std::vector<uint64_t>& tw, uint64_t k) {
+  return std::find(tw.begin(), tw.end(), k) != tw.end();
+}
+} // namespace
+
+// ---------------------------------------------------------------------------------
+// P1.1a-1 — the mountain hairpin.  4 m/char, so a row is 4 m.
+//
+//   A--G--H--M--N--B   ONE OSM way "AGHMNBCIJKLD": arm A-B (400 m, east, four shape
+//                  X   points), apex link B-C (8 m), arm C-D (west, drifting away).
+//                  C   G/H/M/N and I/J/K/L are shape points, not junctions — without
+//                I Y   them each arm decodes to two samples and the cover test cannot
+//              J       see the divergence at all.
+//            K
+//          L
+//
+//   D
+//
+// C sits 8 m below B; D sits 32 m below A — so the arms are 8 m apart at the apex and
+// 32 m apart at the far end, which is what a hairpin's arms do: they converge on the
+// turn.  X and Y are 4 m spurs whose only job is to force graph nodes at B and C so
+// the way yields three edges instead of one shape.  Planimetrically A-B and C-D pass
+// every P1 test (collinear, ~92 % of samples inside 30 m, span 0.92); only the
+// switchback test can separate them from a carriageway.
+// ---------------------------------------------------------------------------------
+class RtP11Hairpin : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+A                   G                   H                   M                   N                   B
+                                                                                                    X
+                                                                                                    C
+                                                                                I                   Y
+                                                            J
+                                        K
+                    L
+
+D
+    )";
+    const gurka::ways ways = {
+        {"AGHMNBCIJKLD", {{"highway", "secondary"}}},
+        {"BX", {{"highway", "service"}}},
+        {"CY", {{"highway", "service"}}},
+    };
+    map = gurka::buildtiles(gurka::detail::map_to_coordinates(ascii_map, 4), ways, {}, {},
+                            "test/data/rt_p11_hairpin");
+  }
+};
+gurka::map RtP11Hairpin::map = {};
+
+TEST_F(RtP11Hairpin, P11a_HairpinArmsAreNotTwins) {
+  auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+  const auto& L = map.nodes;
+  std::cerr << "[P1.1a] way id A-B = " << wayid_of(*reader, L, "A", "B")
+            << ", C-D = " << wayid_of(*reader, L, "C", "D") << "\n";
+
+  // CONTROL — switchback test OFF: P1's geometry calls the two arms twins.  Without
+  // this the assertion below could pass on a map that was never a twin at all.
+  const auto ctl = twins_of(*reader, L, false, "A", "B");
+  std::cerr << "[P1.1a] control (test off): A-B has " << ctl.size() << " twin(s); C-D in = "
+            << has_canon(ctl, canon_of(*reader, L, "C", "D")) << "\n";
+  EXPECT_TRUE(has_canon(ctl, canon_of(*reader, L, "C", "D")))
+      << "MAP NOT DISCRIMINATING: the P1 geometry did not call the hairpin arms twins, so "
+         "the switchback test has nothing to remove";
+
+  // TREATMENT — same OSM way and a divergent offset: not a twin.
+  const auto tw = twins_of(*reader, L, true, "A", "B");
+  std::cerr << "[P1.1a] A-B has " << tw.size() << " twin(s); C-D in = "
+            << has_canon(tw, canon_of(*reader, L, "C", "D")) << "\n";
+  EXPECT_FALSE(has_canon(tw, canon_of(*reader, L, "C", "D")))
+      << "the switchback test did not drop the hairpin pair — block C's is_lollipop and "
+         "vlasina-50 km regressions stand";
+}
+
+// ---------------------------------------------------------------------------------
+// P1.1a-2 — the dual carriageway control.  4 m/char.
+//
+//   P================================================Q   way "PQ", one-way east
+//   S================================================R   way "SR", one-way west, 8 m
+//
+// Two DIFFERENT OSM ways holding a constant 8 m offset.  The switchback test must
+// leave this pair alone, or P1's whole F02 result goes with it.
+// ---------------------------------------------------------------------------------
+class RtP11Carriageway : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+P                                                                                                   Q
+
+S                                                                                                   R
+    )";
+    const gurka::ways ways = {
+        {"PQ", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"SR", {{"highway", "primary"}, {"oneway", "yes"}}},
+    };
+    map = gurka::buildtiles(gurka::detail::map_to_coordinates(ascii_map, 4), ways, {}, {},
+                            "test/data/rt_p11_carriageway");
+  }
+};
+gurka::map RtP11Carriageway::map = {};
+
+TEST_F(RtP11Carriageway, P11a_DualCarriagewayIsStillATwin) {
+  auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+  const auto& L = map.nodes;
+  std::cerr << "[P1.1a] way id P-Q = " << wayid_of(*reader, L, "P", "Q")
+            << ", S-R = " << wayid_of(*reader, L, "S", "R") << "\n";
+  const auto tw = twins_of(*reader, L, true, "P", "Q");
+  std::cerr << "[P1.1a] P-Q has " << tw.size() << " twin(s); S-R in = "
+            << has_canon(tw, canon_of(*reader, L, "S", "R")) << "\n";
+  EXPECT_TRUE(has_canon(tw, canon_of(*reader, L, "S", "R")))
+      << "the switchback test threw the dual carriageway out with the hairpin — F02 is back";
+}
+
+// ---------------------------------------------------------------------------------
+// P1.1b — the BUILT loop is what gets ranked (F20's full fix).  1000 m/char.
+//
+//         Q   P            Two loops, BOTH clean hard-exclude successes:
+//                            east lobe  A-B-C (pd 8 km; B-C curvature 15, A-B 0),
+//         R   A B     C       home over C-D-A (16 km, curvature 0) => a 24 km ride,
+//                             50 % over target.  Harvest curviness = 0.75.
+//                     D     north-west lobe A-P-Q (pd 8 km, curvature 8), home over
+//                             Q-R-A (8 km, curvature 8) => 16 km, on target.
+//                             Harvest curviness = 0.53.
+//
+// v3/P1 rank on the harvest chain, so the east lobe takes slot 0.  P1.1 scores the
+// built loop — whole-loop curviness 0.25 against 0.53, plus a 0.50 distance error —
+// and the north-west lobe wins.
+// ---------------------------------------------------------------------------------
+class RtP11BuiltRanking : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+
+
+
+
+
+
+      Q   P
+
+
+
+      R   A B     C
+
+
+
+
+
+                  D
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
+        {"CD", {{"highway", "secondary"}}}, {"DA", {{"highway", "secondary"}}},
+        {"AP", {{"highway", "secondary"}}}, {"PQ", {{"highway", "secondary"}}},
+        {"QR", {{"highway", "secondary"}}}, {"RA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p11_built_ranking");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> c15, c8;
+    for (const auto& [a, b] :
+         std::vector<std::pair<std::string, std::string>>{{"B", "C"}, {"C", "B"}})
+      c15.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    for (const auto& [a, b] : std::vector<std::pair<std::string, std::string>>{{"A", "P"},
+                                                                              {"P", "A"},
+                                                                              {"P", "Q"},
+                                                                              {"Q", "P"},
+                                                                              {"Q", "R"},
+                                                                              {"R", "Q"},
+                                                                              {"R", "A"},
+                                                                              {"A", "R"}})
+      c8.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    test::customize_edges(map.config, [&c15, &c8](const baldr::GraphId& edgeid,
+                                                  baldr::DirectedEdge& edge) {
+      if (std::find(c15.begin(), c15.end(), edgeid) != c15.end())
+        edge.set_curvature(15);
+      if (std::find(c8.begin(), c8.end(), edgeid) != c8.end())
+        edge.set_curvature(8);
+    });
+  }
+  static valhalla::Api run(gurka::map& m, bool built_ranking) {
+    m.config.put("thor.roundtrip_built_ranking", built_ranking);
+    return gurka::do_action(valhalla::Options::route, m, {"A", "A"}, "motorcycle",
+                            {{"/roundtrip/target_distance", "16000"},
+                             {"/roundtrip/num_candidates", "2"},
+                             {"/costing_options/motorcycle/reuse_penalty", "0.8"}});
+  }
+};
+gurka::map RtP11BuiltRanking::map = {};
+
+TEST_F(RtP11BuiltRanking, P11b_BuiltLoopScoreReordersTheBank) {
+  // CONTROL — P1's ranking (harvest chain): the curvy-forward lobe takes slot 0.
+  auto ctl = run(map, false);
+  ASSERT_EQ(ctl.trip().routes_size(), 2) << "control did not build both loops";
+  for (int r = 0; r < 2; ++r)
+    std::cerr << "[P1.1b] control slot " << r << " = " << dump_path(leg_names(ctl, r, 0)) << "| "
+              << dump_path(leg_names(ctl, r, 1)) << "\n";
+  EXPECT_GE(count_name(leg_names(ctl, 0, 0), "BC"), 1)
+      << "MAP NOT DISCRIMINATING: the harvest-chain ranking did not put the curvy-forward "
+         "lobe in slot 0; legs[0] = "
+      << dump_path(leg_names(ctl, 0, 0));
+
+  // TREATMENT — the built-loop score.
+  auto result = run(map, true);
+  ASSERT_EQ(result.trip().routes_size(), 2) << "did not build both loops";
+  for (int r = 0; r < 2; ++r)
+    std::cerr << "[P1.1b] slot " << r << " = " << dump_path(leg_names(result, r, 0)) << "| "
+              << dump_path(leg_names(result, r, 1)) << "\n";
+  const auto slot0 = leg_names(result, 0, 0);
+  EXPECT_EQ(count_name(slot0, "BC"), 0)
+      << "slot 0 is still the harvest-chain winner — the built-loop score did not reorder "
+         "the bank; legs[0] = "
+      << dump_path(slot0);
+  // the lobe can be ridden either way round (A-P-Q home over Q-R-A, or the reverse).
+  EXPECT_GE(count_name(slot0, "AP") + count_name(slot0, "PQ") + count_name(slot0, "RA") +
+                count_name(slot0, "QR"),
+            1)
+      << "slot 0 is not the on-target north-west lobe; legs[0] = " << dump_path(slot0);
+  EXPECT_GE(count_name(leg_names(result, 1, 0), "BC"), 1)
+      << "the curvy-forward lobe did not fall to slot 1";
+}
+
+// ---------------------------------------------------------------------------------
+// P1.1c — the geometry Defect Gate refills a twin-ridden return.  30 m/char.
+//
+//   A==E==B        top carriageway A>E>B, one-way east, 1.5 km per edge, curvature 15
+//   D==F==C        bottom carriageway C>F>D, one-way west, 30 m south — the TWINS
+//   ...
+//   M==N           a clean second lobe 1.5 km south: A-M-N, home over N-A
+//
+// The corridor's second edge E-B sits beyond the Start Exemption, so it and its twin
+// C-F are barred; the return falls to rung 1 and rides C-F home anyway — 1 500 m of
+// twin outside the exemption, the exact shape P1 left in slots 9-11.  With K = 1 the
+// gate must reject that loop and refill the slot with the clean lobe.
+// ---------------------------------------------------------------------------------
+class RtP11GeometryGate : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+                                                                                                    A                                                 E                                                 B
+                                                                                                    D                                                 F                                                 C
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    M                                                 N
+    )";
+    const gurka::ways ways = {
+        {"AE", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"EB", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"CF", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"FD", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"BC", {{"highway", "primary"}}},
+        {"DA", {{"highway", "primary"}}},
+        {"AM", {{"highway", "secondary"}}},
+        {"MN", {{"highway", "secondary"}}},
+        {"NA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 30);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p11_geometry_gate");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> c15, c6;
+    for (const auto& [a, b] : std::vector<std::pair<std::string, std::string>>{{"A", "E"},
+                                                                              {"E", "B"},
+                                                                              {"C", "F"},
+                                                                              {"F", "D"}})
+      c15.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    for (const auto& [a, b] : std::vector<std::pair<std::string, std::string>>{{"A", "M"},
+                                                                              {"M", "A"},
+                                                                              {"M", "N"},
+                                                                              {"N", "M"},
+                                                                              {"N", "A"},
+                                                                              {"A", "N"}})
+      c6.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    test::customize_edges(map.config, [&c15, &c6](const baldr::GraphId& edgeid,
+                                                  baldr::DirectedEdge& edge) {
+      if (std::find(c15.begin(), c15.end(), edgeid) != c15.end())
+        edge.set_curvature(15);
+      if (std::find(c6.begin(), c6.end(), edgeid) != c6.end())
+        edge.set_curvature(6);
+    });
+  }
+  static valhalla::Api run(gurka::map& m, bool gate) {
+    m.config.put("thor.roundtrip_geometry_gate", gate);
+    return gurka::do_action(valhalla::Options::route, m, {"A", "A"}, "motorcycle",
+                            {{"/roundtrip/target_distance", "6000"},
+                             {"/roundtrip/num_candidates", "1"},
+                             {"/costing_options/motorcycle/reuse_penalty", "0.8"},
+                             {"/costing_options/motorcycle/prefer_curvature", "0.5"}});
+  }
+};
+gurka::map RtP11GeometryGate::map = {};
+
+TEST_F(RtP11GeometryGate, P11c_TwinRiddenReturnIsRefilled) {
+  // CONTROL — gate off: the twin-riding loop is served, which is what P1 does.
+  auto ctl = run(map, false);
+  ASSERT_GE(ctl.trip().routes_size(), 1) << "control served no loop";
+  const auto ctl_ret = leg_names(ctl, 0, 1);
+  std::cerr << "[P1.1c] control (gate off) legs[0] = " << dump_path(leg_names(ctl, 0, 0))
+            << "| legs[1] = " << dump_path(ctl_ret) << "\n";
+  EXPECT_GE(count_name(ctl_ret, "CF"), 1)
+      << "MAP NOT DISCRIMINATING: even ungated the return avoided the twin carriageway; "
+         "legs[1] = "
+      << dump_path(ctl_ret);
+
+  // TREATMENT — the gate rejects it and the queue refills with the clean lobe.
+  auto result = run(map, true);
+  ASSERT_GE(result.trip().routes_size(), 1)
+      << "P1.1 REGRESSION: the gate rejected the twin loop and nothing was served";
+  const auto ret = leg_names(result, 0, 1);
+  const auto fwd = leg_names(result, 0, 0);
+  std::cerr << "[P1.1c] legs[0] = " << dump_path(fwd) << "| legs[1] = " << dump_path(ret) << "\n";
+  EXPECT_EQ(count_name(ret, "CF"), 0)
+      << "the geometry gate served a return that rides the forward corridor's twin; "
+         "legs[1] = "
+      << dump_path(ret);
+  EXPECT_GE(count_name(fwd, "AM") + count_name(fwd, "MN") + count_name(ret, "NA"), 1)
+      << "the slot was not refilled with the clean M-N lobe; legs[0] = " << dump_path(fwd)
+      << "| legs[1] = " << dump_path(ret);
 }

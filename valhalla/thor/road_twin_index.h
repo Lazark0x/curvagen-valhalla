@@ -54,6 +54,13 @@ public:
     uint64_t pair_tests = 0;
     uint64_t twin_pairs = 0;
     uint64_t parallel_pairs = 0;
+    // proto/v4-p1.1 switchback test (curvagen-valhalla#12 item 1)
+    uint64_t geom_twin_pairs = 0;      // pairs the P1 geometry alone called twins
+    uint64_t switchback_dropped = 0;   // ...of which the switchback test rejected
+    uint64_t sb_same_way = 0;          // dropped: same OSM way id
+    uint64_t sb_divergent = 0;         // dropped: offset not constant along the run
+    uint64_t geom_par_pairs = 0;
+    uint64_t switchback_dropped_par = 0;
     uint64_t twin_keys = 0;
     uint64_t parallel_keys = 0;
     double build_ms = 0.0;
@@ -68,14 +75,23 @@ public:
   static const RoadTwinIndex& get(baldr::GraphReader& reader,
                                   double twin_radius_m,
                                   double parallel_radius_m,
-                                  bool build_parallels);
+                                  bool build_parallels,
+                                  bool switchback_test);
 
-  // The canonical id of a directed edge: itself when it carries the stored shape
-  // direction, else its opposing edge.  Both are already in hand at every call site.
-  static uint64_t canonical_id(const baldr::DirectedEdge* de,
+  // The canonical id of a directed edge = min(edge, opposing edge).
+  //
+  // proto/v4-p1.1: this WAS `de->forward() ? eid : opp`.  min() is the same
+  // undirected identity but needs no DirectedEdge dereference, which is what lets the
+  // F01 forest pass (roundtrip_expansion.cc) key every settled label without a tile
+  // lookup — see that file's canonical_from_label().  `de` is kept in the signature
+  // (unused) so the call sites read the same.
+  static uint64_t canonical_id(const baldr::DirectedEdge*,
                                const baldr::GraphId& eid,
                                const baldr::GraphId& opp) {
-    return de->forward() ? eid.value : (opp.is_valid() ? opp.value : eid.value);
+    return opp.is_valid() ? std::min(eid.value, opp.value) : eid.value;
+  }
+  static uint64_t canonical_id(uint64_t eid, uint64_t opp) {
+    return std::min(eid, opp);
   }
 
   void append_twins(uint64_t canonical, std::vector<uint64_t>& out) const {
@@ -88,6 +104,18 @@ public:
     return lookup(twin_keys_, canonical) != twin_keys_.size();
   }
 
+  // proto/v4-p1.1: one-probe Bloom prefilter over the twin key set.  A clear bit is a
+  // PROOF of "no twins"; a set bit falls through to the CSR binary search.  The F01
+  // forest pass asks this question once per settled label (hundreds of thousands per
+  // request) and >98 % of the answers are "no" — a 512 KiB bit array turns those into
+  // one cache probe instead of a ~17-step lower_bound over 115 k keys.
+  bool maybe_has_twins(uint64_t canonical) const {
+    if (twin_filter_.empty())
+      return true;
+    const uint64_t h = mix(canonical) & kFilterMask;
+    return (twin_filter_[h >> 6] >> (h & 63)) & 1ull;
+  }
+
   const Stats& stats() const {
     return stats_;
   }
@@ -97,7 +125,8 @@ private:
   void Build(baldr::GraphReader& reader,
              double twin_radius_m,
              double parallel_radius_m,
-             bool build_parallels);
+             bool build_parallels,
+             bool switchback_test);
 
   static size_t lookup(const std::vector<uint64_t>& keys, uint64_t k) {
     auto it = std::lower_bound(keys.begin(), keys.end(), k);
@@ -114,6 +143,17 @@ private:
       return;
     out.insert(out.end(), vals.begin() + off[i], vals.begin() + off[i + 1]);
   }
+
+  static constexpr uint64_t kFilterBits = 1ull << 22; // 4 Mi bits = 512 KiB
+  static constexpr uint64_t kFilterMask = kFilterBits - 1;
+  static uint64_t mix(uint64_t x) { // splitmix64 finalizer
+    x ^= x >> 30;
+    x *= 0xbf58476d1ce4e5b9ull;
+    x ^= x >> 27;
+    x *= 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+  }
+  std::vector<uint64_t> twin_filter_;
 
   // CSR: sorted keys, [off[i], off[i+1]) into vals.
   std::vector<uint64_t> twin_keys_, twin_vals_;

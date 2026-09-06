@@ -181,6 +181,30 @@ protected:
   // (or its twin).  Config-gated so the before/after is one binary.
   bool roundtrip_simple_chains;
 
+  // PROTOTYPE proto/v4-p1.1 (curvagen-valhalla#12).
+  // 1. switchback test: a geometric twin pair is only the same physical road if it is a
+  //    different OSM way OR holds a constant lateral offset (a hairpin's arms do not).
+  // 3. built-loop ranking: score the BUILT loop (both legs) instead of the harvest chain.
+  // 4. geometry Defect Gate: reject a loop whose return rides forward-corridor twins for
+  //    >= roundtrip_gate_twin_ride_m beyond the Start Exemption, or whose return carries
+  //    an exact-mirror bounce >= roundtrip_gate_return_bounce_m anywhere (F08/G6b).
+  // 5. fallback rungs: corridor+twins barred -> corridor only -> full soft leash.
+  bool roundtrip_switchback_test;
+  bool roundtrip_built_ranking;
+  bool roundtrip_geometry_gate;
+  double roundtrip_gate_twin_ride_m;
+  double roundtrip_gate_return_bounce_m;
+  bool roundtrip_fallback_rungs;
+  // Ticket-literal intermediate rung (release the parallel leash only, twins still
+  // barred).  A soft multiplier can never restore reachability, so this rung is a
+  // provable no-op; kept behind a default-off knob for the measurement that says so.
+  bool roundtrip_fallback_parallel_rung;
+  // F09: the stall branch grants a fresh +want attempt budget even if something else
+  // widened the pool first.
+  bool roundtrip_f09_budget;
+  double roundtrip_rank_overlap_w;
+  double roundtrip_rank_disterr_w;
+
 private:
   std::string service_name() const override {
     return "thor";

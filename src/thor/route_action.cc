@@ -1244,6 +1244,65 @@ bool decode_leg_grid(const std::vector<PathInfo>& leg,
   return true;
 }
 
+// proto/v4-p1.1: append a leg's shape onto the 1e-5 grid with a running along-path
+// distance (consecutive duplicates dropped).  Shared by the seam detector and the
+// mid-leg mirror detector below.  false = unresolvable tile (caller treats the check as
+// inconclusive-clean, exactly as the seam gate always has).
+bool append_leg_pts(const std::vector<PathInfo>& leg,
+                    size_t from,
+                    size_t to,
+                    baldr::GraphReader& reader,
+                    std::vector<std::pair<int64_t, int64_t>>& pts,
+                    std::vector<double>& cum) {
+  for (size_t li = from; li < to; ++li) {
+    graph_tile_ptr tile = reader.GetGraphTile(leg[li].edgeid);
+    if (!tile)
+      return false;
+    const DirectedEdge* de = tile->directededge(leg[li].edgeid);
+    auto shape = tile->edgeinfo(de).shape();
+    if (!de->forward())
+      std::reverse(shape.begin(), shape.end());
+    for (const auto& p : shape) {
+      std::pair<int64_t, int64_t> k{std::llround(p.lat() * 1e5), std::llround(p.lng() * 1e5)};
+      if (pts.empty() || pts.back() != k) {
+        if (!pts.empty())
+          cum.push_back(cum.back() +
+                        midgard::PointLL(pts.back().second / 1e5, pts.back().first / 1e5)
+                            .Distance(midgard::PointLL(k.second / 1e5, k.first / 1e5)));
+        pts.push_back(k);
+      }
+    }
+  }
+  return true;
+}
+
+// proto/v4-p1.1 GEOMETRY DEFECT GATE, half two (F08 / gurka G6b).  The longest exact-
+// mirror stub ANYWHERE in one leg.  seam_stub_m only counts palindromes whose interval
+// covers the seam, so a mid-return bounce — the return overshoots into a spur that ends
+// on its own path and U-turns back — is invisible to it, and the audit's G6b serves a
+// 999.99 m mid-return mirror with the gate reading clean (F08, F13 leak 3).  The price
+// is decoding the whole return leg on every candidate, not a 1500 m window; budgeted in
+// the stage ledger as `gate=`.
+double leg_mirror_stub_m(const std::vector<PathInfo>& leg, baldr::GraphReader& reader) {
+  std::vector<std::pair<int64_t, int64_t>> pts;
+  std::vector<double> cum{0.0};
+  if (!append_leg_pts(leg, 0, leg.size(), reader, pts, cum) || pts.size() < 3)
+    return 0.0;
+  double worst = 0.0;
+  for (size_t i = 1; i + 1 < pts.size(); ++i) {
+    if (pts[i - 1] == pts[i + 1]) {
+      size_t w = 1;
+      while (i >= 1 + w && i + 1 + w < pts.size() && pts[i - 1 - w] == pts[i + 1 + w])
+        ++w;
+      const double stub = cum[i] - cum[i - w];
+      if (stub > worst)
+        worst = stub;
+      i += w;
+    }
+  }
+  return worst;
+}
+
 // ADR-0037 Defect Gate detector: decode both legs onto the 1e-5 grid and measure the
 // longest exact-mirror stub whose interval covers the seam — the cross-leg retrace that
 // survives every forward-side guard (a fallback return riding back down a dead-end
@@ -1275,32 +1334,10 @@ double seam_stub_m(const std::vector<PathInfo>& fwd,
   std::vector<std::pair<int64_t, int64_t>> pts;
   std::vector<double> cum{0.0};
   size_t seam_idx = 0;
-  auto append_leg = [&](const std::vector<PathInfo>& leg, size_t from, size_t to) -> bool {
-    for (size_t li = from; li < to; ++li) {
-      graph_tile_ptr tile = reader.GetGraphTile(leg[li].edgeid);
-      if (!tile)
-        return false;
-      const DirectedEdge* de = tile->directededge(leg[li].edgeid);
-      auto shape = tile->edgeinfo(de).shape();
-      if (!de->forward())
-        std::reverse(shape.begin(), shape.end());
-      for (const auto& p : shape) {
-        std::pair<int64_t, int64_t> k{std::llround(p.lat() * 1e5), std::llround(p.lng() * 1e5)};
-        if (pts.empty() || pts.back() != k) {
-          if (!pts.empty())
-            cum.push_back(cum.back() +
-                          midgard::PointLL(pts.back().second / 1e5, pts.back().first / 1e5)
-                              .Distance(midgard::PointLL(k.second / 1e5, k.first / 1e5)));
-          pts.push_back(k);
-        }
-      }
-    }
-    return true;
-  };
-  if (!append_leg(fwd, fwd_begin, fwd.size()))
+  if (!append_leg_pts(fwd, fwd_begin, fwd.size(), reader, pts, cum))
     return 0.0;
   seam_idx = pts.empty() ? 0 : pts.size() - 1;
-  if (!append_leg(ret, 0, ret_end))
+  if (!append_leg_pts(ret, 0, ret_end, reader, pts, cum))
     return 0.0;
   if (pts.size() < 3)
     return 0.0;
@@ -1348,6 +1385,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   };
   double harvest_ms = 0, scan_ms = 0, walkback_ms = 0, rejoin_ms = 0, astar_ms = 0,
          astar_fb_ms = 0, seam_ms = 0, build_ms = 0;
+  // proto/v4-p1.1: the geometry Defect Gate's own budget (score + return-leg decode).
+  double gate_ms = 0;
+  uint32_t gate_seam = 0, gate_twinride = 0, gate_bouncehits = 0;
 
   // 1) One forward expansion + harvest turnarounds (Task A4). An empty primary band is
   //    no longer fatal here — the Distance Flex scan below may still fill the queue.
@@ -1356,7 +1396,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   const RoadTwinIndex* twin_index =
       roundtrip_road_identity ? &RoadTwinIndex::get(*reader, roundtrip_twin_radius_m,
                                                     roundtrip_parallel_radius_m,
-                                                    roundtrip_parallel_tier)
+                                                    roundtrip_parallel_tier,
+                                                    roundtrip_switchback_test)
                               : nullptr;
   const bool parallel_tier = roundtrip_parallel_tier;
 
@@ -1475,6 +1516,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   uint32_t fallback_count = 0;
   // proto/v4-p1 road-identity ledger counters.
   uint32_t twins_excluded = 0, parallels_leashed = 0, identity_legs = 0;
+  // proto/v4-p1.1 fallback-rung ledger (item 5): how many legs finished on each rung.
+  uint32_t rung_hits[4] = {0, 0, 0, 0};
+  uint32_t parallel_rung_tried = 0, parallel_rung_converted = 0;
   // Cross-candidate corridor memory (wayfinder #46): directed-edge value -> number of
   // already-committed loops that rode it (both directions, outside the Start Exemption
   // disk). Grows as the bank fills; read by route_leg to surcharge shared corridors.
@@ -1483,13 +1527,29 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // corridor hard-excluded beyond the Start Exemption, soft-leashed everywhere, and its
   // junction edges progress-grade-penalized. The round-trip return is corridor=forward
   // leg, to=start; the Second Via sub-legs reuse it with wider corridors.
+  //
+  // proto/v4-p1.1 FALLBACK RUNGS (item 5).  v3 had one step: "hard exclusion, or drop
+  // every hard exclusion".  The ladder is now
+  //    rung 0  corridor + twins barred beyond the Start Exemption; corridor, twins and
+  //            parallels leashed; parallels carry the progress grade.
+  //    rung 1  TWINS RELEASED from the bar (still leashed) and parallels released from
+  //            the leash and the grade — the corridor's own pavement is still barred, so
+  //            a rung-1 loop still never retraces it.
+  //    rung 2  full soft leash: no hard exclusion at all (the v3 Fallback Loop).
+  // The ticket's rung 1 was "release parallels, keep twins barred".  That cannot work:
+  // mark_edges_used / mark_rejoin_edges are multiplicative cost factors read by
+  // EdgeFactor (dynamiccost.h:1292-1308) and never block, so a rung that only relaxes
+  // soft costs cannot turn "no route home" into a route — it can only pay for a second
+  // exhaustive A*.  It is kept behind thor.roundtrip_fallback_parallel_rung (default
+  // off) so the claim can be measured rather than argued.
   auto route_leg = [&](const std::vector<PathInfo>& corridor, valhalla::Location& from,
-                       valhalla::Location& to, bool& fell_back) -> std::vector<PathInfo> {
+                       valhalla::Location& to, uint8_t& rung) -> std::vector<PathInfo> {
     const auto t_rejoin = ledger_clock::now();
     cost->clear_used_edges();
     const double total_dist = std::max(1.0f, corridor.back().path_distance);
     std::vector<uint64_t> vals;
-    std::vector<sif::AvoidEdge> hard;
+    std::vector<sif::AvoidEdge> hard;      // the corridor's own pavement
+    std::vector<sif::AvoidEdge> twin_hard; // proto/v4-p1.1: the twin tier, rung-1 releasable
     struct NodeAt {
       GraphId node;
       double dist;
@@ -1541,9 +1601,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
           corridor_vals.push_back(topp.value);
         }
         if (beyond) {
-          hard.push_back({t, 0.0});
+          twin_hard.push_back({t, 0.0});
           if (topp.is_valid())
-            hard.push_back({topp, 0.0});
+            twin_hard.push_back({topp, 0.0});
           ++twins_excluded;
         }
       }
@@ -1555,22 +1615,35 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       for (uint64_t cv : par) {
         const GraphId t(cv);
         const GraphId topp = reader->GetOpposingEdgeId(t);
-        vals.push_back(t.value);
+        // proto/v4-p1.1: parallels live in their own tier (parallel_at) so rung 1 can
+        // release them; P1 pushed them straight into `vals`.
         parallel_at.emplace_back(t.value, at);
-        if (topp.is_valid()) {
-          vals.push_back(topp.value);
+        if (topp.is_valid())
           parallel_at.emplace_back(topp.value, at);
-        }
         ++parallels_leashed;
       }
     }
     if (twin_index)
       ++identity_legs;
-    cost->mark_edges_used(vals);
+    // proto/v4-p1.1: the leash set is re-assembled per rung, so keep the tiers apart.
+    // `vals` = corridor + opposites + twins (+ their opposites); parallel_vals = the
+    // parallel tier, dropped from rung 1 up.
+    std::vector<uint64_t> parallel_vals;
+    parallel_vals.reserve(parallel_at.size());
+    for (const auto& [ev, _] : parallel_at)
+      parallel_vals.push_back(ev);
+    auto apply_leash = [&](bool with_parallels) {
+      cost->clear_used_edges();
+      cost->mark_edges_used(vals);
+      if (with_parallels)
+        cost->mark_edges_used(parallel_vals);
+    };
+    apply_leash(true);
 
     // Progress-graded rejoin (ADR-0037): junction edges hanging off forward-path nodes
     // get a penalty graded by how far along the forward leg the node sits. Edges on the
     // forward path itself are skipped — the leash and the hard exclusion own those.
+    auto build_rejoin = [&](bool with_parallels) {
     std::unordered_map<uint64_t, float> rejoin;
     const float leash_surcharge = cost->reuse_factor() - 1.0f;
     if (leash_surcharge > 0.f) {
@@ -1603,9 +1676,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         });
       }
       // proto/v4-p1: the parallel tier — a road 30-80 m from the corridor carries the
-      // same progress grade as the corridor stretch it shadows.
-      for (const auto& [ev, dist] : parallel_at)
-        bump(ev, grade_at(dist));
+      // same progress grade as the corridor stretch it shadows.  Released at rung 1.
+      if (with_parallels)
+        for (const auto& [ev, dist] : parallel_at)
+          bump(ev, grade_at(dist));
     }
     // Cross-candidate corridor penalty (wayfinder #46): every edge earlier loops in this
     // bank already rode carries a soft surcharge on THIS return leg, graded by the
@@ -1621,9 +1695,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     }
     if (!rejoin.empty())
       cost->mark_rejoin_edges(std::move(rejoin));
+    };
+    build_rejoin(true);
     cost->set_user_avoid_edges(avoid_baseline);
-    if (!hard.empty())
-      cost->AddUserAvoidEdges(hard);
+    std::vector<sif::AvoidEdge> bars = hard;
+    bars.insert(bars.end(), twin_hard.begin(), twin_hard.end());
+    if (!bars.empty())
+      cost->AddUserAvoidEdges(bars);
     rejoin_ms += ms_since(t_rejoin);
     bidir_astar.Clear();
     std::vector<std::vector<PathInfo>> paths;
@@ -1632,24 +1710,64 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       paths = bidir_astar.GetBestPath(from, to, *reader, mode_costing, mode, options);
     } catch (const std::exception&) {
       // "No route home under exclusion" can surface as a throw or as an empty result;
-      // either way the fallback below decides.
+      // either way the ladder below decides.
       paths.clear();
     }
     astar_ms += ms_since(t_astar);
-    if (paths.empty() && !hard.empty()) {
-      // Re-poke the interrupt first: if the try above swallowed a client disconnect,
-      // this rethrows instead of paying a second A*.
+    rung = 0;
+
+    // One rung of the ladder: re-arm the leash/grade/bar tiers and search again.
+    auto retry = [&](bool with_parallels, bool bar_twins) {
       if (interrupt)
-        (*interrupt)();
-      // Fallback Loop: no fresh-road route home in this network — retry on the leash.
-      fell_back = true;
+        (*interrupt)(); // rethrow a swallowed client disconnect before paying an A*
+      apply_leash(with_parallels);
+      build_rejoin(with_parallels);
+      cost->set_user_avoid_edges(avoid_baseline);
+      std::vector<sif::AvoidEdge> b = hard;
+      if (bar_twins)
+        b.insert(b.end(), twin_hard.begin(), twin_hard.end());
+      if (!b.empty())
+        cost->AddUserAvoidEdges(b);
+      bidir_astar.Clear();
+      const auto t_fb = ledger_clock::now();
+      try {
+        paths = bidir_astar.GetBestPath(from, to, *reader, mode_costing, mode, options);
+      } catch (const std::exception&) {
+        paths.clear();
+      }
+      astar_fb_ms += ms_since(t_fb);
+    };
+
+    // Ticket-literal rung: parallels released, twins still barred.  Default off — see
+    // the reachability note above; the knob exists to measure the zero.
+    if (paths.empty() && !bars.empty() && roundtrip_fallback_parallel_rung && parallel_tier &&
+        !parallel_at.empty()) {
+      ++parallel_rung_tried;
+      retry(false, true);
+      if (!paths.empty())
+        ++parallel_rung_converted;
+    }
+    // rung 1: twins released to the leash, parallels released; the corridor stays barred.
+    if (paths.empty() && !bars.empty() && roundtrip_fallback_rungs && !twin_hard.empty()) {
+      retry(false, false);
+      if (!paths.empty())
+        rung = 1;
+    }
+    // rung 2: the v3 Fallback Loop — every hard exclusion dropped.
+    if (paths.empty() && !bars.empty()) {
+      rung = 2;
       ++fallback_count;
+      apply_leash(true);
+      build_rejoin(true);
       cost->set_user_avoid_edges(avoid_baseline);
       bidir_astar.Clear();
       const auto t_fb = ledger_clock::now();
       paths = bidir_astar.GetBestPath(from, to, *reader, mode_costing, mode, options);
       astar_fb_ms += ms_since(t_fb);
     }
+    if (paths.empty())
+      rung = 3; // no route on any rung — the candidate fails
+    ++rung_hits[rung];
     cost->set_user_avoid_edges(avoid_baseline);
     cost->clear_used_edges();
     return paths.empty() ? std::vector<PathInfo>{} : paths.front();
@@ -1662,11 +1780,18 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   struct Loop {
     std::vector<PathInfo> fwd, ret;
     valhalla::Location turn;
-    float curviness;
+    float curviness; // the HARVEST CHAIN's score — v3/P1's whole ranking key
     // Fallback Loop tag (ADR-0037): the return leg came from the soft-leash retry, so
     // it may reuse forward edges anywhere. The Defect Gate reads this to give the
     // loop a full-leg decode (a seam-window verdict provably leaks wrapped bounces).
     bool fallback;
+    // proto/v4-p1.1 (item 3, F20's full fix): the BUILT loop's own score.
+    uint8_t rung = 0;           // 0 clean hard-exclude / 1 twins released / 2 soft leash
+    float loop_curviness = 0.f; // curvature-weighted mean over BOTH legs, 0..1 per km
+    double self_overlap_m = 0;  // twins-aware D1-style metres, outside the exemption
+    double dist_err = 0;        // |built - target| / target
+    double bounce_m = 0;        // longest mid-return exact mirror (the geometry gate)
+    double score = 0;           // the documented rank score below
   };
   std::vector<Loop> loops;
   std::vector<Loop> dirty_loops;
@@ -1701,6 +1826,83 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     add(L.fwd, false, fwd_total);
     add(L.ret, true, ret_total);
     return fwd_total + ret_total;
+  };
+
+  // proto/v4-p1.1 BUILT-LOOP SCORE (item 3 — F20's full fix).  v3 and P1 ranked on
+  // `cands[ci].curviness_per_km`: the harvest label chain's curviness, computed before
+  // the walk-back pops the tip, blind to the return leg, to distance error and to
+  // self-overlap.  The score below reads the loop that will actually be ridden:
+  //
+  //     score = curviness(whole loop) / ((1 + Wo * overlap_frac) * (1 + Wd * dist_err))
+  //
+  //   curviness(whole loop)  sum(curvature * len) / sum(len) / 15 over BOTH legs, so a
+  //                          curvy forward leg no longer hides a straight motorway home.
+  //   overlap_frac           twins-aware self-overlap metres / loop metres.  A return
+  //                          edge counts as overlap when its canonical id, or a sidecar
+  //                          TWIN of it, is on the forward leg outside the Start
+  //                          Exemption — the engine-side D1 ("ridden both ways").
+  //   dist_err               |built - target| / target (F21: ranking was distance-blind).
+  //   Wo = 4, Wd = 1         thor.roundtrip_rank_{overlap,disterr}_w.  Wo = 4 makes a
+  //                          25 % self-overlapping loop score half a clean one; Wd = 1
+  //                          makes a 20 %-off loop lose ~17 %, which is about what a
+  //                          rider trades a fifth of the distance for.
+  //
+  // Tiers come first and are absolute: rung 0 (clean hard-exclude) before rung 1 (twins
+  // released) before rung 2 (soft-leash Fallback); the gate's dirty stash is served only
+  // if nothing else is.  Within a tier the sort is stable, so equal scores keep queue
+  // order and the seed still owns the tie-break.
+  auto score_built = [&](Loop& L) {
+    graph_tile_ptr tile, opp_tile;
+    double curv = 0.0, len = 0.0;
+    std::unordered_set<uint64_t> fwd_ids;
+    std::vector<uint64_t> tw;
+    for (const auto& pi : L.fwd) {
+      const GraphId e = pi.edgeid;
+      if (!reader->GetGraphTile(e, tile))
+        continue;
+      const DirectedEdge* de = tile->directededge(e);
+      curv += static_cast<double>(de->curvature()) * de->length();
+      len += de->length();
+      if (static_cast<double>(pi.path_distance) <= kStartExemptionMeters)
+        continue;
+      opp_tile = tile;
+      const GraphId opp = reader->GetOpposingEdgeId(e, opp_tile);
+      const uint64_t canon = RoadTwinIndex::canonical_id(de, e, opp);
+      fwd_ids.insert(canon);
+      if (twin_index) {
+        tw.clear();
+        twin_index->append_twins(canon, tw);
+        fwd_ids.insert(tw.begin(), tw.end());
+      }
+    }
+    const double fwd_total = static_cast<double>(L.fwd.back().path_distance);
+    const double ret_total = static_cast<double>(L.ret.back().path_distance);
+    double overlap = 0.0, prev = 0.0;
+    for (const auto& pi : L.ret) {
+      const GraphId e = pi.edgeid;
+      const double cum = static_cast<double>(pi.path_distance);
+      const double seglen = cum - prev;
+      prev = cum;
+      if (!reader->GetGraphTile(e, tile))
+        continue;
+      const DirectedEdge* de = tile->directededge(e);
+      curv += static_cast<double>(de->curvature()) * de->length();
+      len += de->length();
+      if (ret_total - cum <= kStartExemptionMeters)
+        continue;
+      opp_tile = tile;
+      const GraphId opp = reader->GetOpposingEdgeId(e, opp_tile);
+      if (fwd_ids.count(RoadTwinIndex::canonical_id(de, e, opp)))
+        overlap += seglen;
+    }
+    const double total = fwd_total + ret_total;
+    L.loop_curviness = len > 0.0 ? static_cast<float>(curv / len / 15.0) : 0.0f;
+    L.self_overlap_m = overlap;
+    L.dist_err = target > 0.0 ? std::fabs(total - target) / target : 0.0;
+    const double ov_frac = total > 0.0 ? overlap / total : 0.0;
+    L.score = static_cast<double>(L.loop_curviness) /
+              ((1.0 + roundtrip_rank_overlap_w * ov_frac) *
+               (1.0 + roundtrip_rank_disterr_w * L.dist_err));
   };
   std::vector<PointLL> built_lls;
   std::unordered_set<uint64_t> built_nodes; // the distance-correction node guard
@@ -1767,9 +1969,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (outbound == 0)
       return std::nullopt;
     std::vector<PathInfo> ret;
-    bool fell_back = false;
+    uint8_t rung = 0;
     try {
-      ret = route_leg(fwd, turn, start, fell_back);
+      ret = route_leg(fwd, turn, start, rung);
     } catch (const std::exception& e) {
       // A return leg that cannot route fails this candidate only — the same
       // contract as the empty-path skip below. Re-poke the interrupt so a
@@ -1790,19 +1992,53 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // mirror apex sits far off-seam, where a window sees no palindrome at all — v3f
     // leaked 25 wrapped bounces exactly this way — so fallbacks always get the full
     // decode.
+    const bool fell_back = rung >= 2;
     const auto t_seam = ledger_clock::now();
     const double stub = fell_back ? seam_stub_m(fwd, ret, *reader, 0.0)
                                   : seam_stub_m(fwd, ret, *reader, kSeamWindowM);
     seam_ms += ms_since(t_seam);
-    if (stub >= kSeamStubRejectM) {
+
+    Loop L;
+    L.fwd = std::move(fwd);
+    L.ret = std::move(ret);
+    L.turn = std::move(turn);
+    L.curviness = cands[ci].curviness_per_km;
+    L.fallback = fell_back;
+    L.rung = rung;
+
+    // proto/v4-p1.1 GEOMETRY DEFECT GATE (item 4).  ADR-0037's gate reads ONE shape:
+    // an exact-mirror stub across the seam.  Two rider-visible shapes walk past it —
+    //   (a) a return that rides the forward corridor's TWINS beyond the Start Exemption
+    //       (the F02 residue: not the same edge, so no seam palindrome, but the same
+    //       physical road ridden the other way).  A rung-0 loop cannot do this (the
+    //       twins were barred from its search); a rung-1 or rung-2 loop can, and that is
+    //       exactly the deep-bank residue P1 pushed into slots 9-11 rather than removed;
+    //   (b) a mid-return exact-mirror bounce, whose apex sits far off-seam (F08 / G6b).
+    // Both are now treated like a seam mirror: rejected, slot refilled from the queue,
+    // served only if the cell would otherwise return nothing.
+    const auto t_gate = ledger_clock::now();
+    score_built(L);
+    bool gate_twin = false, gate_bounce = false;
+    if (roundtrip_geometry_gate) {
+      gate_twin = L.self_overlap_m >= roundtrip_gate_twin_ride_m;
+      if (!gate_twin) {
+        L.bounce_m = leg_mirror_stub_m(L.ret, *reader);
+        gate_bounce = L.bounce_m >= roundtrip_gate_return_bounce_m;
+      }
+    }
+    gate_ms += ms_since(t_gate);
+    if (stub >= kSeamStubRejectM || gate_twin || gate_bounce) {
+      if (stub >= kSeamStubRejectM)
+        ++gate_seam;
+      if (gate_twin)
+        ++gate_twinride;
+      if (gate_bounce)
+        ++gate_bouncehits;
       if (dirty_loops.size() < want)
-        dirty_loops.push_back({std::move(fwd), std::move(ret), std::move(turn),
-                               cands[ci].curviness_per_km, fell_back});
+        dirty_loops.push_back(std::move(L));
       return std::nullopt;
     }
-
-    return Loop{std::move(fwd), std::move(ret), std::move(turn),
-                cands[ci].curviness_per_km, fell_back};
+    return L;
   };
 
   // Distance Flex, lazy (ADR-0037 / #54 candidate 6): the widened re-scan of the same
@@ -1813,14 +2049,26 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   uint32_t attempts = 0;
   uint32_t attempt_cap = want + kAttemptSlack;
   size_t qi = 0;
+  // proto/v4-p1.1 F09 (item 6): the stall branch granted the fresh +want budget only
+  // when IT was the one calling widen_pool().  The distance correction also widens
+  // (`widened = true`), so a cell whose correction fired first reached its stall with
+  // `widened` already set, was granted nothing, and broke at want + kAttemptSlack — the
+  // hard cells the budget exists to protect.  The grant now belongs to the stall, once,
+  // and never shrinks the cap.
+  bool stall_granted = false;
+  const char* underfill_cause = "none";
   while (true) {
     if (loops.size() >= want)
       break;
-    if ((qi >= queue.size() || attempts >= attempt_cap) && !widened) {
-      attempt_cap = attempts + want;
-      widen_pool();
+    if (qi >= queue.size() || attempts >= attempt_cap) {
+      if (roundtrip_f09_budget ? !stall_granted : !widened) {
+        stall_granted = true;
+        attempt_cap = std::max(attempt_cap, attempts + want);
+        widen_pool(); // idempotent
+      }
     }
     if (qi >= queue.size() || attempts >= attempt_cap) {
+      underfill_cause = attempts >= attempt_cap ? "cap" : "queue";
       if (attempts >= attempt_cap)
         LOG_INFO("roundtrip: attempt cap (" + std::to_string(attempt_cap) + ") hit with " +
                  std::to_string(loops.size()) + " loop(s) built");
@@ -1842,7 +2090,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // candidates stay distinct instead of converging on the one ideal node.
     const double actual_m = static_cast<double>(built->fwd.back().path_distance) +
                             static_cast<double>(built->ret.back().path_distance);
-    const double dist_err = std::fabs(actual_m - target) / target;
+    const double dist_err = built->dist_err;
     // Fallback Loops fire only on extreme misses — see kDistCorrFallbackThr.
     // (proto/v4-p1: the two-lobe exemption went with Second Via.)
     const double fire_thr = built->fallback ? kDistCorrFallbackThr : kDistCorrTolerance;
@@ -1977,9 +2225,18 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (correction_count > 0)
     LOG_INFO("roundtrip: distance correction re-aimed " + std::to_string(correction_count) +
              " off-target build(s)");
-  if (!dirty_loops.empty())
-    LOG_INFO("roundtrip: Defect Gate rejected " + std::to_string(dirty_loops.size()) +
-             " seam-stub loop(s) at build time");
+  if (gate_seam + gate_twinride + gate_bouncehits > 0)
+    LOG_INFO("roundtrip gate: rejected seam=" + std::to_string(gate_seam) +
+             " twin_ride=" + std::to_string(gate_twinride) +
+             " return_bounce=" + std::to_string(gate_bouncehits) + " (stashed " +
+             std::to_string(dirty_loops.size()) + ")");
+  LOG_INFO("roundtrip rungs: r0=" + std::to_string(rung_hits[0]) +
+           " r1=" + std::to_string(rung_hits[1]) + " r2=" + std::to_string(rung_hits[2]) +
+           " none=" + std::to_string(rung_hits[3]) +
+           (parallel_rung_tried
+                ? " parallel_rung=" + std::to_string(parallel_rung_converted) + "/" +
+                      std::to_string(parallel_rung_tried)
+                : std::string()));
   if (loops.empty() && !dirty_loops.empty()) {
     // Dirty-last-resort: better one honest out-and-back than a 442 in a network that
     // physically cannot close a clean loop.
@@ -1997,21 +2254,34 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   //    as Fallbacks with the direct-serve slots 0-2 the worst on every axis the score
   //    can see.  Clean-first is the one axis P1 adds; ranking the BUILT loop (return
   //    leg, distance error, self-overlap) is P2's job.
-  std::stable_sort(loops.begin(), loops.end(), [](const Loop& a, const Loop& b) {
-    if (a.fallback != b.fallback)
-      return !a.fallback;
-    return a.curviness > b.curviness;
+  const bool built_rank = roundtrip_built_ranking;
+  std::stable_sort(loops.begin(), loops.end(), [built_rank](const Loop& a, const Loop& b) {
+    if (!built_rank) {
+      if (a.fallback != b.fallback)
+        return !a.fallback;
+      return a.curviness > b.curviness;
+    }
+    // proto/v4-p1.1: rung tier first (absolute), then the BUILT loop's score.
+    if (a.rung != b.rung)
+      return a.rung < b.rung;
+    return a.score > b.score;
   });
 
   {
     // proto/v4-p1: surface the served order so the ranking change is auditable in the
-    // ledger the way the fallback/gate counts already are.
+    // ledger the way the fallback/gate counts already are.  proto/v4-p1.1 adds the
+    // score's three inputs, so a slot can be explained from the log alone:
+    //   slot:rung/score*1000/loop-curviness*1000/self-overlap m/distance-error*100
     std::string order;
     for (size_t li = 0; li < loops.size(); ++li)
-      order += (li ? " " : "") + std::to_string(li) + ":" +
-               (loops[li].fallback ? "fb" : "cl") + "/" +
-               std::to_string(static_cast<int>(loops[li].curviness * 1000.0f));
-    LOG_INFO("roundtrip ranking: clean-first then curviness — " + order);
+      order += (li ? " " : "") + std::to_string(li) + ":r" + std::to_string(loops[li].rung) + "/" +
+               std::to_string(static_cast<int>(loops[li].score * 1000.0)) + "/" +
+               std::to_string(static_cast<int>(loops[li].loop_curviness * 1000.0f)) + "/" +
+               std::to_string(static_cast<int>(loops[li].self_overlap_m)) + "/" +
+               std::to_string(static_cast<int>(loops[li].dist_err * 100.0));
+    LOG_INFO(std::string("roundtrip ranking: ") +
+             (built_rank ? "rung tier then built-loop score" : "clean-first then curviness") +
+             " — " + order);
   }
 
   // 5) Serialize each loop as a 2-leg TripRoute (start -> turnaround -> start). Pass fresh
@@ -2042,12 +2312,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     LOG_INFO("roundtrip timing: harvest=" + ms(harvest_ms) + " scan=" + ms(scan_ms) +
              " walkback=" + ms(walkback_ms) + " rejoin=" + ms(rejoin_ms) +
              " astar=" + ms(astar_ms) + " astar_fb=" + ms(astar_fb_ms) +
-             " seam=" + ms(seam_ms) + " build=" + ms(build_ms) +
+             " seam=" + ms(seam_ms) + " gate=" + ms(gate_ms) + " build=" + ms(build_ms) +
+             " f01_key=" + ms(expander.f01_key_ms()) + " f01_dfs=" + ms(expander.f01_dfs_ms()) +
+             " f01_labels=" + std::to_string(expander.f01_labels_scanned()) +
              " (ms) attempts=" + std::to_string(attempts) +
              " corrections=" + std::to_string(correction_count) +
              " fallbacks=" + std::to_string(fallback_count) +
              " loops=" + std::to_string(loops.size()) +
-             " dirty=" + std::to_string(dirty_loops.size()) + (widened ? " widened" : ""));
+             " dirty=" + std::to_string(dirty_loops.size()) + (widened ? " widened" : "") +
+             " underfill=" + underfill_cause);
   }
 }
 } // namespace thor

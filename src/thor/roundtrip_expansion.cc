@@ -3,6 +3,7 @@
 #include "midgard/pointll.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <unordered_map>
 
@@ -85,8 +86,10 @@ std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
   // proto/v4-p1 F01: one pass over the whole label forest, before any candidate is
   // considered.  Per-candidate chain walks are O(candidates x chain depth) and cost
   // ~1 s on a 50 km Belgrade request (measured); this is O(labels).
-  if (reject_nonsimple_ && nonsimple_.size() != bdedgelabels_.size())
-    ComputeChainSimplicity(reader);
+  // proto/v4-p1.1: cached across the primary and widened ScanBand (both use
+  // hi_frac 1.18, so `hi` is identical); recomputed only if a wider band ever arrives.
+  if (reject_nonsimple_ && (nonsimple_.size() != bdedgelabels_.size() || hi > f01_hi_))
+    ComputeChainSimplicity(reader, hi);
 
   // Post-hoc curviness-per-km + bounce rejection (ADR-0037 turnaround hardening: the
   // costing's own U-turn test — pred.opp_local_idx() == edge.localedgeidx() — admits
@@ -201,23 +204,47 @@ std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
 // the labels form a forest.  One DFS carrying the canonical ids of the current
 // root-to-node path in a small hash map answers "does this edge already appear above
 // me" in O(1) per label, and the flag inherits down the chain.
-void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader) {
+void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader, uint32_t hi) {
   const uint32_t n = static_cast<uint32_t>(bdedgelabels_.size());
   nonsimple_.assign(n, 0);
+  f01_hi_ = hi;
+  f01_labels_ = 0;
+  f01_key_ms_ = f01_dfs_ms_ = 0.0;
   if (n == 0)
     return;
+  const auto t_key = std::chrono::steady_clock::now();
 
-  // Canonical (forward) directed-edge id per label — the undirected identity key AND
-  // the sidecar's lookup key.  Only the reverse-facing half needs an opposing lookup.
+  // Canonical undirected id per label = min(edge, opposing edge) — the sidecar's key
+  // convention since proto/v4-p1.1.
+  //
+  // P1 read it as `de->forward() ? eid : GetOpposingEdgeId(eid)`, which costs a tile
+  // fetch for the edge PLUS a second fetch inside the opposing lookup, on every settled
+  // label: +48 ms/request at 300 km, the single biggest line in P1's latency bill (§8).
+  // Everything needed is already in the label — `endnode()` and `opp_index()` are
+  // stored by BDEdgeLabel's constructor — so the opposing id is
+  // `(endnode.tile, endnode.level, node->edge_index() + opp_index)` and the DirectedEdge
+  // is never dereferenced.  One tile fetch remains, and it is served from a
+  // single-entry cache because settle order clusters by tile.
+  //
+  // The forward Dijkstra does NOT populate BDEdgeLabel::opp_edgeid() (dijkstras.cc:136
+  // "we don't bother ... for the forward expansion"), which is why the id is rebuilt
+  // here rather than read off the label.
   std::vector<uint64_t> canon(n, 0);
+  graph_tile_ptr tile;
   for (uint32_t k = 0; k < n; ++k) {
-    const GraphId eid = bdedgelabels_[k].edgeid();
-    graph_tile_ptr tile = reader.GetGraphTile(eid);
-    if (!tile)
+    if (bdedgelabels_[k].path_distance() > hi)
+      continue; // pruned subtree — never a candidate, never an ancestor of one
+    const GraphId en = bdedgelabels_[k].endnode();
+    if (!reader.GetGraphTile(en, tile))
       continue;
-    const DirectedEdge* de = tile->directededge(eid);
-    canon[k] = de->forward() ? eid.value : reader.GetOpposingEdgeId(eid).value;
+    const GraphId opp(en.tileid(), en.level(),
+                      tile->node(en)->edge_index() + bdedgelabels_[k].opp_index());
+    canon[k] = std::min(bdedgelabels_[k].edgeid().value, opp.value);
+    ++f01_labels_;
   }
+  f01_key_ms_ =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_key).count();
+  const auto t_dfs = std::chrono::steady_clock::now();
 
   // children lists (reverse order so a child list comes out ascending)
   constexpr uint32_t kEnter = 0xfffffffeu;
@@ -237,6 +264,8 @@ void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader) {
   std::vector<std::pair<uint32_t, uint32_t>> stack; // (label, child cursor | kEnter)
   std::vector<uint64_t> tw;
   for (uint32_t r : roots) {
+    if (canon[r] == 0 && bdedgelabels_[r].path_distance() > hi)
+      continue;
     stack.emplace_back(r, kEnter);
     while (!stack.empty()) {
       const size_t top = stack.size() - 1;
@@ -247,7 +276,9 @@ void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader) {
         if (c) {
           if (onpath.count(c)) {
             bad = true;
-          } else if (twin_index_) {
+          } else if (twin_index_ && twin_index_->maybe_has_twins(c)) {
+            // proto/v4-p1.1: the Bloom prefilter answers "no twins" — the >98 % case —
+            // without the CSR binary search.
             tw.clear();
             twin_index_->append_twins(c, tw);
             for (uint64_t t : tw)
@@ -264,6 +295,8 @@ void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader) {
       } else if (stack[top].second != kInvalidLabel) {
         const uint32_t ch = stack[top].second;
         stack[top].second = child_next[ch];
+        if (canon[ch] == 0 && bdedgelabels_[ch].path_distance() > hi)
+          continue; // proto/v4-p1.1: out-of-band subtree, pruned whole
         stack.emplace_back(ch, kEnter);
       } else {
         const uint64_t c = canon[k];
@@ -276,6 +309,8 @@ void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader) {
       }
     }
   }
+  f01_dfs_ms_ =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dfs).count();
 }
 
 } // namespace thor

@@ -7,6 +7,7 @@
 #include "midgard/pointll.h"
 
 #include <chrono>
+#include <functional>
 #include <cmath>
 #include <limits>
 #include <map>
@@ -35,6 +36,20 @@ constexpr double kCoverFraction = 0.70;
 constexpr double kSpanFraction = 0.60;
 // Collinearity tolerance on the chord bearings (the ticket's "~180 deg +/- tolerance").
 constexpr double kBearingTolDeg = 30.0;
+// proto/v4-p1.1 SWITCHBACK TEST (curvagen-valhalla#12 item 1).  Planimetric geometry
+// cannot tell a mountain hairpin pair from a dual carriageway (P1 report §7.6: block C
+// paid for it with is_lollipop c0.8 1.30 -> 3.91 % and vlasina-50 km 48.3 -> 62.7 %).
+// Two physical facts separate them:
+//   * a dual carriageway is ALWAYS two different OSM ways (each carriageway is its own
+//     one-way way); the two arms either side of a hairpin are usually one way;
+//   * a carriageway pair holds a roughly CONSTANT lateral offset along the matched run,
+//     while a hairpin's arms converge to ~0 at the apex and diverge away from it.
+// A pair qualifies only if it is a different way OR its offset is constant.
+// "Constant" = the covered samples' offsets span at most kOffsetSpreadM, or the
+// smallest is at least kOffsetConstFrac of the largest (which admits a wide-median
+// motorway whose separation swings 20-60 m but never collapses).
+constexpr double kOffsetSpreadM = 12.0;
+constexpr double kOffsetConstFrac = 0.40;
 // Spatial bin pitch; must be >= the widest radius so a 1-ring neighbourhood is complete.
 constexpr double kCellM = 120.0;
 // Serbia-scale constant for the lon/metre conversion of the BIN GRID only (distances
@@ -88,17 +103,19 @@ std::mutex& registry_mutex() {
 const RoadTwinIndex& RoadTwinIndex::get(GraphReader& reader,
                                         double twin_radius_m,
                                         double parallel_radius_m,
-                                        bool build_parallels) {
+                                        bool build_parallels,
+                                        bool switchback_test) {
   // Keyed by tileset location + radii: gurka builds many tilesets in one process.
   static std::map<std::string, std::unique_ptr<RoadTwinIndex>> registry;
   const std::string key = reader.GetTileSetLocation() + "|" + std::to_string(twin_radius_m) +
-                          "|" + std::to_string(build_parallels ? parallel_radius_m : 0.0);
+                          "|" + std::to_string(build_parallels ? parallel_radius_m : 0.0) + "|" +
+                          (switchback_test ? "sb" : "nosb");
   std::lock_guard<std::mutex> lock(registry_mutex());
   auto it = registry.find(key);
   if (it != registry.end())
     return *it->second;
   auto idx = std::unique_ptr<RoadTwinIndex>(new RoadTwinIndex());
-  idx->Build(reader, twin_radius_m, parallel_radius_m, build_parallels);
+  idx->Build(reader, twin_radius_m, parallel_radius_m, build_parallels, switchback_test);
   auto* raw = idx.get();
   registry.emplace(key, std::move(idx));
   return *raw;
@@ -107,7 +124,8 @@ const RoadTwinIndex& RoadTwinIndex::get(GraphReader& reader,
 void RoadTwinIndex::Build(GraphReader& reader,
                           double twin_radius_m,
                           double parallel_radius_m,
-                          bool build_parallels) {
+                          bool build_parallels,
+                          bool switchback_test) {
   const auto t0 = std::chrono::steady_clock::now();
   stats_.twin_radius_m = twin_radius_m;
   stats_.parallel_radius_m = build_parallels ? parallel_radius_m : 0.0;
@@ -120,6 +138,7 @@ void RoadTwinIndex::Build(GraphReader& reader,
   std::vector<uint16_t> samp_cnt;
   std::vector<float> bearing;
   std::vector<float> len_m; // edge length (metres) — the span test's yardstick
+  std::vector<uint64_t> way_id; // proto/v4-p1.1: OSM way id — the switchback test
   std::vector<Pt> samples;
   std::vector<std::pair<uint64_t, uint32_t>> cell_entries; // (cell key, edge index)
 
@@ -155,15 +174,23 @@ void RoadTwinIndex::Build(GraphReader& reader,
         continue;
       if (!((de->forwardaccess() | de->reverseaccess()) & kAutoAccess))
         continue;
-      const auto shape = tile->edgeinfo(de).shape();
+      const auto ei = tile->edgeinfo(de);
+      const auto shape = ei.shape();
       if (shape.size() < 2)
         continue;
+      // proto/v4-p1.1: the canonical key is now min(edge, opposing edge) — see the
+      // header.  One opposing lookup per segment at BUILD time buys the F01 forest pass
+      // a tile-free key at request time.
+      graph_tile_ptr opp_tile = tile;
+      const GraphId opp = reader.GetOpposingEdgeId(eid, opp_tile);
+      const uint64_t canon = opp.is_valid() ? std::min(eid.value, opp.value) : eid.value;
 
       // Sample at kSampleSpacingM, endpoints always in, capped.
       const double len = static_cast<double>(de->length());
       double pitch = std::max(kSampleSpacingM, len / (kMaxSamplesPerEdge - 1));
       const uint32_t idx = static_cast<uint32_t>(edge_ids.size());
-      edge_ids.push_back(eid.value);
+      edge_ids.push_back(canon);
+      way_id.push_back(ei.wayid());
       samp_off.push_back(static_cast<uint32_t>(samples.size()));
       auto push = [&](const PointLL& p) {
         samples.push_back({static_cast<int32_t>(std::llround(p.lat() * 1e6)),
@@ -224,6 +251,15 @@ void RoadTwinIndex::Build(GraphReader& reader,
   std::vector<uint32_t> cand;
   std::vector<std::pair<uint64_t, uint64_t>> twin_pairs, par_pairs;
 
+  // proto/v4-p1.1: where the switchback test bites, on a 0.5 deg grid — the terrain
+  // breakdown the ticket asks for (block C mountain origins vs the Belgrade cells),
+  // reported without hard-coding any corpus geography into the engine.
+  std::map<std::pair<int, int>, uint32_t> drop_cells;
+  auto note_drop = [&](const Pt& p) {
+    ++drop_cells[{static_cast<int>(std::floor(p.lat_e6 * 1e-6 * 2.0)),
+                  static_cast<int>(std::floor(p.lon_e6 * 1e-6 * 2.0))}];
+  };
+
   for (uint32_t u = 0; u < nedges; ++u) {
     const uint32_t uo = samp_off[u], uc = samp_cnt[u];
     // candidate gather
@@ -278,7 +314,7 @@ void RoadTwinIndex::Build(GraphReader& reader,
       // every sample projects onto the same point of the neighbour, so the span is ~0.
       // Without it the Serbia index called 40 % of all segments twins.
       auto run = [&](uint32_t ao, uint32_t ac, uint32_t bo, uint32_t bc, double r2,
-                     double& cov, double& span) {
+                     double& cov, double& span, double& off_min, double& off_max) {
         double blen[kMaxSamplesPerEdge + 2];
         double acc = 0.0;
         blen[0] = 0.0;
@@ -290,6 +326,8 @@ void RoadTwinIndex::Build(GraphReader& reader,
         }
         uint32_t n = 0;
         double smin = std::numeric_limits<double>::max(), smax = -1.0;
+        off_min = std::numeric_limits<double>::max();
+        off_max = -1.0;
         for (uint32_t s = ao; s < ao + ac; ++s) {
           const double px = X(samples[s]), py = Y(samples[s]);
           double best = std::numeric_limits<double>::max(), best_s = 0.0, tt = 0.0;
@@ -305,24 +343,53 @@ void RoadTwinIndex::Build(GraphReader& reader,
             ++n;
             smin = std::min(smin, best_s);
             smax = std::max(smax, best_s);
+            // proto/v4-p1.1: the covered samples' lateral offsets — the switchback test.
+            const double off = std::sqrt(best);
+            off_min = std::min(off_min, off);
+            off_max = std::max(off_max, off);
           }
         }
         cov = ac ? double(n) / ac : 0.0;
         span = (smax >= smin) ? (smax - smin) : 0.0;
       };
-      auto qualifies = [&](double r2) {
+      // proto/v4-p1.1: `constant` is the switchback verdict for whichever direction
+      // qualified; `same_way` is the cheap OSM-identity half of it.
+      const bool same_way = way_id[u] == way_id[v];
+      auto qualifies = [&](double r2, bool& constant) {
         double c1 = 0, s1 = 0, c2 = 0, s2 = 0;
-        run(uo, uc, vo, vc, r2, c1, s1);
-        run(vo, vc, uo, uc, r2, c2, s2);
+        double o1lo = 0, o1hi = 0, o2lo = 0, o2hi = 0;
+        run(uo, uc, vo, vc, r2, c1, s1, o1lo, o1hi);
+        run(vo, vc, uo, uc, r2, c2, s2, o2lo, o2hi);
         const double shorter = std::min(len_m[u], len_m[v]);
         const bool q1 = c1 >= kCoverFraction && s1 >= kSpanFraction * shorter;
         const bool q2 = c2 >= kCoverFraction && s2 >= kSpanFraction * shorter;
+        auto flat = [](double lo, double hi) {
+          return hi >= 0.0 && ((hi - lo) <= kOffsetSpreadM || lo >= kOffsetConstFrac * hi);
+        };
+        constant = (q1 && flat(o1lo, o1hi)) || (q2 && flat(o2lo, o2hi));
         return q1 || q2;
       };
-      if (qualifies(twin_r2))
-        twin_pairs.emplace_back(edge_ids[u], edge_ids[v]);
-      else if (build_parallels && qualifies(max_r2))
-        par_pairs.emplace_back(edge_ids[u], edge_ids[v]);
+      // A pair is the same physical road only if the geometry says so AND the
+      // switchback test does not veto it: different OSM way, or a constant offset.
+      bool constant = false;
+      if (qualifies(twin_r2, constant)) {
+        ++stats_.geom_twin_pairs;
+        if (!switchback_test || !same_way || constant) {
+          twin_pairs.emplace_back(edge_ids[u], edge_ids[v]);
+        } else {
+          ++stats_.switchback_dropped;
+          ++stats_.sb_same_way;
+          if (!constant)
+            ++stats_.sb_divergent;
+          note_drop(samples[uo]);
+        }
+      } else if (build_parallels && qualifies(max_r2, constant)) {
+        ++stats_.geom_par_pairs;
+        if (!switchback_test || !same_way || constant)
+          par_pairs.emplace_back(edge_ids[u], edge_ids[v]);
+        else
+          ++stats_.switchback_dropped_par;
+      }
     }
   }
   stats_.twin_pairs = twin_pairs.size();
@@ -352,6 +419,12 @@ void RoadTwinIndex::Build(GraphReader& reader,
   };
   emit(twin_pairs, twin_keys_, twin_off_, twin_vals_);
   emit(par_pairs, par_keys_, par_off_, par_vals_);
+  // proto/v4-p1.1: the Bloom prefilter over the twin key set (see the header).
+  twin_filter_.assign(kFilterBits / 64, 0ull);
+  for (uint64_t k : twin_keys_) {
+    const uint64_t h = mix(k) & kFilterMask;
+    twin_filter_[h >> 6] |= 1ull << (h & 63);
+  }
   stats_.twin_keys = twin_keys_.size();
   stats_.parallel_keys = par_keys_.size();
   stats_.retained_bytes = twin_keys_.size() * 8 + twin_off_.size() * 4 + twin_vals_.size() * 8 +
@@ -371,6 +444,29 @@ void RoadTwinIndex::Build(GraphReader& reader,
            std::to_string(static_cast<int>(stats_.parallel_radius_m)) + " m); retained " +
            std::to_string(stats_.retained_bytes / 1024 / 1024) + " MiB, peak ~" +
            std::to_string(stats_.peak_bytes / 1024 / 1024) + " MiB");
+
+  // proto/v4-p1.1 switchback ledger: what the OSM-way / constant-offset test removed,
+  // and the 0.5 deg cells it removed it from (top 12, descending).
+  if (switchback_test) {
+    std::vector<std::pair<uint32_t, std::pair<int, int>>> top;
+    for (const auto& kv : drop_cells)
+      top.emplace_back(kv.second, kv.first);
+    std::sort(top.begin(), top.end(), std::greater<>());
+    std::string cells;
+    for (size_t i = 0; i < top.size() && i < 12; ++i)
+      cells += " (" + std::to_string(top[i].second.first / 2.0).substr(0, 4) + "," +
+               std::to_string(top[i].second.second / 2.0).substr(0, 5) + ")=" +
+               std::to_string(top[i].first);
+    LOG_INFO("roundtrip switchback test: dropped " + std::to_string(stats_.switchback_dropped) +
+             " of " + std::to_string(stats_.geom_twin_pairs) + " geometric twin pairs (" +
+             std::to_string(stats_.geom_twin_pairs
+                                ? 100 * stats_.switchback_dropped / stats_.geom_twin_pairs
+                                : 0) +
+             " %) — same OSM way " + std::to_string(stats_.sb_same_way) +
+             ", divergent offset " + std::to_string(stats_.sb_divergent) + "; parallels dropped " +
+             std::to_string(stats_.switchback_dropped_par) + " of " +
+             std::to_string(stats_.geom_par_pairs) + "; drop cells (0.5 deg):" + cells);
+  }
 }
 
 } // namespace thor

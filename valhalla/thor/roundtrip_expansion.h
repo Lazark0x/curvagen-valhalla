@@ -5,6 +5,7 @@
 #include "thor/road_twin_index.h"
 
 #include <cstdint>
+#include <cstddef>
 #include <vector>
 
 namespace valhalla {
@@ -62,6 +63,16 @@ public:
   uint32_t nonsimple_rejected() const {
     return nonsimple_rejected_;
   }
+  // proto/v4-p1.1: the F01 pass's own cost, split canon-key / DFS (ms).
+  double f01_key_ms() const {
+    return f01_key_ms_;
+  }
+  double f01_dfs_ms() const {
+    return f01_dfs_ms_;
+  }
+  uint32_t f01_labels_scanned() const {
+    return f01_labels_;
+  }
 
 protected:
   // We only need the settled label tree, not per-node expansion callbacks.
@@ -78,7 +89,10 @@ protected:
                          uint32_t& edge_label_reservation) const override;
 
   // proto/v4-p1 F01: fill nonsimple_ for every settled label in one forest pass.
-  void ComputeChainSimplicity(baldr::GraphReader& reader);
+  // proto/v4-p1.1: `hi` bounds it — a label past the widest band's upper edge can never
+  // BE a candidate, and path_distance is monotone along a chain, so it can never be an
+  // ANCESTOR of one either.  Its whole subtree is pruned.
+  void ComputeChainSimplicity(baldr::GraphReader& reader, uint32_t hi);
 
 private:
   float max_meters_ = 0.0f;   // = target/2 * 1.2
@@ -87,6 +101,9 @@ private:
   const RoadTwinIndex* twin_index_ = nullptr;      // proto/v4-p1 F01 (twin-aware)
   uint32_t nonsimple_rejected_ = 0;                // proto/v4-p1 ledger counter
   std::vector<uint8_t> nonsimple_;                 // proto/v4-p1 per-label chain flag
+  uint32_t f01_hi_ = 0;                            // proto/v4-p1.1 band bound of the cached pass
+  double f01_key_ms_ = 0.0, f01_dfs_ms_ = 0.0;     // proto/v4-p1.1 sub-stage ledger
+  uint32_t f01_labels_ = 0;
 };
 
 } // namespace thor
