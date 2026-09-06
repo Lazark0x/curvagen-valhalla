@@ -3118,6 +3118,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     rescue_pass = true;
     qi = 0;
     attempt_cap = std::max(attempt_cap, attempts + want + kAttemptSlack);
+    stall_granted = false; // the rescue gets P1.1's own stall grant (F09) once more
     build_loop();
     if (rt_debug)
       std::cerr << "[rt-debug] rescue pass: attempts=" << pair_rescue_attempts << " loops="
