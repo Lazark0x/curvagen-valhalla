@@ -360,7 +360,7 @@ Three levers, all measured on 27 heavy Belgrade 50–100 km cells (`~/.curvagen-
 | `roundtrip_geometry_gate=false` | 3 307 | 1 152 | **12.3** | the attempts, not the decode |
 | `roundtrip_f09_budget=false` | 3 360 | 1 203 | 14.2 | inside noise |
 
-`thor.roundtrip_gate_refill_budget` (§4) is the untried fourth: capping the refills at, say, 4 per request would cut most of the +3.4 attempts while leaving the served slots gated. **It was not swept — the corpus runs cost ~11 minutes each and the budget went on the ratchet-9 sweep the ticket asked for.** It is the first thing to try if the 1.10× bar has to be met.
+`thor.roundtrip_gate_refill_budget` (§4) is the fourth lever, and it **has now been swept — see §15.** Capping the refills does cut the attempts and does meet the bar (budget 2 with the rung ladder off reads 1.10×, fills 552/552), at a cost §11 did not anticipate: the budget is shared with the seam gate, so bounding it puts ≥ 500 m seam stubs back into the deep bank (§15.5).
 
 ### 8.5 Mechanism classification
 
@@ -417,12 +417,12 @@ Seven of the fourteen pass outright, two are reports that improved, and the five
 
 ### For P2
 
-1. **The gate's refill economics are the whole latency bill.** +3.4 builds/request. `thor.roundtrip_gate_refill_budget` exists and is unswept; so is the obvious alternative — score the candidate's *return corridor* before building it, so the gate rejects at harvest time rather than after an A\*.
-2. **The intermediate rung earns 2.1 % for ~200 ms.** Either find the rung that converts (release the corridor's *exempt* stretch first? release twins only where the corridor is one-way?) or drop it.
+1. **The gate's refill economics are the whole latency bill.** +3.4 builds/request. `thor.roundtrip_gate_refill_budget` **is now swept (§15)** and the answer is: bounding it meets the latency bar and fixes the fills, but starves ADR-0037's seam gate along with the geometry gate, so `spike_ge_500m` goes 0.00 → 2.08 %. **The knob is mis-scoped** — a budget that applied only to the geometry gate's rejects would buy the whole win for nothing, and that one-line change is P2's first move (§15.5). The other alternative still stands: score the candidate's *return corridor* before building it, so the gate rejects at harvest time rather than after an A\*.
+2. **The intermediate rung earns 2.1 % for ~200 ms.** Either find the rung that converts (release the corridor's *exempt* stretch first? release twins only where the corridor is one-way?) or drop it. **§15 drops it:** turning the ladder off changes served slots 0–5 by *nothing* to the decimal, loses no request (`none` stays 14), and is what carries the knee under the 1.10× bar.
 3. **Block C at c0.8 needs its own answer.** Not the switchback test. Candidates: let the twin tier degrade to the soft leash above some terrain ruggedness; or accept that a mountain out-and-back on a single serpentine *is* the ride and stop calling it a lollipop.
 4. **Distinctness needs a partner mechanism**, and the sweep must be joint with latency: `roundtrip_xcand_strength` 0.5 is a known full win at a known latency cost (ADR-0039), and P1.1 has spent that headroom.
 5. **The F01 pass at 300 km is 54 ms.** O(labels) with ~62 ns/label of pointer-chasing; the remaining wins are algorithmic (Euler-tour ancestor test, or an approximate bounded-window revisit check), not constant-factor.
-6. **Fills 538/552.** Every short bank is budget-forced. Raising `kAttemptSlack` trades latency for fills; capping gate refills trades served-slot cleanliness for both. The three-way is a product call.
+6. **Fills 538/552.** Every short bank is budget-forced. **§15 settles this one:** capping gate refills takes fills to **552/552** at every budget tried, `underfill=cap` 31 → 0, and it does *not* cost served-slot cleanliness in slots 0–5 (±0.4 pp) — it costs the deep bank and the ≥ 500 m absolute. `kAttemptSlack` never needed raising, and could not have been raised by config anyway (`constexpr`, `route_action.cc:1019`).
 
 ### For Gate v2
 
@@ -431,6 +431,275 @@ Seven of the fourteen pass outright, two are reports that improved, and the five
 9. **D1b's operating point matters more than ever.** At 500 m the residual is 7.6 %; at 2 km it is 0.3 %. `labeling-sample.jsonl` sets the point.
 10. **Ratchet 9 needs its semantics decided before it can be applied** (§9). As a regression bar against prod, P1.1 fails by 1.096×; as a floor against what the rig serves today, it passes at 0.980×.
 11. **A "served-slot" gate would be sharper than a population gate.** Every headline defect number in this document is dominated by slots a rider never reads; §8.3 is the table that actually predicts the product.
+
+## 15. Gate refill-budget sweep
+
+The AFK follow-up the HITL close asked for: §4's `thor.roundtrip_gate_refill_budget` and §5's
+rung ladder, swept on corpus-v2 against the pinned `b4f514d7f` baseline, **config only — the
+binary is `proto/v4-p1.1` @ `a1d24909b`, unchanged.** Fifteen full-corpus runs (552 requests,
+K = 12) fired one engine at a time on :8003 (P1.1) and :8004 (baseline).
+
+### 15.0 What the knob can and cannot express (asked for explicitly)
+
+**`0` means *unlimited*, not "no refills".** `worker.cc:94-95` reads
+`config.get<uint32_t>("thor.roundtrip_gate_refill_budget", 0)` and `route_action.cc:1397-1398`
+maps it:
+
+```cpp
+const uint32_t gate_refill_budget =
+    roundtrip_gate_refill_budget ? roundtrip_gate_refill_budget : 0xffffffffu;
+```
+
+so the **smallest expressible budget is 1**, and there is **no config value for a rank-only
+gate**. The ticket's fourth sweep point — "0-refill, gated loops kept in the last tier, no
+replacement build" — is therefore **not reachable from configuration on this binary**; it needs
+a one-line sentinel change (`-1`, `"none"`, or an explicit `roundtrip_gate_refill` bool), which
+is mechanism code and out of a config sweep's scope. **Budget 1 is the closest reachable point**:
+at 4.93 gate rejects per request it refills ~20 % of them and keeps the rest, so it is rank-only
+plus one rescue per request.
+
+**`kAttemptSlack` is not a knob either** — `route_action.cc:1019` has
+`constexpr uint32_t kAttemptSlack = 8`. The ticket's optional "+1" is a rebuild, not a config
+flip. It is moot regardless: **every bounded budget already fills 552/552** (§15.2), so there is
+nothing left for extra slack to buy.
+
+### 15.1 The runs
+
+| # | configuration | results dir | engine ledger |
+|---|---|---|---|
+| 1 | budget **unlimited** (= §11's run) | `results/p1-1-latency/` | `engine-lat-p11.log` |
+| 2 | budget **4** | `results/p1-1-sweep-b4/` | `eng-b4.log` |
+| 3 | budget **2** | `results/p1-1-sweep-b2/` | `eng-b2.log` |
+| 4 | budget **1** | `results/p1-1-sweep-b1/` | `eng-b1.log` |
+| 5 | budget **2** + `roundtrip_fallback_rungs=false` | `results/p1-1-sweep-b2-norungs/` | `eng-b2-norungs.log` |
+| 6 | budget **1** + `roundtrip_fallback_rungs=false` | `results/p1-1-sweep-b1-norungs/` | `eng-b1nt.log` |
+| — | latency repeats of 3 and 5 | `results/p1-1-sweep-b2-{repeat,tight}/`, `-b1-tight/`, `-b2-norungs-tight/` | — |
+| — | baseline brackets A–F | `results/census-v2-sweep-base{A,B,C,D,E,F}/` | `eng-base{C,D,E,F}.log` |
+
+**The engine is deterministic.** Budget 2 fired three times produced a *byte-identical* ledger
+(`r0=7801 r1=65 r2=2120 none=14`, `refilled 865 kept 946`) and identical loop geometry each time;
+the repeats differ only in wall latency. Every quality number below is therefore a single
+measurement with no sampling error — **only latency needed repeating.**
+
+### 15.2 Latency — and why it took four brackets
+
+The box drifts. **Seven full-corpus baseline readings** were taken across the session:
+1.299 (§11's pair) · 1.362 (A) · 1.031 (B) · 1.074 (C) · 1.181 (D) · 1.089 (E) · 1.246 (F) s —
+**mean 1.183 s, sd 0.125 s = 10.5 %**, which confirms the ±12 % noise floor empirically and means
+**a single pair cannot resolve the 1.10 × bar.** Bracket B..F run on a warm page cache; A and
+§11's pair do not, which is most of the drift.
+
+Two instruments are therefore reported: the harness's **wall p50** (the bar's own metric, and
+what a rider feels — it includes queueing behind the other two workers) and the engine's own
+**stage total** from the `roundtrip timing:` ledger (`roundtrip_stage_timing` was enabled on the
+baseline engine for this sweep, which §11 could not do). Ratios are against the pooled baseline
+of the same instrument.
+
+| configuration | wall p50 (n) | **× base** | wall p95 | × base | engine stage ms | **× base** | attempts/req |
+|---|---|---|---|---|---|---|---|
+| baseline `b4f514d7f` | 1.183 s (7) | 1.000× | 3.109 s | 1.000× | 800 | 1.000× | 12.62 |
+| budget **unlimited** | 1.917 s (1) | **1.620×** | 4.506 s | 1.449× | 1 310 | **1.637×** | 15.98 |
+| budget **4** | 1.741 s (1) | **1.472×** | 3.849 s | 1.238× | 1 160 | **1.449×** | 14.26 |
+| budget **2** | 1.362 s (3) | **1.151×** | 3.005 s | 0.967× | 896 | **1.120×** | 13.50 |
+| budget **1** | 1.353 s (2) | **1.143×** | 3.139 s | 1.010× | 925 | **1.155×** | 12.92 |
+| budget **2** + rungs off | 1.307 s (2) | **1.104×** | 2.907 s | 0.935× | 861 | **1.076×** | 13.51 |
+| budget **1** + rungs off | 1.337 s (1) | **1.130×** | 2.872 s | 0.924× | 862 | **1.077×** | 12.93 |
+
+Both instruments agree to within 3 pp on every row, which is the best available evidence that the
+ordering is real and not box noise. Three readings matter:
+
+1. **The budget is the whole latency bill, exactly as §11 predicted.** Capping refills at 4 takes
+   1.62 → 1.47×; at 2 it takes it to **1.15×**. Attempts/request fall 15.98 → 14.26 → 13.50, and
+   `astar` + `astar_fb` fall 1 142 → 994 → 802 ms — the two A\* lines again carry the change.
+2. **Budget 1 buys nothing over budget 2.** 1.143× vs 1.151× on wall and 1.155× vs 1.120× on the
+   engine: the two are indistinguishable, because the requests that trip the gate many times are a
+   minority and 0.58 builds/request is inside the noise. **Budget 1 is Pareto-dominated** — it
+   costs real cleanliness (§15.4, §15.5) for no latency at all.
+3. **Only turning the rung ladder off clears the bar.** Budget 2 + `roundtrip_fallback_rungs=false`
+   is **1.104× wall / 1.076× engine** — the ladder's `astar_fb` drops 214 → 148 ms, matching §11's
+   −218 ms A/B. It converts 65 legs of 10 057; without it those 65 fall to rung 2 and `r2` goes
+   2 120 → 2 187 (+0.6 % of legs). **`none` stays 14 — no request loses a route.**
+
+### 15.3 Fills and the gate ledger
+
+| configuration | fills 12/12 | short banks | `underfill=cap` | `underfill=queue` | gate rejects seam/twin/bounce | refilled | kept in bank | topped up | rungs r0/r1/r2/none | failures |
+|---|---|---|---|---|---|---|---|---|---|---|
+| unlimited | 538/552 | 11×9, 10×3, 9×1, 8×1 | **31** | 0 | 552 / 2 611 / 106 | 2 722 | 0 | 300 | 8303/67/3054/14 | 0 |
+| budget 4 | **552/552** | — | 0 | 0 | 444 / 1 943 / 98 | 1 342 | 704 | 0 | 8101/67/2365/14 | 0 |
+| budget 2 | **552/552** | — | 0 | 1 | 398 / 1 715 / 92 | 865 | 946 | 1 | 7801/65/2120/14 | 0 |
+| budget 1 | **552/552** | — | 0 | 2 | 380 / 1 608 / 89 | 479 | 1 223 | 2 | 7517/65/2003/14 | 0 |
+| budget 2 + rungs off | **552/552** | — | 0 | 1 | 397 / 1 724 / 91 | 867 | 952 | 1 | 7805/**0**/2187/14 | 0 |
+| budget 1 + rungs off | **552/552** | — | 0 | 2 | 380 / 1 614 / 89 | 479 | 1 229 | 2 | 7519/**0**/2068/14 | 0 |
+
+**Gate 7 of §12 flips from FAIL to PASS at every bounded budget.** §6's diagnosis is confirmed
+end to end: the 14 short banks were *budget-forced*, the budget was being spent on gate refills,
+and bounding the refills returns it. `underfill=cap` goes **31 → 0**; the 1–2 requests that now
+end `underfill=queue` are genuinely network-forced and the last-resort top-up fills them anyway
+(`topped up` 1–2 loops), so the served bank is still 12/12.
+
+Reject counts fall with the budget (2 722 → 1 811 at budget 2) because fewer replacement builds
+means fewer built candidates to reject — the gate is not getting weaker, the pipeline is getting
+shorter. The ledger counts rejects **by kind** but refills/keeps **in aggregate** (a loop can trip
+two kinds at once), so a per-kind refilled/kept split is not attributable from this build's ledger.
+
+### 15.4 Served-slot cleanliness — slots 0–2 and 3–5
+
+The question the ticket actually cares about. Unlimited is the reference column.
+
+| | unlimited | budget 4 | budget 2 | budget 1 | b2 + rungs off | b1 + rungs off |
+|---|---|---|---|---|---|---|
+| **slots 0–2** near-mirror + same-pavement | 5.4 % | 5.5 % | 5.7 % | 5.8 % | **5.7 %** | 5.8 % |
+| slots 0–2 D1b unseen mean m | 121 | 122 | 125 | 125 | **125** | 125 |
+| slots 0–2 D1b unseen ≥ 500 m | 8.9 % | 9.1 % | 9.3 % | 9.1 % | **9.3 %** | 9.1 % |
+| slots 0–2 D1 same-pavement run ≥ 500 m | 11.4 % | 11.3 % | 11.0 % | 10.9 % | **11.0 %** | 10.9 % |
+| **slots 3–5** near-mirror + same-pavement | 3.3 % | 3.3 % | 3.1 % | 3.0 % | **3.1 %** | 3.0 % |
+| slots 3–5 D1b unseen mean m | 124 | 120 | 113 | 109 | **113** | 109 |
+| slots 3–5 D1b unseen ≥ 500 m | 8.6 % | 8.4 % | 7.9 % | 7.5 % | **7.9 %** | 7.5 % |
+| slots 3–5 D1 same-pavement run ≥ 500 m | 7.4 % | 7.3 % | 7.4 % | 7.7 % | **7.4 %** | 7.7 % |
+| slots 9–11 D1 same-pavement run ≥ 500 m | 9.0 % | 17.9 % | 30.6 % | 40.6 % | 31.1 % | 41.2 % |
+| slots 9–11 fallback-like heavy reuse | 8.8 % | 15.8 % | 23.1 % | 31.3 % | 23.3 % | 31.5 % |
+
+**Slots 0–5 do not move.** Against the unlimited run every metric a rider reads is within
+**±0.4 pp and ±4 m at every budget** — and the rung ladder changes them by **nothing at all**
+(budget 2 and budget 2 + rungs off are identical to the decimal in slots 0–5; the ladder only
+ever touched the deep bank). That is the mechanism working as designed: a kept-gated loop is
+marked and sorted into the last tier, so it can only surface where the cell had nothing better.
+
+**The deep bank pays.** Slots 9–11 go 9.0 → 17.9 → 30.6 → 40.6 % on D1 same-pavement runs. §8.3's
+"the deep bank stopped being a dump" is a property of *unlimited* refills, and the budget sells it
+back. At budget 2 the deep bank sits between the census and P1; at budget 1 it is back to P1's
+44.9 %-class dump. **This is the second reason budget 1 is dominated.**
+
+Worst-20 by D1b unseen metres, and where they sit:
+
+| configuration | worst loop | its slot | worst-20 slot spread |
+|---|---|---|---|
+| unlimited | 2 759 m / 6.1 % of a 45.2 km ride | 8 | 0–11 (two in slots 0–2) |
+| budget 4 | 4 002 m / 10.2 % of 39.4 km | 11 | 4–11 |
+| **budget 2 (± rungs)** | **4 002 m / 10.2 %** | **11** | **3–11, sixteen of twenty in slots 10–11** |
+| budget 1 (± rungs) | **11 193 m / 28.5 %** of 39.3 km | 11 | **all twenty in slots 10–11** |
+
+Budget 1 puts P1's single worst loop — the same vracar 50 km c0.5 s101 ride, 28.5 % of it a
+near-mirror — back into the bank. It is parked in slot 11, but it is back.
+
+### 15.5 The cost the sweep found that nobody was looking for
+
+**Every bounded budget breaks Gate v1.3's one true absolute.**
+
+| configuration | `spike_ge_500m` ALL | slots 0–2 | slots 3–5 | slots 6–8 | slots 9–11 | `spike_ge_30m` | max stub |
+|---|---|---|---|---|---|---|---|
+| baseline / unlimited | **0.00 %** | 0 | 0 | 0 | 0 | **0.00 %** | 0 m |
+| budget 4 | 1.04 % | **1** | 6 | 24 | 38 | 1.19 % | 23.8 km |
+| budget 2 (± rungs) | 2.08 % | **0** | **4** | 34 | 100 | 2.52 % | 23.8 km |
+| budget 1 (± rungs) | 2.42 % | **0** | **4** | 44–45 | 111–112 | 3.3 % | 23.8 km |
+
+**Why.** The refill budget is **shared between the seam gate and the geometry gate**. ADR-0037's
+seam gate has always refilled unconditionally, and its rejects *are* the ≥ 500 m U-turn stubs that
+`spike_ge_500m == 0` forbids. Capping the budget starves the seam gate along with the new one:
+`spike_ge_30m` — the seam gate's own 30 m threshold — goes 0.00 → 3.3 %, and 398 seam rejects per
+corpus at budget 2 stop being refilled. §14's open question 7 said this absolute "caught a real
+regression here"; it has caught a second one. Two of budget 2's worst-20 are literally classified
+`seam residue` (novisad 20 km, 3 685 m, slot 10).
+
+**The knob is mis-scoped, and that is the sweep's most useful finding.** A budget that applied to
+the *geometry* gate's rejects only — leaving seam rejects always refilled, as ADR-0037 has them —
+would buy the entire latency win with none of this. That is a one-line change in the
+`stub >= kSeamStubRejectM || gate_twin || gate_bounce` branch at `route_action.cc:2059-2068` and
+it is the first thing P2 should do.
+
+Mitigating the alarm: at budget 2 **slots 0–2 are still spike-free**, and slots 3–5 carry 4 loops
+of 1 656 (**0.24 %**). The population meter fails; the served surface very nearly does not.
+
+### 15.6 Whole-bank quality, curviness, rings
+
+| configuration | D1b ≥ 500 m Vračar | D1b ≥ 500 m demand | D1 run ≥ 500 m Vračar | D1 run ≥ 500 m demand | D4 fallback proxy | rings/loop |
+|---|---|---|---|---|---|---|
+| baseline | 61.1 % | 64.1 % | 33.6 % | 24.6 % | — | 1.09 |
+| unlimited | **0.4 %** | **8.1 %** | **0.0 %** | **2.8 %** | 10.2 % | 0.54 |
+| budget 4 | 0.8 % | 8.0 % | 3.2 % | 3.5 % | 13.0 % | 0.56 |
+| budget 2 | 1.8 % | 8.2 % | 9.3 % | 6.2 % | 16.9 % | 0.61 |
+| budget 2 + rungs off | 1.6 % | 8.1 % | 9.3 % | 6.5 % | 17.2 % | 0.61 |
+| budget 1 | 3.9 % | 8.8 % | 12.8 % | 9.2 % | 20.6 % | 0.65 |
+| budget 1 + rungs off | 3.8 % | 8.7 % | 12.8 % | 9.5 % | 21.0 % | 0.65 |
+
+**Gates 1–4 of §12 stay green at every budget** (the bar is "down ≥ 50 % and ≥ P1's"): the worst
+cell is budget 1's Vračar D1 run at 12.8 % against a 16.8 % bar. The margin is real but it is
+shrinking, and budget 2 keeps roughly twice as much of it as budget 1.
+
+Curviness retention is **flat across the whole sweep** — c0.5 1.003–1.010×, c0.7 1.059–1.067×,
+**c0.8 0.939–0.945×**, c1.0 1.029–1.048×. §12 gate 5 fails at c0.8 in every configuration
+including unlimited; **the budget neither causes nor fixes it** (§13.1 — it is block C's
+twin exclusion, not the gate's economics). Ring share creeps 43.4 → 46.4 → 48.0 % as kept-gated
+loops stay in the bank, still far below the census's 64.1 %.
+
+Failures: **0 in all fifteen runs.**
+
+### 15.7 The knee, and the Pareto front
+
+**No configuration satisfies every bar.** Latency ≤ 1.10 × and `spike_ge_500m == 0` are mutually
+exclusive on this binary, because the one knob that buys the latency is the same knob that starves
+the seam gate (§15.5). So both are given.
+
+**The knee — `roundtrip_gate_refill_budget = 2` with `roundtrip_fallback_rungs = false`:**
+
+- **latency 1.104× wall p50** (1.076× on the engine-stage instrument), p95 **0.935×** — the bar is
+  met at the point estimate on both instruments, with the honest caveat that the baseline's own
+  sd is 10.5 %, so "1.10×" and "1.15×" are not separable in one pair. It is the only configuration
+  whose point estimate is at or under the bar on **both** instruments.
+- **fills 552/552**, `underfill=cap` 0, failures 0.
+- **served slots 0–5 within ±0.4 pp and ±4 m of the unlimited run on every near-mirror (D1b) and
+  same-pavement (D1) metric** — that is the stated tolerance, and it is met.
+- **the tolerance it breaks:** 4 loops of 1 656 in slots 3–5 (0.24 %) carry a ≥ 500 m seam stub
+  that unlimited refilled away; slots 0–2 stay spike-free.
+
+Budget 1 is **dominated** — identical latency (1.143× / 1.130× vs 1.151× / 1.104×, all inside
+noise), a dirtier deep bank (40.6 % vs 30.6 %), a worse whole-bank Vračar D1 (12.8 % vs 9.3 %) and
+P1's 11 193 m loop back in the bank. It should not be shipped at any price.
+
+Pareto front (latency × served-slot cleanliness × fills):
+
+| point | latency ×base (wall / engine) | slots 0–5 spiked loops | slots 9–11 D1 | fills | verdict |
+|---|---|---|---|---|---|
+| **unlimited** | 1.620 / 1.637 | **0** | **9.0 %** | 538/552 | cleanest, fails latency **and** fills |
+| **budget 4** | 1.472 / 1.449 | 7 (one in slots 0–2) | 17.9 % | 552/552 | fails latency; buys back most of the deep bank |
+| **budget 2** | 1.151 / 1.120 | 4 (none in 0–2) | 30.6 % | 552/552 | ~1.15×; keeps the rung ladder's 2.1 % conversion |
+| **budget 2 + rungs off** | **1.104 / 1.076** | 4 (none in 0–2) | 31.1 % | 552/552 | **the knee** |
+| ~~budget 1 (± rungs)~~ | 1.143 / 1.155 | 4 (none in 0–2) | 40.6 % | 552/552 | **dominated — no latency win, real cleanliness loss** |
+
+Andrey's pick is really between three rows: **unlimited** if the ≥ 500 m absolute is
+non-negotiable and the latency bar is the thing to renegotiate; **budget 4** if the deep bank is
+worth 1.47×; **budget 2 + rungs off** if the 1.10× bar is the hard one. The fourth and best option
+is not on this list because it is not a config: **scope the budget to the geometry gate only**
+(§15.5) and the front collapses to a single dominant point.
+
+### 15.8 Recommended `valhalla.json`
+
+The rig's `thor` block carries none of P1.1's knobs (`data/valhalla.json` — checked). The knee is
+two lines on top of the P1.1 defaults:
+
+```jsonc
+"thor": {
+  // ... existing prod thor block unchanged ...
+
+  // proto/v4-p1.1 geometry Defect Gate — the knee from the refill-budget sweep
+  // (research 2026-09-06-p1-1-road-identity-iteration.md §15).
+  "roundtrip_gate_refill_budget": 2,      // 0 = unlimited; 2 => 1.10x p50, fills 552/552
+  "roundtrip_fallback_rungs": false,      // the ladder converts 2.1 % of failed legs for ~65 ms
+
+  // left at their P1.1 defaults, listed so the served config is explicit:
+  "roundtrip_switchback_test": true,
+  "roundtrip_built_ranking": true,
+  "roundtrip_geometry_gate": true,
+  "roundtrip_gate_twin_ride_m": 500,
+  "roundtrip_gate_return_bounce_m": 30,
+  "roundtrip_f09_budget": true
+}
+```
+
+**Do not ship this without reading §15.5.** It trades `spike_ge_500m` 0.00 → 2.08 % (0 loops in
+slots 0–2, 4 in slots 3–5) for the latency bar. If that trade is unacceptable — and Gate v2's
+open question 7 argues it should be — the answer is not a different budget value, it is scoping
+the budget to the geometry gate's rejects so the seam gate keeps refilling unconditionally.
 
 ## Appendix A — commands
 
@@ -478,6 +747,26 @@ LQ_RUN_B=<p1 run> LQ_PREFIX_B=p1v2 LQ_TAG_B="P1 " \
   python3 ~/.curvagen-scratch/p1.1/p1_gallery.py <run>/gallery-p1-1.html
 ```
 
+**The §15 sweep** (config only — same binary, same corpus, one engine at a time):
+
+```bash
+# per-budget configs, written next to /tmp/v8003.json inside the build container
+docker exec rt-p1-build python3 -c "import json; b=json.load(open('/tmp/v8003.json')); \
+  b['thor']['roundtrip_gate_refill_budget']=2; json.dump(b,open('/tmp/v8003-b2.json','w'))"
+# ... and -b4 / -b1, plus roundtrip_fallback_rungs=false for the -norungs variants.
+
+# the baseline needs the ledger too, which §11 could not read:
+docker exec rt-p11-base python3 -c "import json; d=json.load(open('/custom_files/valhalla.json')); \
+  d['httpd']['service']['listen']='tcp://*:8004'; d.setdefault('thor',{})['roundtrip_stage_timing']=True; \
+  json.dump(d,open('/tmp/v8004.json','w'))"
+
+~/.curvagen-scratch/p1.1/sweep_lib.sh          # run_p11 / run_base: stop both engines, start one,
+                                               # wait for /status, fire the corpus, docker cp the ledger
+~/.curvagen-scratch/p1.1/sweep-phase{1,1b,2,3,4}.sh   # the fifteen runs, in order
+~/.curvagen-scratch/p1.1/sweep-analyse.sh <run_dir> <prefix>   # detectors + det/mech/v13/slot tables
+python3 ~/.curvagen-scratch/p1.1/sweep_agg.py <run_dir> <engine.log>   # one JSON row per configuration
+```
+
 **A trap worth recording:** a `loopqual run` started with `nohup ... &` from a tool shell dies with that shell, and its children keep firing at the engine after the parent is gone. One P1.1 corpus was measured while a stray runner hammered the same engine (p50 3.95 s, fire 641 s); §11's numbers come from a dedicated uncontended pair. Check `pgrep -f 'loopqual run'` before trusting any latency number on this box.
 
 ## Appendix B — artefacts
@@ -493,12 +782,25 @@ LQ_RUN_B=<p1 run> LQ_PREFIX_B=p1v2 LQ_TAG_B="P1 " \
 | `~/.curvagen-scratch/p1.1/{analyse,ledger_agg,slot_clean,p1_gallery}.py`, `ab-*.log` | the P1.1 scratch tooling and the knob A/B |
 | `~/.curvagen-scratch/p11v2*.jsonl` | detector output for the P1.1 run |
 | `~/.curvagen-scratch/p1.1/engine-*.log` | engine ledgers: sidecar + switchback build, identity/gate/rung counters, ranking order, stage timing |
+| **`tools/loopqual/results/p1-1-sweep-{b4,b2,b1,b2-norungs,b1-norungs}/`** | **§15's six swept configurations (the unlimited point is `p1-1-latency/`)** |
+| `tools/loopqual/results/p1-1-sweep-b2-{repeat,tight}/` · `-b1-tight/` · `-b2-norungs-tight/` | §15.2's latency repeats — same ledger, different wall clock |
+| `tools/loopqual/results/census-v2-sweep-base{A..F}/` | the six baseline brackets; A/B bracket the session, C–D and E–F are the two tight interleaved blocks |
+| **`tools/loopqual/results/p1-1-sweep-summary.md`** | **the sweep summary: the knee, the Pareto front, the config snippet** |
+| `~/.curvagen-scratch/p1.1/{sweep_lib.sh,sweep-phase*.sh,sweep-analyse.sh,sweep_agg.py,sweep_tables.py}` | the sweep driver and its aggregation |
+| `~/.curvagen-scratch/p1.1/eng-{b4,b2,b1,b2t,b1t,b2r,b2-norungs,b1nt,base*}.log` | one engine ledger per swept run |
+| `~/.curvagen-scratch/sw{4,2,1,2n,1n}*.jsonl` · `~/.curvagen-scratch/p1.1/agg-sw*-*.txt` | detector output and tables for the swept configurations |
 
-Container `rt-p1-build` (the P1.1 build + engine, :8003) is **stopped, not removed**, so P2 re-uses the warm `build/` — a rebuild from cold is ~40 minutes. `rt-p11-base` (the baseline on :8004) was created for this iteration and is **removed**; recreate it with the `docker run` line in Appendix A. `valhalla-local` (:8002) was never addressed.
+Container `rt-p1-build` (the P1.1 build + engine, :8003) is **stopped, not removed**, so P2 re-uses the warm `build/` — a rebuild from cold is ~40 minutes. `rt-p11-base` (the baseline on :8004) is created and removed per session; recreate it with the `docker run` line in Appendix A. `valhalla-local` (:8002) and the results `http.server` on :8791 were never addressed.
 
 ## Appendix C — the branch
 
 `proto/v4-p1.1`, cut from `proto/v4-p1` @ `6fb8e37df`. Three `proto(v4-p1.1):` commits plus this document. Nothing pushed; `curvature-costing` is untouched and carries this document as an untracked file at the same path.
+
+**The branch copy of this document is stale.** §15 was written by the sweep session into the
+**untracked working-tree copy** on `curvature-costing`; the copy committed on `proto/v4-p1.1`
+@ `a1d24909b` still ends at Appendix C. The sweep changed no code, so the branch's *binary* is
+current — only its document is behind. Fold §15 into the branch when the parent session next
+commits there; nothing was pushed and no branch was switched to write it.
 
 Touched: `valhalla/thor/road_twin_index.h`, `src/thor/road_twin_index.cc`, `valhalla/thor/roundtrip_expansion.h`, `src/thor/roundtrip_expansion.cc`, `src/thor/route_action.cc`, `valhalla/thor/worker.h`, `src/thor/worker.cc`, `test/gurka/test_roundtrip_audit.cc`.
 
