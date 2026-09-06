@@ -103,11 +103,12 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_pair_sharing(config.get<bool>("thor.roundtrip_pair_sharing", true)),
       roundtrip_pair_band(config.get<double>("thor.roundtrip_pair_band", 0.20)),
       roundtrip_pair_shortlist(config.get<uint32_t>("thor.roundtrip_pair_shortlist", 8)),
-      roundtrip_pair_twin_join_m(config.get<double>("thor.roundtrip_pair_twin_join_m", 60.0)),
+      roundtrip_pair_twin_join_m(config.get<double>("thor.roundtrip_pair_twin_join_m", 0.0)),
       roundtrip_pair_max_bridges(config.get<uint32_t>("thor.roundtrip_pair_max_bridges", 12)),
       roundtrip_pair_return_legal(config.get<bool>("thor.roundtrip_pair_return_legal", true)),
       roundtrip_pair_eval_cap(config.get<uint32_t>("thor.roundtrip_pair_eval_cap", 600)),
-      roundtrip_pair_two_way_tree(config.get<bool>("thor.roundtrip_pair_two_way_tree", true)) {
+      roundtrip_pair_two_way_tree(config.get<bool>("thor.roundtrip_pair_two_way_tree", true)),
+      roundtrip_pair_twin_reject(config.get<bool>("thor.roundtrip_pair_twin_reject", true)) {
 
   // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10): build the road-identity sidecar at
   // engine start (first thor worker; later workers hit the cached instance) so the

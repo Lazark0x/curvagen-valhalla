@@ -219,11 +219,12 @@ protected:
   bool roundtrip_pair_sharing;
   double roundtrip_pair_band;
   uint32_t roundtrip_pair_shortlist;
-  double roundtrip_pair_twin_join_m; // fold twin carriageways whose end junctions sit within this
+  double roundtrip_pair_twin_join_m; // fold twin carriageways whose end junctions sit within this (0 = off, the measured setting: the fold teleports across carriageways)
   uint32_t roundtrip_pair_max_bridges; // local repairs per loop before the whole return is rebuilt
   bool roundtrip_pair_return_legal;    // offer only return-rideable arcs to the second phase
   uint32_t roundtrip_pair_eval_cap;    // pair evaluations per request before the near-dup filter is dropped
   bool roundtrip_pair_two_way_tree;    // prefer two-way arrivals as tree arcs (the forward legs)
+  bool roundtrip_pair_twin_reject;     // reject a pair riding a twin (fwd-vs-ret or ret-vs-ret) at selection
 
 private:
   std::string service_name() const override {

@@ -1445,6 +1445,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // ---------------------------------------------------------------------------------
   std::unique_ptr<RoundTripPairPass> pairs;
   double pair_pass_ms = 0, bridge_ms = 0, pair_eval_ms = 0;
+  // prototype debugging: ROUNDTRIP_DEBUG=1 mirrors the pair ledger to stderr (gurka
+  // silences the logger inside do_action)
+  const bool rt_debug = std::getenv("ROUNDTRIP_DEBUG") != nullptr;
   uint32_t rev_fail_tile = 0, rev_fail_noopp = 0, rev_fail_access = 0, rev_fail_turn = 0,
            rev_fail_gap = 0, pair_fwd_illegal = 0, pair_swapped = 0, rev_bad_ret_edge = 0;
   bool pair_cheap_reject = false; // the last pair build died before any search
@@ -1635,6 +1638,24 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (pe.dist_err > roundtrip_pair_band) {
       ++pair_band_rejects;
       pe.reject = "band";
+      if (rt_debug) {
+        std::cerr << "[rt-debug] band reject cand=" << ci << " tree_len=" << pe.pair.tree_len
+                  << " other_len=" << pe.pair.other_len << " arcs " << pe.pair.tree.size() << "/"
+                  << pe.pair.other.size() << " target=" << target << "\n";
+        for (const auto* path : {&pe.pair.tree, &pe.pair.other}) {
+          std::cerr << "[rt-debug]   path:";
+          for (uint32_t h : *path) {
+            const auto& a = pairs->arc(h);
+            std::cerr << " (" << a.from << "->" << a.to << " len=" << static_cast<int>(a.len)
+                      << (a.tree ? " T" : "") << " fwd="
+                      << (a.fwd_label == RoundTripPairPass::kNone
+                              ? 0
+                              : expander.labels()[a.fwd_label].edgeid().value)
+                      << " ret=" << a.ret_edge << ")";
+          }
+          std::cerr << "\n";
+        }
+      }
       return pe;
     }
     // Curviness over BOTH legs, the twins-aware self-overlap (forward vs return AND
@@ -1724,7 +1745,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         return pe;
       }
     }
-    if (roundtrip_geometry_gate && overlap >= roundtrip_gate_twin_ride_m && !pair_allow_twin) {
+    // The pair's own twin test (not the geometry gate's — that judges built loops):
+    // the corridor's twins, forward-vs-return AND return-vs-return, at the gate's
+    // threshold.
+    if (roundtrip_pair_twin_reject && overlap >= roundtrip_gate_twin_ride_m && !pair_allow_twin) {
       ++pair_twin_rejects; // the geometry gate's twin-ride verdict, at selection
       pe.reject = "twin";
       pair_twin_candidates.push_back(ci);
@@ -2875,6 +2899,14 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // and never shrinks the cap.
   bool stall_granted = false;
   const char* underfill_cause = "none";
+  // proto/v4-p2: the build loop runs twice in pair mode — once on pairs, and, when the
+  // bank is still short after the pair pass has said its piece, once more with P1.1's
+  // builder over the same queue (the RESCUE pass): a cell with no disjoint pair at all
+  // (vlasina: one road in and out) is then served exactly as P1.1 serves it — a soft-
+  // leash Fallback Loop, gated and ranked last — never a 442 where P1.1 has a loop.
+  uint32_t pair_rescue_attempts = 0, pair_rescue_loops = 0;
+  bool rescue_pass = false;
+  auto build_loop = [&]() {
   while (true) {
     if (loops.size() >= want)
       break;
@@ -2895,7 +2927,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     const uint32_t ci = queue[qi++];
     if (!built_separated(cands[ci].ll))
       continue;
-    if (pairs) {
+    if (pairs && !rescue_pass) {
       // proto/v4-p2: a selection-time reject (no pair, off band, twin ride, near-dup)
       // costs a path walk, not a search, so it does not spend the attempt budget.
       const PairEval& pe = eval_pair(ci);
@@ -2907,9 +2939,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       }
     }
     ++attempts;
-    auto built = build_candidate(ci);
+    if (rescue_pass)
+      ++pair_rescue_attempts;
+    auto built = rescue_pass ? attempt_build(ci) : build_candidate(ci);
     if (!built) {
-      if (pairs && pair_cheap_reject)
+      if (pairs && !rescue_pass && pair_cheap_reject)
         --attempts; // died before any search: not a spent build
       continue;
     }
@@ -3044,12 +3078,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     }
     if (pairs && built->cand != baldr::kInvalidLabel)
       pair_built_keys.push_back(pair_cache[built->cand].keys);
+    if (rescue_pass)
+      ++pair_rescue_loops;
     loops.push_back(std::move(*built));
   }
+  };
+  build_loop();
   uint32_t pair_twin_last_resort = 0;
-  // prototype debugging: ROUNDTRIP_DEBUG=1 mirrors the pair ledger to stderr (gurka
-  // silences the logger inside do_action)
-  const bool rt_debug = std::getenv("ROUNDTRIP_DEBUG") != nullptr;
   if (rt_debug)
     std::cerr << "[rt-debug] after main loop: loops=" << loops.size() << " dirty=" << dirty_loops.size()
               << " twin_candidates=" << pair_twin_candidates.size() << " considered="
@@ -3078,6 +3113,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         loops.push_back(std::move(*built));
     }
     pair_allow_twin = false;
+  }
+  if (pairs && loops.size() < want) {
+    rescue_pass = true;
+    qi = 0;
+    attempt_cap = std::max(attempt_cap, attempts + want + kAttemptSlack);
+    build_loop();
+    if (rt_debug)
+      std::cerr << "[rt-debug] rescue pass: attempts=" << pair_rescue_attempts << " loops="
+                << pair_rescue_loops << " bank=" << loops.size() << "\n";
   }
   if (fallback_count > 0)
     LOG_INFO("roundtrip: " + std::to_string(fallback_count) +
@@ -3117,6 +3161,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              std::to_string(pair_repair_failed) + " fwd_recost=" +
              std::to_string(pair_fwd_recost) + "/" + std::to_string(pair_fwd_recost_fail) +
              " twin_last_resort=" + std::to_string(pair_twin_last_resort) +
+             " rescue=" + std::to_string(pair_rescue_loops) + "/" +
+             std::to_string(pair_rescue_attempts) +
              " gate_fires=" + std::to_string(gate_seam + gate_twinride + gate_bouncehits) +
              " pair_ms=" + std::to_string(static_cast<int>(pair_pass_ms)) +
              " eval_ms=" + std::to_string(static_cast<int>(pair_eval_ms)) +
