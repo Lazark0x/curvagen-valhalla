@@ -49,6 +49,12 @@ public:
   const std::vector<sif::BDEdgeLabel>& labels() const {
     return bdedgelabels_;
   }
+  // proto/v4-p2: the label index of a settled directed edge (kInvalidLabel if the
+  // expansion never reached it) — the pair pass rebuilds the line graph from this.
+  uint32_t label_index(const baldr::GraphId& edgeid) const {
+    const auto es = edgestatus_.Get(edgeid);
+    return es.set() == EdgeSet::kUnreachedOrReset ? baldr::kInvalidLabel : es.index();
+  }
 
   // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10) — F01 harvest hygiene.  With this on,
   // ScanBand rejects a candidate whose label chain is not SIMPLE: an undirected edge
@@ -62,6 +68,11 @@ public:
   }
   uint32_t nonsimple_rejected() const {
     return nonsimple_rejected_;
+  }
+  // proto/v4-p2: the cached F01 verdict for any settled label (false when the pass has
+  // not run or the label is out of its band).
+  bool chain_nonsimple(uint32_t label) const {
+    return label < nonsimple_.size() && nonsimple_[label] != 0;
   }
   // proto/v4-p1.1: the F01 pass's own cost, split canon-key / DFS (ms).
   double f01_key_ms() const {

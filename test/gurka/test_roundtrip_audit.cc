@@ -22,6 +22,7 @@
 
 #include "baldr/graphreader.h"
 #include "gurka.h"
+#include "midgard/logging.h"
 #include "thor/road_twin_index.h"
 #include "midgard/encoded.h"
 #include "midgard/pointll.h"
@@ -2110,4 +2111,511 @@ TEST_F(RtP11ScopedRefillBudget, P11d_SeamRefillIsNotSpentByTheGeometryBudget) {
       << "SHARED-BUDGET REGRESSION (§15.5): the served bank carries a " << worst_stub
       << " m exact-mirror spike while a clean loop exists — the seam gate must refill "
          "unconditionally at every budget";
+}
+
+// =================================================================================
+// proto/v4-p2 (curvagen-valhalla#11) — the Suurballe-Tarjan whole-loop pair pass.
+// =================================================================================
+#include "thor/roundtrip_pairs.h"
+
+// P2-core: the paper's own worked example (Suurballe & Tarjan 1984, Fig. 1-3).
+//
+//   s(0) -> a(3), b(2); a -> c(4), d(7); b -> e(7); d -> f(8); e -> g(9)      tree
+//   nontree, REDUCED costs: (s,d) 1, (a,e) 2, (c,f) 1, (g,b) 10, (g,f) 8
+//
+// Fig. 3 gives d(s,-,-)=0, d(d)=1 via (s,d) labeled at s, e(2,a,s), f(2,c,d),
+// b(12,g,e); a, c, g have no pair.  The pair for f is (s,a),(a,c),(c,f) + (s,d),(d,f).
+TEST(RtP2SuurballeCore, PaperFigure1) {
+  using thor::ShortestPairs;
+  constexpr uint32_t s = 0, a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7;
+  std::vector<uint32_t> parent{ShortestPairs::kNone, s, s, a, a, b, d, e};
+  std::vector<ShortestPairs::Arc> arcs{{s, d, 1.f}, {a, e, 2.f}, {c, f, 1.f}, {g, b, 10.f}, {g, f, 8.f}};
+  ShortestPairs sp;
+  sp.Run(parent, arcs);
+  EXPECT_DOUBLE_EQ(sp.dist(s), 0.0);
+  EXPECT_DOUBLE_EQ(sp.dist(d), 1.0);
+  EXPECT_DOUBLE_EQ(sp.dist(e), 2.0);
+  EXPECT_DOUBLE_EQ(sp.dist(f), 2.0);
+  EXPECT_DOUBLE_EQ(sp.dist(b), 12.0);
+  EXPECT_FALSE(sp.has_pair(a));
+  EXPECT_FALSE(sp.has_pair(c));
+  EXPECT_FALSE(sp.has_pair(g));
+  EXPECT_FALSE(sp.has_pair(s));
+
+  auto verts = [](const std::vector<ShortestPairs::Step>& p) {
+    std::vector<uint32_t> v;
+    if (!p.empty())
+      v.push_back(p.front().from);
+    for (const auto& st : p)
+      v.push_back(st.to);
+    return v;
+  };
+  std::vector<ShortestPairs::Step> pa, pb;
+  sp.Construct(f, pa, pb);
+  std::set<std::vector<uint32_t>> got{verts(pa), verts(pb)};
+  std::set<std::vector<uint32_t>> want{{s, a, c, f}, {s, d, f}};
+  EXPECT_EQ(got, want) << "the pair for f is not the paper's";
+  sp.Construct(b, pa, pb);
+  got = {verts(pa), verts(pb)};
+  want = {{s, b}, {s, a, e, g, b}};
+  EXPECT_EQ(got, want) << "the pair for b is not the paper's";
+  // every step of both paths is a distinct arc (edge-disjoint), except the shared ends
+  std::set<std::pair<uint32_t, uint32_t>> seen;
+  for (const auto* p : {&pa, &pb})
+    for (const auto& st : *p)
+      EXPECT_TRUE(seen.insert({st.from, st.to}).second) << "arc reused across the pair";
+}
+
+// ---------------------------------------------------------------------------------
+// P2a — the dual carriageway, where the only way home from the corridor is the twin.
+// The P1.1c map: A=E=B a one-way primary east (curvature 15), D=F=C its twin one-way
+// west 30 m south, links B-C and D-A, and the clean A-M-N-A lobe (curvature 6).
+//
+// P1.1 reaches "no twin ride" through the GATE: the twin loop is built (a rung-2
+// soft-leash return), decoded, rejected, and its slot refilled — with the gate off it
+// is served (the P1.1c control).  P2 never builds it: B has no second disjoint arrival
+// (every route home crosses the twin, which cannot be ridden start->B), so the pair
+// pass reports "no pair" and selection moves on — the clean lobe is served EVEN WITH
+// THE GATE OFF, which is what makes this a structural claim rather than a gate one.
+// ---------------------------------------------------------------------------------
+class RtP2DualCarriageway : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+                                                                                                    A                                                 E                                                 B
+                                                                                                    D                                                 F                                                 C
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    M                                                 N
+    )";
+    const gurka::ways ways = {
+        {"AE", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"EB", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"CF", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"FD", {{"highway", "primary"}, {"oneway", "yes"}}},
+        {"BC", {{"highway", "primary"}}},
+        {"DA", {{"highway", "primary"}}},
+        {"AM", {{"highway", "secondary"}}},
+        {"MN", {{"highway", "secondary"}}},
+        {"NA", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 30);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p2_dual_carriageway");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> c15, c6;
+    for (const auto& [a, b] : std::vector<std::pair<std::string, std::string>>{{"A", "E"},
+                                                                              {"E", "B"},
+                                                                              {"C", "F"},
+                                                                              {"F", "D"}})
+      c15.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    for (const auto& [a, b] : std::vector<std::pair<std::string, std::string>>{{"A", "M"},
+                                                                              {"M", "A"},
+                                                                              {"M", "N"},
+                                                                              {"N", "M"},
+                                                                              {"N", "A"},
+                                                                              {"A", "N"}})
+      c6.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    test::customize_edges(map.config, [&c15, &c6](const baldr::GraphId& edgeid,
+                                                  baldr::DirectedEdge& edge) {
+      if (std::find(c15.begin(), c15.end(), edgeid) != c15.end())
+        edge.set_curvature(15);
+      if (std::find(c6.begin(), c6.end(), edgeid) != c6.end())
+        edge.set_curvature(6);
+    });
+  }
+  static valhalla::Api run(gurka::map& m, bool pair_pass, bool gate) {
+    m.config.put("thor.roundtrip_pair_pass", pair_pass);
+    m.config.put("thor.roundtrip_geometry_gate", gate);
+    return gurka::do_action(valhalla::Options::route, m, {"A", "A"}, "motorcycle",
+                            {{"/roundtrip/target_distance", "6000"},
+                             {"/roundtrip/num_candidates", "1"},
+                             {"/costing_options/motorcycle/reuse_penalty", "0.8"},
+                             {"/costing_options/motorcycle/prefer_curvature", "0.5"}});
+  }
+};
+gurka::map RtP2DualCarriageway::map = {};
+
+TEST_F(RtP2DualCarriageway, P2a_NoPairThroughTheTwinCarriageway) {
+  // CONTROL — P1.1 with its gate off rides the twin home (the P1.1c control).
+  auto ctl = run(map, false, false);
+  ASSERT_GE(ctl.trip().routes_size(), 1) << "control served no loop";
+  const auto ctl_ret = leg_names(ctl, 0, 1);
+  std::cerr << "[P2a] control (P1.1, gate off) legs[0] = " << dump_path(leg_names(ctl, 0, 0))
+            << "| legs[1] = " << dump_path(ctl_ret) << "\n";
+  EXPECT_GE(count_name(ctl_ret, "CF"), 1)
+      << "MAP NOT DISCRIMINATING: the P1.1 control did not ride the twin carriageway";
+
+  // TREATMENT — the pair pass with the gate OFF: no pair exists for B, so the corridor
+  // is never built and the clean lobe is served by construction.
+  auto result = run(map, true, false);
+  ASSERT_GE(result.trip().routes_size(), 1) << "P2 served no loop";
+  const auto fwd = leg_names(result, 0, 0);
+  const auto ret = leg_names(result, 0, 1);
+  std::cerr << "[P2a] pair pass (gate off) legs[0] = " << dump_path(fwd)
+            << "| legs[1] = " << dump_path(ret) << "\n";
+  for (const auto* w : {"AE", "EB", "CF", "FD"})
+    EXPECT_EQ(count_name(fwd, w) + count_name(ret, w), 0)
+        << "the pair pass rode the dual carriageway " << w << " with the gate off — the "
+           "twin exclusion is not structural; ride = "
+        << dump_path(fwd) << "| " << dump_path(ret);
+  EXPECT_GE(count_name(fwd, "AM") + count_name(fwd, "NA") + count_name(ret, "AM") +
+                count_name(ret, "NA"),
+            1)
+      << "the clean A-M-N-A lobe was not served; ride = " << dump_path(fwd) << "| "
+      << dump_path(ret);
+  // ...and the gate-on run serves the same lobe (the gate has nothing left to do).
+  auto gated = run(map, true, true);
+  ASSERT_GE(gated.trip().routes_size(), 1);
+  EXPECT_EQ(count_name(leg_names(gated, 0, 1), "CF"), 0);
+}
+
+// ---------------------------------------------------------------------------------
+// P2b — RETURN-VS-RETURN: the only way home rides BOTH carriageways inside the return
+// leg (the H3 shape of the same-road study: out on one carriageway, back on its twin).
+//
+//   M                                     N          row 0
+//
+//   S           G=====A=====H          row 40: S-G access, G=H road A (curvature 15)
+//               K=====B=====L          row 41: K=L road B, its twin (two-way, own way)
+//                                      H-L joins the two at the far end only
+//               T                      row 70: T-K
+//              X                       row 100: S-X-T, the curvy forward road
+//
+// From T the only way home is T-K, K->L along B, L-H, H->G along A, G-S: the return
+// rides B and then its twin A the other way.  P1.1's twin bar is assembled from the
+// FORWARD leg only (S-X-T has no twins), so it serves this loop as a rung-0 clean
+// success with self-overlap 0 (route_action.cc:1883-1914 in P1.1, the study's §3).
+// The pair pass sees the return as the second s->T path S-G-H-L-K-T, whose own edges
+// ride a twin pair beyond the exemption: a twin reject at SELECTION, before any build.
+// With the clean M-N lobe present it is served instead; without it (a second map) the
+// twin loop is still served — as the dirty last resort, never a 442.
+//
+// Sized so every node of the return sits inside the harvest region (1.2 x target/2 =
+// 3 600 m of tree distance at 6 000 m): the second path can only use what the
+// expansion settled, which is a stated limit of the pass.
+// ---------------------------------------------------------------------------------
+class RtP2ReturnVsReturn : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static gurka::map lonely;
+  static std::string ascii(bool with_lobe) {
+    std::string rows;
+    auto row = [&](int width, std::map<int, char> cells) {
+      std::string r(width, ' ');
+      for (auto [c, ch] : cells)
+        r[c] = ch;
+      rows += r + "\n";
+    };
+    const int W = 100;
+    if (with_lobe)
+      row(W, {{0, 'M'}, {70, 'N'}});
+    else
+      row(W, {});
+    for (int i = 1; i < 40; ++i)
+      row(W, {});
+    row(W, {{10, 'S'}, {40, 'G'}, {55, 'A'}, {70, 'H'}});
+    row(W, {{40, 'K'}, {55, 'B'}, {70, 'L'}});
+    for (int i = 42; i < 70; ++i)
+      row(W, {});
+    row(W, {{40, 'T'}});
+    for (int i = 71; i < 100; ++i)
+      row(W, {});
+    row(W, {{25, 'X'}});
+    return rows;
+  }
+  static gurka::map build(bool with_lobe, const std::string& dir) {
+    gurka::ways ways = {
+        {"SG", {{"highway", "secondary"}}},
+        {"GA", {{"highway", "primary"}, {"name", "road A"}}},
+        {"AH", {{"highway", "primary"}, {"name", "road A"}}},
+        {"KB", {{"highway", "primary"}, {"name", "road B"}}},
+        {"BL", {{"highway", "primary"}, {"name", "road B"}}},
+        {"HL", {{"highway", "primary"}}},
+        {"TK", {{"highway", "secondary"}}},
+        {"SX", {{"highway", "secondary"}}},
+        {"XT", {{"highway", "secondary"}}},
+    };
+    if (with_lobe) {
+      ways.insert({"SM", {{"highway", "secondary"}}});
+      ways.insert({"MN", {{"highway", "secondary"}}});
+      ways.insert({"NS", {{"highway", "secondary"}}});
+    }
+    const auto layout = gurka::detail::map_to_coordinates(ascii(with_lobe), 30);
+    gurka::map m = gurka::buildtiles(layout, ways, {}, {}, dir);
+    auto reader = test::make_clean_graphreader(m.config.get_child("mjolnir"));
+    std::map<baldr::GraphId, uint32_t> curv;
+    auto set = [&](const char* a, const char* b, uint32_t c) {
+      curv[std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b))] = c;
+      curv[std::get<0>(gurka::findEdgeByNodes(*reader, layout, b, a))] = c;
+    };
+    set("G", "A", 15);
+    set("A", "H", 15);
+    set("K", "B", 15);
+    set("B", "L", 15);
+    set("S", "X", 12);
+    set("X", "T", 12);
+    set("T", "K", 10);
+    if (with_lobe) {
+      set("M", "N", 8);
+      set("N", "S", 8);
+    }
+    test::customize_edges(m.config, [&curv](const baldr::GraphId& edgeid,
+                                            baldr::DirectedEdge& edge) {
+      auto it = curv.find(edgeid);
+      if (it != curv.end())
+        edge.set_curvature(it->second);
+    });
+    return m;
+  }
+  static void SetUpTestSuite() {
+    map = build(true, "test/data/rt_p2_return_vs_return");
+    lonely = build(false, "test/data/rt_p2_return_vs_return_lonely");
+  }
+  static valhalla::Api run(gurka::map& m, bool pair_pass) {
+    m.config.put("thor.roundtrip_pair_pass", pair_pass);
+    return gurka::do_action(valhalla::Options::route, m, {"S", "S"}, "motorcycle",
+                            {{"/roundtrip/target_distance", "6000"},
+                             {"/roundtrip/num_candidates", "1"},
+                             {"/costing_options/motorcycle/reuse_penalty", "0.8"},
+                             {"/costing_options/motorcycle/prefer_curvature", "0.5"}});
+  }
+};
+gurka::map RtP2ReturnVsReturn::map = {};
+gurka::map RtP2ReturnVsReturn::lonely = {};
+
+TEST_F(RtP2ReturnVsReturn, P2b_TwinRideInsideTheReturnIsRejectedAtSelection) {
+  // CONTROL — P1.1 serves the T loop clean: its twin bar never looks at the return.
+  auto ctl = run(map, false);
+  ASSERT_GE(ctl.trip().routes_size(), 1) << "control served no loop";
+  const auto cfwd = leg_names(ctl, 0, 0);
+  const auto cret = leg_names(ctl, 0, 1);
+  std::cerr << "[P2b] control (P1.1) legs[0] = " << dump_path(cfwd) << "| legs[1] = "
+            << dump_path(cret) << "\n";
+  EXPECT_GE(count_name(cret, "road A") + count_name(cret, "road B"), 2)
+      << "MAP NOT DISCRIMINATING: the P1.1 control's return does not ride both "
+         "carriageways; legs[1] = "
+      << dump_path(cret);
+
+  // TREATMENT — the T pair is a twin reject at selection; the M-N lobe is served.
+  auto result = run(map, true);
+  ASSERT_GE(result.trip().routes_size(), 1) << "P2 served no loop";
+  const auto fwd = leg_names(result, 0, 0);
+  const auto ret = leg_names(result, 0, 1);
+  std::cerr << "[P2b] pair pass legs[0] = " << dump_path(fwd) << "| legs[1] = " << dump_path(ret)
+            << "\n";
+  EXPECT_EQ(count_name(fwd, "road A") + count_name(fwd, "road B") + count_name(ret, "road A") +
+                count_name(ret, "road B"),
+            0)
+      << "the pair pass served the return-vs-return twin ride; ride = " << dump_path(fwd)
+      << "| " << dump_path(ret);
+  EXPECT_GE(count_name(fwd, "MN") + count_name(ret, "MN"), 1)
+      << "the clean M-N lobe was not served; ride = " << dump_path(fwd) << "| "
+      << dump_path(ret);
+
+  // DIRTY-LAST — with no clean alternative the twin loop is still served (never a 442).
+  // the engine ledger, for the record (every worker reconfigures logging in turn)
+  for (const char* k : {"loki.logging.type", "thor.logging.type", "odin.logging.type"})
+    lonely.config.put(k, "std_err");
+  auto alone = run(lonely, true);
+  ASSERT_GE(alone.trip().routes_size(), 1)
+      << "the pair pass returned nothing where a (dirty) loop exists";
+  const auto aret = leg_names(alone, 0, 1);
+  std::cerr << "[P2b] lonely map legs[0] = " << dump_path(leg_names(alone, 0, 0))
+            << "| legs[1] = " << dump_path(aret) << "\n";
+  EXPECT_GE(count_name(aret, "road A") + count_name(aret, "road B"), 2)
+      << "expected the twin ride as the dirty last resort; legs[1] = " << dump_path(aret);
+}
+
+// ---------------------------------------------------------------------------------
+// P2c — the ONE-WAY REPAIR: the pair's second path rides a one-way in the start->T
+// direction, so the return cannot simply reverse it; the non-reversible stretch is
+// bridged by a local hard-excluded A* around it, the rest of the return is kept.
+//
+//   S-------------A------------>T        SA, AT: the curvy forward road (curvature 12),
+//   |                            /       AT ONE-WAY east; DT joins D to T
+//   C------------>D             /        CD is ONE-WAY east; SC and DT two-way
+//   E-----------/                        C-E-D: the two-way bypass the bridge must find
+//
+// The bridged T loop (S-A-T + T-D-E-C-S, 6 755 m) sits inside the band at 6 000 m; the
+// same edges ridden the other way round (sink D, no bridge) tie on score, and seed 0
+// keeps the curvier harvest chain first.
+// ---------------------------------------------------------------------------------
+class RtP2OneWayRepair : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    std::string rows;
+    auto row = [&](std::map<int, char> cells) {
+      std::string r(30, ' ');
+      for (auto [c, ch] : cells)
+        r[c] = ch;
+      rows += r + "\n";
+    };
+    row({{0, 'S'}, {13, 'A'}, {26, 'T'}});
+    for (int i = 1; i < 10; ++i)
+      row({});
+    row({{0, 'C'}, {13, 'D'}});
+    row({});
+    row({{0, 'E'}}); // 200 m below C: the bypass costs 1 515 m against the one-way's 1 300
+    const gurka::ways ways = {
+        {"SA", {{"highway", "secondary"}}},
+        // A->T one-way too, so the pair cannot dodge the repair by swapping which path
+        // is ridden out: either way home crosses a one-way against its direction.
+        {"AT", {{"highway", "secondary"}, {"oneway", "yes"}}},
+        {"SC", {{"highway", "secondary"}}},
+        {"CD", {{"highway", "secondary"}, {"oneway", "yes"}}},
+        {"DT", {{"highway", "secondary"}}},
+        {"CE", {{"highway", "secondary"}}},
+        {"ED", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(rows, 100);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p2_one_way_repair");
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::vector<baldr::GraphId> c12;
+    for (const auto& [a, b] : std::vector<std::pair<std::string, std::string>>{{"S", "A"},
+                                                                              {"A", "S"},
+                                                                              {"A", "T"},
+                                                                              {"T", "A"}})
+      c12.push_back(std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b)));
+    test::customize_edges(map.config,
+                          [&c12](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            if (std::find(c12.begin(), c12.end(), edgeid) != c12.end())
+                              edge.set_curvature(12);
+                          });
+  }
+};
+gurka::map RtP2OneWayRepair::map = {};
+
+TEST_F(RtP2OneWayRepair, P2c_NonReversibleStretchIsBridged) {
+  map.config.put("thor.roundtrip_pair_pass", true);
+  auto result = gurka::do_action(valhalla::Options::route, map, {"S", "S"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "6000"},
+                                  {"/roundtrip/num_candidates", "1"},
+                                  {"/roundtrip/seed", "0"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.8"},
+                                  {"/costing_options/motorcycle/prefer_curvature", "0.5"}});
+  ASSERT_GE(result.trip().routes_size(), 1) << "no loop served";
+  const auto fwd = leg_names(result, 0, 0);
+  const auto ret = leg_names(result, 0, 1);
+  std::cerr << "[P2c] legs[0] = " << dump_path(fwd) << "| legs[1] = " << dump_path(ret) << "\n";
+  EXPECT_EQ(count_name(fwd, "SA"), 1) << "forward leg is not the curvy S-A-T road";
+  EXPECT_EQ(count_name(fwd, "AT"), 1) << "forward leg is not the curvy S-A-T road";
+  EXPECT_EQ(count_name(ret, "CD"), 0) << "the return rides the one-way against its direction";
+  EXPECT_EQ(count_name(ret, "DT"), 1) << "the reversible part of the second path was not kept";
+  EXPECT_EQ(count_name(ret, "SC"), 1) << "the reversible part of the second path was not kept";
+  EXPECT_EQ(count_name(ret, "ED") + count_name(ret, "CE"), 2)
+      << "the one-way stretch was not bridged through the C-E-D bypass; legs[1] = "
+      << dump_path(ret);
+  EXPECT_EQ(count_name(ret, "AT") + count_name(ret, "SA"), 0)
+      << "the repair rode the forward corridor home";
+}
+
+// ---------------------------------------------------------------------------------
+// P2d — K distinct sinks, each within the distance band, from a grid where the pass
+// has plenty of pairs: a 5 x 5 lattice of 1 km cells, the start at a corner.
+// ---------------------------------------------------------------------------------
+class RtP2Grid : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      UVWXY
+      PQRST
+      KLMNO
+      FGHIJ
+      ABCDE
+    )";
+    gurka::ways ways;
+    const std::string g = "UVWXYPQRSTKLMNOFGHIJABCDE";
+    for (int r = 0; r < 5; ++r)
+      for (int c = 0; c < 5; ++c) {
+        const char n = g[r * 5 + c];
+        if (c + 1 < 5)
+          ways.insert({std::string{n, g[r * 5 + c + 1]}, {{"highway", "secondary"}}});
+        if (r + 1 < 5)
+          ways.insert({std::string{n, g[(r + 1) * 5 + c]}, {{"highway", "secondary"}}});
+      }
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p2_grid");
+  }
+};
+gurka::map RtP2Grid::map = {};
+
+TEST_F(RtP2Grid, P2d_DistinctSinksInsideTheBand) {
+  map.config.put("thor.roundtrip_pair_pass", true);
+  const double target = 8000.0;
+  auto result = gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "8000"},
+                                  {"/roundtrip/num_candidates", "6"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.8"}});
+  const int n = result.trip().routes_size();
+  ASSERT_GE(n, 3) << "expected at least three pair-built loops on a 5x5 grid";
+  std::set<std::pair<int64_t, int64_t>> seams;
+  for (int r = 0; r < n; ++r) {
+    const auto pts = ride_shape(result, r);
+    const double len = ride_length_m(pts);
+    const auto seam_pts = leg_shape(result, r, 0);
+    ASSERT_FALSE(seam_pts.empty());
+    const auto& seam = seam_pts.back();
+    std::cerr << "[P2d] slot " << r << " legs[0] = " << dump_path(leg_names(result, r, 0))
+              << "| legs[1] = " << dump_path(leg_names(result, r, 1)) << " (" << len << " m)\n";
+    EXPECT_LE(std::fabs(len - target) / target, 0.20 + 1e-6)
+        << "slot " << r << " is outside the distance band: " << len << " m";
+    EXPECT_TRUE(seams.insert({std::llround(seam.lat() * 1e5), std::llround(seam.lng() * 1e5)}).second)
+        << "slot " << r << " reuses another slot's turnaround";
+    // edge-disjoint legs: no way appears in both legs beyond the exempt access roads
+    // (AB and AF, the 1 km first cells, sit inside the 1.5 km Start Exemption)
+    const auto f = name_counts(leg_names(result, r, 0));
+    for (const auto& w : leg_names(result, r, 1))
+      if (w != "AB" && w != "AF")
+        EXPECT_EQ(f.count(w), 0u) << "slot " << r << " rides " << w << " both ways";
+  }
 }

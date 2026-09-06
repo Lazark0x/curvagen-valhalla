@@ -23,6 +23,7 @@ set(sources
   optimizer.cc
   road_twin_index.cc
   roundtrip_expansion.cc
+  roundtrip_pairs.cc
   route_matcher.cc
   status_action.cc
   trace_attributes_action.cc

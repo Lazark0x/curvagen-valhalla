@@ -205,6 +205,25 @@ protected:
   bool roundtrip_f09_budget;
   double roundtrip_rank_overlap_w;
   double roundtrip_rank_disterr_w;
+  // proto/v4-p2 (curvagen-valhalla#11): the Suurballe-Tarjan whole-loop pair pass.
+  // roundtrip_pair_pass swaps harvest->select->return-A* for one disjoint-pair pass
+  // over the harvest forest (the return is the pair's second path, reversed);
+  // roundtrip_pair_bridge repairs a non-reversible stretch of that return with a local
+  // hard-excluded A* instead of rebuilding the whole return; roundtrip_pair_sharing
+  // applies the K x K near-dup filter at SELECTION (the pair is known before any build);
+  // roundtrip_pair_band is the |built - target| / target the pair must satisfy to be
+  // chosen; roundtrip_pair_shortlist is the per-sector top-M whose pairs are constructed
+  // and scored before the seed-rotated pick.
+  bool roundtrip_pair_pass;
+  bool roundtrip_pair_bridge;
+  bool roundtrip_pair_sharing;
+  double roundtrip_pair_band;
+  uint32_t roundtrip_pair_shortlist;
+  double roundtrip_pair_twin_join_m; // fold twin carriageways whose end junctions sit within this
+  uint32_t roundtrip_pair_max_bridges; // local repairs per loop before the whole return is rebuilt
+  bool roundtrip_pair_return_legal;    // offer only return-rideable arcs to the second phase
+  uint32_t roundtrip_pair_eval_cap;    // pair evaluations per request before the near-dup filter is dropped
+  bool roundtrip_pair_two_way_tree;    // prefer two-way arrivals as tree arcs (the forward legs)
 
 private:
   std::string service_name() const override {

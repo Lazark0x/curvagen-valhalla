@@ -97,7 +97,17 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
           config.get<bool>("thor.roundtrip_fallback_parallel_rung", false)),
       roundtrip_f09_budget(config.get<bool>("thor.roundtrip_f09_budget", true)),
       roundtrip_rank_overlap_w(config.get<double>("thor.roundtrip_rank_overlap_w", 4.0)),
-      roundtrip_rank_disterr_w(config.get<double>("thor.roundtrip_rank_disterr_w", 1.0)) {
+      roundtrip_rank_disterr_w(config.get<double>("thor.roundtrip_rank_disterr_w", 1.0)),
+      roundtrip_pair_pass(config.get<bool>("thor.roundtrip_pair_pass", false)),
+      roundtrip_pair_bridge(config.get<bool>("thor.roundtrip_pair_bridge", true)),
+      roundtrip_pair_sharing(config.get<bool>("thor.roundtrip_pair_sharing", true)),
+      roundtrip_pair_band(config.get<double>("thor.roundtrip_pair_band", 0.20)),
+      roundtrip_pair_shortlist(config.get<uint32_t>("thor.roundtrip_pair_shortlist", 8)),
+      roundtrip_pair_twin_join_m(config.get<double>("thor.roundtrip_pair_twin_join_m", 60.0)),
+      roundtrip_pair_max_bridges(config.get<uint32_t>("thor.roundtrip_pair_max_bridges", 12)),
+      roundtrip_pair_return_legal(config.get<bool>("thor.roundtrip_pair_return_legal", true)),
+      roundtrip_pair_eval_cap(config.get<uint32_t>("thor.roundtrip_pair_eval_cap", 600)),
+      roundtrip_pair_two_way_tree(config.get<bool>("thor.roundtrip_pair_two_way_tree", true)) {
 
   // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10): build the road-identity sidecar at
   // engine start (first thor worker; later workers hit the cached instance) so the
