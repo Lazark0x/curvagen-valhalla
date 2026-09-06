@@ -195,6 +195,7 @@ protected:
   double roundtrip_gate_twin_ride_m;
   double roundtrip_gate_return_bounce_m;
   bool roundtrip_fallback_rungs;
+  uint32_t roundtrip_gate_refill_budget;
   // Ticket-literal intermediate rung (release the parallel leash only, twins still
   // barred).  A soft multiplier can never restore reachability, so this rung is a
   // provable no-op; kept behind a default-off knob for the measurement that says so.

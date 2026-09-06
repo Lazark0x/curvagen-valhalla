@@ -1388,6 +1388,14 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // proto/v4-p1.1: the geometry Defect Gate's own budget (score + return-leg decode).
   double gate_ms = 0;
   uint32_t gate_seam = 0, gate_twinride = 0, gate_bouncehits = 0;
+  // proto/v4-p1.1: how many gate rejects may buy a replacement build in this request.
+  uint32_t gate_refills = 0, gate_kept = 0;
+  // thor.roundtrip_gate_refill_budget: 0 (default) = unlimited, the ADR-0037 seam
+  // gate's own semantics.  A positive value caps how many rejects may buy a
+  // replacement build; the rest are kept in the bank's last tier.  The corpus runs
+  // both ways — see the latency section of the report.
+  const uint32_t gate_refill_budget =
+      roundtrip_gate_refill_budget ? roundtrip_gate_refill_budget : 0xffffffffu;
 
   // 1) One forward expansion + harvest turnarounds (Task A4). An empty primary band is
   //    no longer fatal here — the Distance Flex scan below may still fill the queue.
@@ -1791,7 +1799,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     double self_overlap_m = 0;  // twins-aware D1-style metres, outside the exemption
     double dist_err = 0;        // |built - target| / target
     double bounce_m = 0;        // longest mid-return exact mirror (the geometry gate)
+    bool gated = false;         // failed the geometry gate — the dirty tier, served last
     double score = 0;           // the documented rank score below
+    // Rank tier, absolute: clean hard-exclude < twins released < soft leash < gated.
+    uint8_t tier() const {
+      return gated ? 3 : rung;
+    }
   };
   std::vector<Loop> loops;
   std::vector<Loop> dirty_loops;
@@ -2027,16 +2040,30 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       }
     }
     gate_ms += ms_since(t_gate);
+    if (stub >= kSeamStubRejectM)
+      ++gate_seam;
+    if (gate_twin)
+      ++gate_twinride;
+    if (gate_bounce)
+      ++gate_bouncehits;
+    // WHO PAYS FOR THE REFILL.  Rejecting a loop and refilling its slot costs a whole
+    // extra build — a return A*, its fallback rungs and the gate's own decode.  The
+    // first P1.1 corpus refilled on EVERY reject (5.7 per request) and paid for it in
+    // both currencies: p50 3.95 s against a 1.19 s same-session control (3.33x), and
+    // nine requests serving 1-6 loops of 12 because the attempt budget ran out chasing
+    // replacements.  The refill therefore has a BUDGET: the first `gate_refill_budget`
+    // rejects per request are stashed and refilled as ADR-0037 does; past it a gated
+    // loop is kept, marked, and sorted into the last tier — behind every clean loop, so
+    // it can only reach a slot a rider reads if the cell has nothing better anyway.
     if (stub >= kSeamStubRejectM || gate_twin || gate_bounce) {
-      if (stub >= kSeamStubRejectM)
-        ++gate_seam;
-      if (gate_twin)
-        ++gate_twinride;
-      if (gate_bounce)
-        ++gate_bouncehits;
-      if (dirty_loops.size() < want)
-        dirty_loops.push_back(std::move(L));
-      return std::nullopt;
+      L.gated = true;
+      if (gate_refills < gate_refill_budget) {
+        ++gate_refills;
+        if (dirty_loops.size() < want)
+          dirty_loops.push_back(std::move(L));
+        return std::nullopt;
+      }
+      ++gate_kept;
     }
     return L;
   };
@@ -2228,8 +2255,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (gate_seam + gate_twinride + gate_bouncehits > 0)
     LOG_INFO("roundtrip gate: rejected seam=" + std::to_string(gate_seam) +
              " twin_ride=" + std::to_string(gate_twinride) +
-             " return_bounce=" + std::to_string(gate_bouncehits) + " (stashed " +
-             std::to_string(dirty_loops.size()) + ")");
+             " return_bounce=" + std::to_string(gate_bouncehits) + "; refilled " +
+             std::to_string(gate_refills) + "/" + std::to_string(gate_refill_budget) +
+             ", kept-in-bank " + std::to_string(gate_kept) + ", stashed " +
+             std::to_string(dirty_loops.size()));
   LOG_INFO("roundtrip rungs: r0=" + std::to_string(rung_hits[0]) +
            " r1=" + std::to_string(rung_hits[1]) + " r2=" + std::to_string(rung_hits[2]) +
            " none=" + std::to_string(rung_hits[3]) +
@@ -2237,12 +2266,27 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                 ? " parallel_rung=" + std::to_string(parallel_rung_converted) + "/" +
                       std::to_string(parallel_rung_tried)
                 : std::string()));
-  if (loops.empty() && !dirty_loops.empty()) {
-    // Dirty-last-resort: better one honest out-and-back than a 442 in a network that
-    // physically cannot close a clean loop.
-    LOG_WARN("roundtrip: no clean loops — serving " + std::to_string(dirty_loops.size()) +
-             " defective loop(s) as a last resort");
-    loops = std::move(dirty_loops);
+  if (loops.size() < want && !dirty_loops.empty()) {
+    // Dirty-last-resort, per SLOT rather than per request (proto/v4-p1.1).  ADR-0037
+    // promoted the stash only when the bank was completely empty, so a cell that built
+    // three clean loops and stashed nine served three; with the geometry gate rejecting
+    // more, that is how the first P1.1 corpus returned 1-6 routes on nine requests.
+    // The stash now tops the bank up, best-scored first, and the tier sort keeps every
+    // topped-up loop behind every clean one.
+    for (auto& d : dirty_loops) {
+      score_built(d);
+      d.gated = true;
+    }
+    std::stable_sort(dirty_loops.begin(), dirty_loops.end(),
+                     [](const Loop& a, const Loop& b) { return a.score > b.score; });
+    const size_t before = loops.size();
+    for (auto& d : dirty_loops) {
+      if (loops.size() >= want)
+        break;
+      loops.push_back(std::move(d));
+    }
+    LOG_INFO("roundtrip: topped the bank up with " + std::to_string(loops.size() - before) +
+             " gated loop(s) as a last resort (had " + std::to_string(before) + ")");
   }
   if (loops.empty())
     throw valhalla_exception_t{442};
@@ -2261,9 +2305,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         return !a.fallback;
       return a.curviness > b.curviness;
     }
-    // proto/v4-p1.1: rung tier first (absolute), then the BUILT loop's score.
-    if (a.rung != b.rung)
-      return a.rung < b.rung;
+    // proto/v4-p1.1: rung/gate tier first (absolute), then the BUILT loop's score.
+    if (a.tier() != b.tier())
+      return a.tier() < b.tier();
     return a.score > b.score;
   });
 
@@ -2274,7 +2318,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     //   slot:rung/score*1000/loop-curviness*1000/self-overlap m/distance-error*100
     std::string order;
     for (size_t li = 0; li < loops.size(); ++li)
-      order += (li ? " " : "") + std::to_string(li) + ":r" + std::to_string(loops[li].rung) + "/" +
+      order += (li ? " " : "") + std::to_string(li) + ":r" +
+               std::to_string(loops[li].tier()) + "/" +
                std::to_string(static_cast<int>(loops[li].score * 1000.0)) + "/" +
                std::to_string(static_cast<int>(loops[li].loop_curviness * 1000.0f)) + "/" +
                std::to_string(static_cast<int>(loops[li].self_overlap_m)) + "/" +

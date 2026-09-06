@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <cmath>
 #include <unordered_map>
 
@@ -229,11 +230,21 @@ void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader, uint
   // The forward Dijkstra does NOT populate BDEdgeLabel::opp_edgeid() (dijkstras.cc:136
   // "we don't bother ... for the forward expansion"), which is why the id is rebuilt
   // here rather than read off the label.
+  // The DFS below walks the forest in traversal order, so every array it touches is a
+  // random access.  BDEdgeLabel is ~80 bytes and the label vector is tens of MB at
+  // 300 km, so the predecessor link is lifted into a compact uint32 array here (read
+  // sequentially, written sequentially) and the label vector is never touched again.
+  // Out-of-band labels are marked with kPruned so the child-skip test is one array read.
+  constexpr uint64_t kPruned = std::numeric_limits<uint64_t>::max();
   std::vector<uint64_t> canon(n, 0);
+  std::vector<uint32_t> pred(n, kInvalidLabel);
   graph_tile_ptr tile;
   for (uint32_t k = 0; k < n; ++k) {
-    if (bdedgelabels_[k].path_distance() > hi)
-      continue; // pruned subtree — never a candidate, never an ancestor of one
+    pred[k] = bdedgelabels_[k].predecessor();
+    if (bdedgelabels_[k].path_distance() > hi) {
+      canon[k] = kPruned; // never a candidate, never an ancestor of one
+      continue;
+    }
     const GraphId en = bdedgelabels_[k].endnode();
     if (!reader.GetGraphTile(en, tile))
       continue;
@@ -251,7 +262,7 @@ void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader, uint
   std::vector<uint32_t> child_head(n, kInvalidLabel), child_next(n, kInvalidLabel);
   std::vector<uint32_t> roots;
   for (uint32_t k = n; k-- > 0;) {
-    const uint32_t p = bdedgelabels_[k].predecessor();
+    const uint32_t p = pred[k];
     if (p == kInvalidLabel) {
       roots.push_back(k);
     } else {
@@ -261,51 +272,70 @@ void RoundTripExpansion::ComputeChainSimplicity(baldr::GraphReader& reader, uint
   }
 
   std::unordered_map<uint64_t, uint32_t> onpath;
+  onpath.reserve(2048); // a root-to-node path is hundreds of edges, never thousands
   std::vector<std::pair<uint32_t, uint32_t>> stack; // (label, child cursor | kEnter)
+  std::vector<uint8_t> inserted;                    // did this frame touch `onpath`?
   std::vector<uint64_t> tw;
   for (uint32_t r : roots) {
-    if (canon[r] == 0 && bdedgelabels_[r].path_distance() > hi)
+    if (canon[r] == kPruned)
       continue;
     stack.emplace_back(r, kEnter);
+    inserted.push_back(0);
     while (!stack.empty()) {
       const size_t top = stack.size() - 1;
       const uint32_t k = stack[top].first;
       if (stack[top].second == kEnter) {
+        const uint32_t p = pred[k];
+        // proto/v4-p1.1: non-simplicity INHERITS, so a bad node's whole subtree is bad
+        // whatever else is on the path.  ~23 % of settled labels sit in one (P1 measured
+        // 41 k rejects per request), and skipping their `onpath` bookkeeping is free
+        // correctness: nothing below them can change their verdict.
         const uint64_t c = canon[k];
-        bool bad = false;
-        if (c) {
-          if (onpath.count(c)) {
-            bad = true;
-          } else if (twin_index_ && twin_index_->maybe_has_twins(c)) {
-            // proto/v4-p1.1: the Bloom prefilter answers "no twins" — the >98 % case —
-            // without the CSR binary search.
-            tw.clear();
-            twin_index_->append_twins(c, tw);
-            for (uint64_t t : tw)
-              if (onpath.count(t)) {
-                bad = true;
-                break;
+        if (p != kInvalidLabel && nonsimple_[p]) {
+          nonsimple_[k] = 1;
+          inserted[top] = 0;
+        } else {
+          bool bad = false;
+          if (c) {
+            // one hash lookup for the membership test AND the insert.
+            auto it = onpath.emplace(c, 0u).first;
+            bad = it->second > 0; // present with a live count = already on this path
+            if (!bad && twin_index_ && twin_index_->maybe_has_twins(c)) {
+              // The Bloom prefilter answers "no twins" — the ~85 % case — without the
+              // CSR binary search over 113 k keys.
+              tw.clear();
+              twin_index_->append_twins(c, tw);
+              for (uint64_t t : tw) {
+                auto jt = onpath.find(t);
+                if (jt != onpath.end()) {
+                  bad = true;
+                  break;
+                }
               }
+            }
+            ++it->second;
           }
-          ++onpath[c];
+          nonsimple_[k] = bad ? 1 : 0;
+          inserted[top] = c ? 1 : 0;
         }
-        const uint32_t p = bdedgelabels_[k].predecessor();
-        nonsimple_[k] = (bad || (p != kInvalidLabel && nonsimple_[p])) ? 1 : 0;
         stack[top].second = child_head[k];
       } else if (stack[top].second != kInvalidLabel) {
         const uint32_t ch = stack[top].second;
         stack[top].second = child_next[ch];
-        if (canon[ch] == 0 && bdedgelabels_[ch].path_distance() > hi)
+        if (canon[ch] == kPruned)
           continue; // proto/v4-p1.1: out-of-band subtree, pruned whole
         stack.emplace_back(ch, kEnter);
+        inserted.push_back(0);
       } else {
-        const uint64_t c = canon[k];
-        if (c) {
-          auto it = onpath.find(c);
+        if (inserted[top]) {
+          // erase at zero: `onpath` must hold the CURRENT path only (hundreds of
+          // entries), never every canonical id the DFS has ever seen.
+          auto it = onpath.find(canon[k]);
           if (it != onpath.end() && --it->second == 0)
             onpath.erase(it);
         }
         stack.pop_back();
+        inserted.pop_back();
       }
     }
   }

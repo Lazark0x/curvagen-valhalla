@@ -91,6 +91,8 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_gate_return_bounce_m(
           config.get<double>("thor.roundtrip_gate_return_bounce_m", 30.0)),
       roundtrip_fallback_rungs(config.get<bool>("thor.roundtrip_fallback_rungs", true)),
+      roundtrip_gate_refill_budget(
+          config.get<uint32_t>("thor.roundtrip_gate_refill_budget", 0)),
       roundtrip_fallback_parallel_rung(
           config.get<bool>("thor.roundtrip_fallback_parallel_rung", false)),
       roundtrip_f09_budget(config.get<bool>("thor.roundtrip_f09_budget", true)),
