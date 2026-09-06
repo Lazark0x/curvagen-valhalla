@@ -1800,6 +1800,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     double dist_err = 0;        // |built - target| / target
     double bounce_m = 0;        // longest mid-return exact mirror (the geometry gate)
     bool gated = false;         // failed the geometry gate — the dirty tier, served last
+    bool seam_reject = false;   // failed the ADR-0037 SEAM gate: an exact-mirror spike
     double score = 0;           // the documented rank score below
     // Rank tier, absolute: clean hard-exclude < twins released < soft leash < gated.
     uint8_t tier() const {
@@ -2057,6 +2058,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // it can only reach a slot a rider reads if the cell has nothing better anyway.
     if (stub >= kSeamStubRejectM || gate_twin || gate_bounce) {
       L.gated = true;
+      L.seam_reject = stub >= kSeamStubRejectM;
       if (gate_refills < gate_refill_budget) {
         ++gate_refills;
         if (dirty_loops.size() < want)
@@ -2280,11 +2282,23 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::stable_sort(dirty_loops.begin(), dirty_loops.end(),
                      [](const Loop& a, const Loop& b) { return a.score > b.score; });
     const size_t before = loops.size();
+    // A SEAM-rejected loop is an exact-mirror stub — the harness's own spike meter, and
+    // Gate v1.3's one absolute (`spike_ge_500m == 0`).  Topping a bank up with one trades
+    // a fill for a spike, which is not a trade this gate is allowed to make: the first
+    // per-slot top-up did exactly that and put spikes into 0.69 % of c0.5 loops.  So the
+    // top-up draws only on loops the GEOMETRY gate rejected; seam rejects keep ADR-0037's
+    // own rule — served only if the bank would otherwise be empty.
     for (auto& d : dirty_loops) {
       if (loops.size() >= want)
         break;
+      if (d.seam_reject)
+        continue;
       loops.push_back(std::move(d));
     }
+    if (loops.empty())
+      for (auto& d : dirty_loops)
+        if (d.seam_reject && loops.size() < want)
+          loops.push_back(std::move(d));
     LOG_INFO("roundtrip: topped the bank up with " + std::to_string(loops.size() - before) +
              " gated loop(s) as a last resort (had " + std::to_string(before) + ")");
   }
