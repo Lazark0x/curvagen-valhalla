@@ -1627,20 +1627,29 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // A per-REQUEST total on top (roundtrip_pair_eval_total, 0 = off): the per-rung budget
   // alone lets a hard request spend four budgets — a0 read 5 224 evaluations per request
   // at ~130 us each, 1.46x wall p50 — so the tail needs one bound across the rungs.
+  // The relaxation rungs re-test the cached candidates for free; their FRESH evaluations
+  // get their own (smaller) cap, roundtrip_pair_relax_eval_cap (0 = the rung-0 cap).
   auto rung_budget_spent = [&]() {
-    return leg_mode && (rung_evals >= roundtrip_pair_eval_cap ||
-                        (roundtrip_pair_eval_total > 0 &&
-                         pair_sinks_considered >= roundtrip_pair_eval_total));
+    const uint32_t cap = leg_relax_rung && roundtrip_pair_relax_eval_cap
+                             ? roundtrip_pair_relax_eval_cap
+                             : roundtrip_pair_eval_cap;
+    return leg_mode && (rung_evals >= cap || (roundtrip_pair_eval_total > 0 &&
+                                              pair_sinks_considered >= roundtrip_pair_eval_total));
   };
+  // The whole-pair threshold, laddered with the leg when roundtrip_pair_share_relax is on
+  // (a0: the whole-pair 0.6 test keyed on built loops fired 1 773 times per request
+  // against the leg test's 224, and it was not relaxed — rung after rung re-rejected on it).
+  double share_frac_active = roundtrip_sharing_frac;
+  bool share_test_off = false;
   auto pair_shares = [&](const PairKeys& k, const std::vector<PairKeys>& bank) -> bool {
-    if (!roundtrip_pair_sharing)
+    if (!roundtrip_pair_sharing || share_test_off)
       return false;
     // P2: best effort — past the evaluation cap the near-dup filter is dropped.  P2.1 leg
     // mode: the cap bounds the WALK (per rung), never the test.
     if (!leg_mode && pair_sinks_considered > roundtrip_pair_eval_cap)
       return false;
     for (const auto& prev : bank)
-      if (shared_fraction(k, prev) > roundtrip_sharing_frac)
+      if (shared_fraction(k, prev) > share_frac_active)
         return true;
     return false;
   };
@@ -3250,6 +3259,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       rung_evals = 0;
       leg_test_off = rung == 3;
       leg_frac_active = roundtrip_pair_leg_sharing_frac + 0.15 * rung;
+      if (roundtrip_pair_share_relax) {
+        share_test_off = rung == 3;
+        share_frac_active = roundtrip_sharing_frac + 0.15 * rung;
+      }
       qi = 0;
       build_loop();
     }
@@ -3357,6 +3370,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         std::to_string(rung_eval_count[0]) + "/" + std::to_string(rung_eval_count[1]) + "/" +
         std::to_string(rung_eval_count[2]) + "/" + std::to_string(rung_eval_count[3]) +
         // the coarse memory guard: evaluations cached, entries still holding keys
+        " share_relax=" + (roundtrip_pair_share_relax ? "1" : "0") +
+        " relax_cap=" + std::to_string(roundtrip_pair_relax_eval_cap) +
+        " eval_total=" + std::to_string(roundtrip_pair_eval_total) +
         " cache=" + std::to_string(pair_cache.size()) + " keys_held=" +
         std::to_string(std::count_if(pair_cache.begin(), pair_cache.end(),
                                      [](const auto& kv) { return !kv.second.keys.ridden.empty(); })));
