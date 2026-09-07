@@ -9,6 +9,20 @@
 
 using namespace valhalla;
 
+namespace {
+// v4 ships the pair pass and the P1.1 knee ON by default (src/thor/worker.cc, ADR-0041
+// §4 — the engine that shipped is the engine that was measured). The suites here pin
+// construction stages that run BEFORE the pair pass, on maps small enough that a
+// different selection stage serves a different candidate entirely, so each states the
+// configuration it is about instead of inheriting whatever the product ships today.
+void pin_pre_pair_pass(gurka::map& m) {
+  m.config.put("thor.roundtrip_pair_pass", false);
+  m.config.put("thor.roundtrip_xcand_penalty", false);
+  m.config.put("thor.roundtrip_gate_refill_budget", 0);
+  m.config.put("thor.roundtrip_fallback_rungs", true);
+}
+} // namespace
+
 // A rectangular loop around A:
 //   A----B
 //   |    |
@@ -33,6 +47,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip");
+    pin_pre_pair_pass(map);
   }
 };
 gurka::map MotorcycleRoundTrip::map = {};
@@ -107,6 +122,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_oneway_sink");
+    pin_pre_pair_pass(map);
   }
 };
 gurka::map MotorcycleRoundTripOneWaySink::map = {};
@@ -153,6 +169,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 500);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_cluster");
+    pin_pre_pair_pass(map);
   }
 };
 gurka::map MotorcycleRoundTripCluster::map = {};
@@ -191,6 +208,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_flex");
+    pin_pre_pair_pass(map);
   }
 };
 gurka::map MotorcycleRoundTripFlex::map = {};
@@ -227,6 +245,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_refill");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -277,6 +296,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_bounce");
+    pin_pre_pair_pass(map);
 
     // The spur and the far corridor section are the curvy prizes; the bounced chain
     // rides the spur twice and outranks the clean C->D chain unless rejected.
@@ -348,6 +368,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_culdesac");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -417,6 +438,7 @@ protected:
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {},
                             "test/data/motorcycle_roundtrip_nofresh");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -465,6 +487,7 @@ D---E
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_gate");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy15, curvy10;
@@ -527,6 +550,7 @@ D
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_lazyflex");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -576,6 +600,7 @@ A---B-----T
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {},
                             "test/data/motorcycle_roundtrip_lastresort");
+    pin_pre_pair_pass(map);
   }
 };
 gurka::map MotorcycleRoundTripDirtyLastResort::map = {};
@@ -617,6 +642,7 @@ protected:
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 500);
     map = gurka::buildtiles(layout, ways, {}, {},
                             "test/data/motorcycle_roundtrip_dedup_refill");
+    pin_pre_pair_pass(map);
 
     // Rank B (1.0) over D (0.99) over C (0.87): the converging pair (B, D) is the
     // top-2 pick. Curvature edits change harvest RANKING only — the request sends no
@@ -681,6 +707,7 @@ A-B-C--P--Q
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_walkback");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -749,6 +776,7 @@ A-----B---C
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {},
                             "test/data/motorcycle_roundtrip_distcorr");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -803,6 +831,7 @@ A---------C
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {},
                             "test/data/motorcycle_roundtrip_distcorr_keep");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -861,6 +890,7 @@ H---G
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/motorcycle_roundtrip_rejoin");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -945,6 +975,7 @@ protected:
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {},
                             "test/data/motorcycle_roundtrip_oneway_arrival");
+    pin_pre_pair_pass(map);
 
     // Make the one-way approach the curvy prize so its head node is the top candidate.
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
@@ -995,6 +1026,7 @@ protected:
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {},
                             "test/data/motorcycle_roundtrip_deadend_tip");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;

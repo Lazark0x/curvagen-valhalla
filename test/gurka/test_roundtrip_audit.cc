@@ -42,6 +42,19 @@ using namespace valhalla;
 
 namespace {
 
+// v4 ships the pair pass and the P1.1 knee ON by default (src/thor/worker.cc, ADR-0041
+// §4 — the engine that shipped is the engine that was measured). Every suite below pins
+// a construction stage that runs BEFORE the pair pass, on a map small enough that a
+// different selection stage serves a different candidate entirely — so each states the
+// configuration it is about instead of inheriting whatever the product ships today. The
+// P2 / P2.1 suites turn the pair knobs back on themselves.
+void pin_pre_pair_pass(gurka::map& m) {
+  m.config.put("thor.roundtrip_pair_pass", false);
+  m.config.put("thor.roundtrip_xcand_penalty", false);
+  m.config.put("thor.roundtrip_gate_refill_budget", 0);
+  m.config.put("thor.roundtrip_fallback_rungs", true);
+}
+
 // Same join gurka::detail::to_string does (gurka.cc:411-422); it is not declared in
 // gurka.h, so we repeat the two lines here.
 std::string join_names(const ::google::protobuf::RepeatedPtrField<::valhalla::StreetName>& sn) {
@@ -213,6 +226,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_audit_ring_reversal");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -333,6 +347,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_audit_ring_reversal_arm");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy15, curvy10;
@@ -413,6 +428,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 30);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_audit_dual_carriageway");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -459,8 +475,10 @@ TEST_F(RtAuditDualCarriageway, G2_ReturnRidesTheOppositeCarriageway) {
   // The turnaround node itself belongs to BOTH legs, so a disc around the seam has to
   // come out of this measurement or it can only ever read 0 m (as it did pre-P1, where
   // the audit recorded "0 m — the shared turnaround node").  100 m is one carriageway
-  // link; everything the F02 class is about lives far outside it.
-  const auto seam = map.nodes.at("B");
+  // link; everything the F02 class is about lives far outside it.  Read the seam off
+  // the SERVED route rather than naming a node: which turnaround wins is the selection
+  // stage's business, and v4's pair pass picks a different one on this map.
+  const auto seam = fshape.back();
   double closest = 1e12;
   for (const auto& rp : rshape) {
     if (rp.Distance(start) < 1500.0 || rp.Distance(seam) < 100.0)
@@ -522,6 +540,7 @@ H---G
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_audit_rejoin_mixed");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -607,6 +626,7 @@ static void build_culdesac(gurka::map& m, const std::string& ascii_map, const st
   // from outside the engine whether the hard-exclusion pass failed (F12: the fell_back
   // tag never reaches the response).
   m = gurka::buildtiles(layout, ways, {}, {}, dir, {{"thor.roundtrip_stage_timing", "true"}});
+  pin_pre_pair_pass(m);
 
   auto reader = test::make_clean_graphreader(m.config.get_child("mjolnir"));
   std::vector<baldr::GraphId> curvy;
@@ -768,6 +788,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, relations, "test/data/rt_audit_restricted_bounce");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -863,6 +884,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, relations, "test/data/rt_audit_restricted_only");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -946,6 +968,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, relations, "test/data/rt_audit_restricted_only_loop");
+    pin_pre_pair_pass(map);
   }
 };
 gurka::map RtAuditRestrictedTurnOnlyLoop::map = {};
@@ -1018,6 +1041,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 500);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_audit_shortcut_pin");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -1137,6 +1161,7 @@ protected:
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_audit_return_heuristic",
                             {{"service_limits.min_linear_cost_factor", "0.00001"}});
+    pin_pre_pair_pass(map);
 
     // The southern chain J-K-L-M is the curvy (discounted) way home; the middle row is
     // the geometrically direct one.
@@ -1299,6 +1324,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 25);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p1_parallel_tier");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -1373,6 +1399,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 30);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p1_twin_only_way_home");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> curvy;
@@ -1437,6 +1464,7 @@ P   Q
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p1_clean_first");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> c15, c8;
@@ -1578,6 +1606,7 @@ D
     };
     map = gurka::buildtiles(gurka::detail::map_to_coordinates(ascii_map, 4), ways, {}, {},
                             "test/data/rt_p11_hairpin");
+    pin_pre_pair_pass(map);
   }
 };
 gurka::map RtP11Hairpin::map = {};
@@ -1630,6 +1659,7 @@ S                                                                               
     };
     map = gurka::buildtiles(gurka::detail::map_to_coordinates(ascii_map, 4), ways, {}, {},
                             "test/data/rt_p11_carriageway");
+    pin_pre_pair_pass(map);
   }
 };
 gurka::map RtP11Carriageway::map = {};
@@ -1692,6 +1722,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p11_built_ranking");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> c15, c8;
@@ -1840,6 +1871,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 30);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p11_geometry_gate");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> c15, c6;
@@ -2002,6 +2034,7 @@ protected:
     };
     const auto layout = gurka::detail::map_to_coordinates(ascii_map, 30);
     map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p11_scoped_budget");
+    pin_pre_pair_pass(map);
 
     auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
     std::vector<baldr::GraphId> c15, c6;
@@ -2396,6 +2429,7 @@ protected:
     }
     const auto layout = gurka::detail::map_to_coordinates(ascii(with_lobe), 30);
     gurka::map m = gurka::buildtiles(layout, ways, {}, {}, dir);
+    pin_pre_pair_pass(m);
     auto reader = test::make_clean_graphreader(m.config.get_child("mjolnir"));
     std::map<baldr::GraphId, uint32_t> curv;
     auto set = [&](const char* a, const char* b, uint32_t c) {
