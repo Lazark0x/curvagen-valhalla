@@ -248,6 +248,7 @@ protected:
   double roundtrip_pair_diversity_w;
   bool roundtrip_pair_leg_relax;
   bool roundtrip_pair_relaxed_last;
+  uint32_t roundtrip_pair_eval_total; // leg mode: fresh evaluations per REQUEST across all rungs (0 = per-rung budget only)
 
 private:
   std::string service_name() const override {

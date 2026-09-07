@@ -1624,7 +1624,14 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // the queue to the next rung instead of walking on.
   uint32_t rung_evals = 0;
   uint32_t rung_eval_count[4] = {0, 0, 0, 0};
-  auto rung_budget_spent = [&]() { return leg_mode && rung_evals >= roundtrip_pair_eval_cap; };
+  // A per-REQUEST total on top (roundtrip_pair_eval_total, 0 = off): the per-rung budget
+  // alone lets a hard request spend four budgets — a0 read 5 224 evaluations per request
+  // at ~130 us each, 1.46x wall p50 — so the tail needs one bound across the rungs.
+  auto rung_budget_spent = [&]() {
+    return leg_mode && (rung_evals >= roundtrip_pair_eval_cap ||
+                        (roundtrip_pair_eval_total > 0 &&
+                         pair_sinks_considered >= roundtrip_pair_eval_total));
+  };
   auto pair_shares = [&](const PairKeys& k, const std::vector<PairKeys>& bank) -> bool {
     if (!roundtrip_pair_sharing)
       return false;
