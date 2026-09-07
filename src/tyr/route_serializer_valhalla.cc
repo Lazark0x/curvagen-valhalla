@@ -702,6 +702,22 @@ std::string serialize(Api& api) {
     // summary time/distance and other stats
     summary(api, i, writer);
 
+    // curvagen fork: the round-trip action's per-candidate provenance, when the
+    // action filled it (ADR-0041 §7). Additive: no other action sets it, and a
+    // client that does not know the key ignores it.
+    if (i < api.trip().routes_size() && api.trip().routes(i).has_curvagen_provenance()) {
+      const auto& prov = api.trip().routes(i).curvagen_provenance();
+      writer.start_object("provenance");
+      writer("builder", prov.builder());
+      writer("rung", static_cast<uint64_t>(prov.rung()));
+      writer("tier", static_cast<uint64_t>(prov.tier()));
+      writer("relaxed", static_cast<uint64_t>(prov.relaxed()));
+      writer("gated", prov.gated());
+      writer("bridges", static_cast<uint64_t>(prov.bridges()));
+      writer("full_repair", prov.full_repair());
+      writer.end_object();
+    }
+
     // get serialized warnings
     if (api.info().warnings_size() >= 1) {
       valhalla::tyr::serializeWarnings(api, writer);

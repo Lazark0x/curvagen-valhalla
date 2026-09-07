@@ -2267,6 +2267,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // proto/v4-p2.1: admitted under relaxation rung 1-3 of the per-leg threshold (0 = the
     // main walk); with roundtrip_pair_relaxed_last it ranks after the non-relaxed ones.
     uint8_t relaxed = 0;
+    // v4: built by the P1.1 rescue pass after the pair pass came up short. Recorded
+    // rather than inferred from !pair_built, because the provenance field on the
+    // response (ADR-0041 §7) has to name the builder, not guess it.
+    bool rescue = false;
     // Rank tier, absolute: clean hard-exclude < twins released < soft leash < gated.
     uint8_t tier() const {
       return gated ? 3 : rung;
@@ -3235,8 +3239,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       ++pair_leg_relaxed;
       pair_leg_relax_rung_used = std::max(pair_leg_relax_rung_used, leg_relax_rung);
     }
-    if (rescue_pass)
+    if (rescue_pass) {
       ++pair_rescue_loops;
+      built->rescue = true;
+    }
     loops.push_back(std::move(*built));
   }
   };
@@ -3514,6 +3520,18 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   for (auto& lp : loops) {
     auto* route = trip.mutable_routes()->Add();
     route->mutable_legs()->Reserve(2);
+    // v4 (ADR-0041 §7, curvagen-valhalla#15): state how this candidate was built.
+    // Additive, fork-local, free — the engine already knows all of it; before this
+    // field the harness had to guess a Fallback Loop from geometry (blind-spots
+    // §5, M11) and could not see the served tier at all.
+    auto* prov = route->mutable_curvagen_provenance();
+    prov->set_builder(lp.pair_built ? "pair" : (lp.rescue ? "rescue" : "route_leg"));
+    prov->set_rung(lp.rung);
+    prov->set_tier(lp.tier());
+    prov->set_relaxed(lp.relaxed);
+    prov->set_gated(lp.gated);
+    prov->set_bridges(lp.pair_bridges);
+    prov->set_full_repair(lp.pair_full_repair);
     {
       valhalla::Location o = start, d = lp.turn;
       auto& leg = *route->mutable_legs()->Add();
