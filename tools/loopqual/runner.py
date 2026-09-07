@@ -120,8 +120,12 @@ def build_request(job, serving: bool):
     costing. Serving mode: orchestrator POST /round-trip app DTO
     (startPoint is [lon, lat])."""
     if serving:
+        # contract 3.7.1: startPoint is a LonLat OBJECT, seed is int64, the
+        # response is {serveId, candidates[]} with a fixed SERVE_K of 3
+        # (openapi.json in curvagen-orchestrator is the machine-verified
+        # source; re-pinned in the v4 build, curvagen-valhalla#15).
         return "/round-trip", {
-            "startPoint": [job["lon"], job["lat"]],
+            "startPoint": {"lon": job["lon"], "lat": job["lat"]},
             "distance": float(job["distance_m"]),
             "curviness": job["curviness"],
             "avoidMotorways": job["avoid_motorways"],
@@ -187,7 +191,7 @@ def fire_corpus(jobs, engine, serving, out_dir: Path, workers, engine_note):
         path, body = build_request(job, serving)
         status, dt, resp = post_json(engine.rstrip("/") + path, body)
         if serving:
-            n_routes = len(resp.get("routes", [])) if status == 200 else 0
+            n_routes = len(resp.get("candidates", [])) if status == 200 else 0
         else:
             n_routes = (1 + len(resp.get("alternates", []))) if status == 200 else 0
         record = {
@@ -216,34 +220,49 @@ def fire_corpus(jobs, engine, serving, out_dir: Path, workers, engine_note):
 # --- analysis ---------------------------------------------------------------
 
 
-def analyze_responses(responses_dir: Path, requested_by_file=None):
-    """-> (records, failures). Iterates response files in sorted order."""
+def analyze_one(path: str):
+    """One response file -> (records, failure|None). Module-level so the
+    analysis pass can run in a process pool: metrics v2 costs ~75 ms per loop
+    (the detector bank), i.e. ~8 min single-core on corpus-v2's 6 624 loops."""
+    fn = Path(path)
+    rec = json.loads(fn.read_text())
+    meta = rec["meta"]
+    mode = meta.get("mode", "engine")
+    if meta["status"] != 200:
+        return [], {
+            "file": fn.name,
+            **{k: meta[k] for k in ("origin", "distance_m", "curviness", "seed", "status")},
+            "error": json.dumps(rec["response"])[:300],
+        }
+    resp = rec["response"]
+    if mode == "serving":
+        candidates = resp.get("candidates", [])
+        make = Loop.from_serving_route
+    else:
+        candidates = [resp["trip"]] + [a["trip"] for a in resp.get("alternates", [])]
+        make = Loop.from_engine_trip
+    bank = [make(candidate, meta, slot) for slot, candidate in enumerate(candidates)]
+    dist = metrics.bank_distinctness(bank)  # per-bank, parallel to `bank`
+    out = []
+    for slot, loop in enumerate(bank):
+        record = metrics.analyze_loop(loop)
+        record.update(dist[slot])
+        record.update(metrics.provenance_of(candidates[slot], mode))
+        record["file"] = fn.name
+        out.append(record)
+    return out, None
+
+
+def analyze_responses(responses_dir: Path, workers: int = None):
+    """-> (records, failures). Response files in sorted order; the per-file
+    work is pure, so the pool preserves determinism (map keeps input order)."""
     records, failures = [], []
-    for fn in sorted(responses_dir.glob("*.json")):
-        rec = json.loads(fn.read_text())
-        meta = rec["meta"]
-        mode = meta.get("mode", "engine")
-        if meta["status"] != 200:
-            failures.append({
-                "file": fn.name,
-                **{k: meta[k] for k in ("origin", "distance_m", "curviness", "seed", "status")},
-                "error": json.dumps(rec["response"])[:300],
-            })
-            continue
-        resp = rec["response"]
-        if mode == "serving":
-            candidates = resp.get("routes", [])
-            make = Loop.from_serving_route
-        else:
-            candidates = [resp["trip"]] + [a["trip"] for a in resp.get("alternates", [])]
-            make = Loop.from_engine_trip
-        bank = [make(candidate, meta, slot) for slot, candidate in enumerate(candidates)]
-        dist = metrics.bank_distinctness(bank)  # per-bank, parallel to `bank`
-        for slot, loop in enumerate(bank):
-            record = metrics.analyze_loop(loop)
-            record.update(dist[slot])
-            record["file"] = fn.name
-            records.append(record)
+    files = [str(fn) for fn in sorted(responses_dir.glob("*.json"))]
+    with concurrent.futures.ProcessPoolExecutor(max_workers=workers) as pool:
+        for recs, failure in pool.map(analyze_one, files, chunksize=2):
+            records += recs
+            if failure:
+                failures.append(failure)
     return records, failures
 
 
@@ -290,9 +309,9 @@ def way_pass(responses_dir: Path, records, trace_base: str, way_seeds, workers):
         mode = meta.get("mode", "engine")
         resp = rec["response"]
         if mode == "serving":
-            for slot, route in enumerate(resp.get("routes", [])):
+            for slot, route in enumerate(resp.get("candidates", [])):
                 tasks.append((fn.name, slot,
-                              metrics.decode_polyline_3d(route["paths"][0]["points"])))
+                              metrics.decode_polyline(route["geometry"])))
         else:
             routes = [resp["trip"]] + [a["trip"] for a in resp.get("alternates", [])]
             for slot, r in enumerate(routes):
@@ -513,6 +532,65 @@ def write_reports(out_dir: Path, run_info, records, failures, aggregates):
 # --- entry ---------------------------------------------------------------------
 
 
+def reanalyze(args):
+    """Re-read a saved run with the CURRENT metrics — no requests fired.
+
+    Metrics v2 (ADR-0041) changed what the meters see, so every run a gate
+    compares must be re-read with the same version; the responses on disk are
+    the record, loops.jsonl is derived. `--out` writes the re-read next to the
+    source (the responses are symlinked, never copied) so a pinned baseline —
+    `results/baseline-v2/` — can carry its own report while pointing at the
+    census's bytes. `edge_reuse_way` is carried over from the source run: the
+    way pass needs a live /trace_attributes endpoint and is not re-run here.
+    """
+    src = Path(args.run)
+    responses_dir = src / "responses"
+    if not responses_dir.is_dir():
+        print(f"{src}: no responses/ to re-read", flush=True)
+        return 2
+    out_dir = Path(args.out) if args.out else src
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if out_dir != src and not (out_dir / "responses").exists():
+        (out_dir / "responses").symlink_to(responses_dir.resolve())
+
+    way_by_key = {}
+    src_loops = src / "loops.jsonl"
+    if src_loops.exists():
+        for line in src_loops.read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r.get("edge_reuse_way") is not None:
+                way_by_key[(r["file"], r["slot"])] = r["edge_reuse_way"]
+
+    t0 = time.perf_counter()
+    records, failures = analyze_responses(responses_dir, workers=args.workers)
+    for r in records:
+        if r.get("edge_reuse_way") is None:
+            r["edge_reuse_way"] = way_by_key.get((r["file"], r["slot"]))
+    print(f"re-read {len(records)} loops in {time.perf_counter() - t0:.0f}s "
+          f"({len(failures)} failed requests) with metrics {metrics.METRICS_VERSION}", flush=True)
+
+    with (out_dir / "loops.jsonl").open("w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+    prev = json.loads((src / "report.json").read_text()) if (src / "report.json").exists() else {}
+    run_info = dict(prev.get("run", {}))
+    run_info.update({
+        "n_ok": run_info.get("n_requests", len(records)) - len(failures),
+        "n_failed": len(failures),
+        "n_loops": len(records),
+        "source_run": str(src),
+        "reanalyzed": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "reanalyzed_metrics": metrics.METRICS_VERSION,
+        "way_reuse_carried_over": len(way_by_key),
+    })
+    write_reports(out_dir, run_info, records, failures, aggregate(records))
+    print(f"wrote {out_dir}/loops.jsonl, report.json, report.md", flush=True)
+    return 0
+
+
 def run(args):
     corpus_path = Path(args.corpus)
     corpus, corpus_sha = load_corpus(corpus_path)
@@ -531,7 +609,7 @@ def run(args):
     print(f"corpus fired/resumed in {time.perf_counter() - t0:.0f}s", flush=True)
 
     t1 = time.perf_counter()
-    records, failures = analyze_responses(responses_dir)
+    records, failures = analyze_responses(responses_dir, workers=args.analysis_workers)
     print(f"analyzed {len(records)} loops in {time.perf_counter() - t1:.0f}s "
           f"({len(failures)} failed requests)", flush=True)
 

@@ -27,6 +27,7 @@ modes (the serving polyline is exactly on that grid already).
 """
 
 import math
+import os
 
 # v1.1: + curviness_geom_clean (Gate v1, wayfinder #49/#50)
 # v1.2: Start-Exemption-aware stem + reuse meters (ADR-0037 §3, curvagen #55).
@@ -38,7 +39,14 @@ import math
 #   exemption; the geometric reuse meter discounts reuse inside it, the discount
 #   zone capped at the constant per loop end (no blank check). edge_reuse_way
 #   keeps v1 semantics (informative cross-check, not a gate input).
-METRICS_VERSION = "v1.3"
+# v2:  the Gate v2 detector bank (ADR-0041): the Retrace family (D1 same-pavement
+#   runs, D1L near-mirror runs, D4 reuse metres), the switchback-aware near-mirror
+#   read, the fixed ring counter (D3) and crossings (D3b), shadow_frac_loop, and
+#   served-surface bank distinctness. Ported from the blind-spot prototypes that
+#   measured the census, P1/P1.1 and P2/P2.1 — same numbers, harness home
+#   (curvagen-valhalla#15). Retired: the exempt-corridor meter (D2) and the
+#   distance-lobe meter (D5).
+METRICS_VERSION = "v2"
 
 PARAMS = {
     # ADR-0037 §3 Start Exemption: path-distance radius around the start inside
@@ -65,9 +73,40 @@ PARAMS = {
     # lollipop: minimum unshared leg0 run to count as a bulb
     "bulb_min_m": 500.0,
     "earth_radius_m": 6371000.0,
+    # --- metrics v2 (ADR-0041) -------------------------------------------
+    # D1 near-mirror / same-pavement retrace runs. The radius is the meter's
+    # subject: 10 m == the same pavement, 25 m == the opposite carriageway
+    # (F02), 40 m == the same corridor. Reported at all three; the gate reads
+    # 10 (D1) and 25 (D1L, D1b).
+    "retrace_radius_m": 25.0,
+    "retrace_ang_tol_deg": 35.0,
+    "retrace_min_run_m": 200.0,
+    "retrace_gap_m": 60.0,
+    "retrace_min_idx_gap": 4,
+    "retrace_seam_slack_m": 250.0,
+    # R1 Retrace-family thresholds (rider-calibrated, ADR-0041 §3)
+    "retrace_d1_m": 500.0,
+    "retrace_d4_m": 500.0,
+    "retrace_d1l_m": 1500.0,
+    # D3 rings (the Lollipop bulb) — hand-set in the blind-spot study, kept
+    # after the calibration set rated rings a non-defect (advisory tier).
+    "ring_touch_radius_m": 40.0,
+    "ring_min_m": 800.0,
+    "ring_min_iq": 0.15,
+    "ring_endpoint_guard_m": 1500.0,
+    "ring_stride_m": 25.0,
+    # D3b self-crossings
+    "xing_min_arc_m": 500.0,
+    "xing_min_angle_deg": 30.0,
+    "xing_cluster_m": 150.0,
 }
 
 EARTH_R = PARAMS["earth_radius_m"]
+
+# ADR-0041 §2: the Served Surface is slots 0-5 of the Candidate Bank — three
+# served synchronously plus the first Bank tap. Gate v2's blocking tier is
+# judged there; slots 6-11 are the deep bank (T6, reserve).
+SERVED_SLOTS = 6
 
 # --- geometry ------------------------------------------------------------
 
@@ -100,34 +139,6 @@ def decode_polyline(shape: str, precision: float = 1e-6):
                 lat += delta
             else:
                 lon += delta
-        pts.append((lat * precision, lon * precision))
-    return pts
-
-
-def decode_polyline_3d(shape: str, precision: float = 1e-5):
-    """App-DTO 3D polyline (lat/lon at 1e5, elevation in cm) -> [(lat, lon)].
-
-    Elevation is decoded (to keep the varint stream aligned) and dropped —
-    v1 metrics are planimetric.
-    """
-    pts, i = [], 0
-    lat = lon = ele = 0
-    n = len(shape)
-    while i < n:
-        vals = []
-        for _ in range(3):
-            shift, result = 0, 0
-            while True:
-                b = ord(shape[i]) - 63
-                i += 1
-                result |= (b & 0x1F) << shift
-                shift += 5
-                if b < 0x20:
-                    break
-            vals.append(~(result >> 1) if result & 1 else result >> 1)
-        lat += vals[0]
-        lon += vals[1]
-        ele += vals[2]
         pts.append((lat * precision, lon * precision))
     return pts
 
@@ -222,14 +233,21 @@ class Loop:
         )
 
     @classmethod
-    def from_serving_route(cls, route, meta, slot):
-        """Orchestrator app DTO route: paths[0].points 3D polyline, no legs.
+    def from_serving_route(cls, candidate, meta, slot):
+        """Orchestrator app DTO Candidate (contract 3.x): `geometry` is a 2D
+        polyline6, `distance` is metres, no legs and no elevation.
 
-        The seam is derived as the grid point farthest (great-circle) from
-        the start — seam-relative outputs are approximate in this mode.
+        Re-pinned to contract 3.7.1 in the v4 build (curvagen-valhalla#15): the
+        pre-3.0 shape this read before (`routes[].paths[0].points`, a 3D
+        polyline) has not existed on the wire since the API v-next redesign, so
+        serving mode could not ingest a live orchestrator at all.
+
+        The seam is derived as the grid point farthest (great-circle) from the
+        start — the served DTO has no leg boundary, so seam-relative outputs
+        are approximate in this mode (~42 % of loops put the apex elsewhere:
+        research 2026-09-05-loopqual-blind-spots.md §7.3).
         """
-        path = route["paths"][0]
-        raw_pts = decode_polyline_3d(path["points"])
+        raw_pts = decode_polyline(candidate["geometry"])
         pts = dedup_consecutive(raw_pts)
         if len(pts) < 3:
             seam = max(0, len(pts) - 1)
@@ -239,8 +257,8 @@ class Loop:
         return cls(
             meta, slot, "serving", "farthest_point",
             pts[: seam + 1], pts[seam:], raw_pts,
-            declared_m=float(path["distance"]),
-            curviness_used=route.get("curvinessUsed"),
+            declared_m=float(candidate["distance"]),
+            curviness_used=candidate.get("curvinessUsed"),
         )
 
     @property
@@ -417,7 +435,8 @@ def corridor_stats(loop: Loop,
     bulbs: maximal unshared leg0 runs >= bulb_min_m (classic lollipop = 1).
     """
     if len(loop.leg0) < 2 or len(loop.leg1) < 2:
-        return {"stem_out_m": 0, "stem_back_m": 0, "stem_frac": 0, "shadow_frac": 0, "bulbs": 0}
+        return {"stem_out_m": 0, "stem_back_m": 0, "stem_frac": 0, "shadow_frac": 0,
+                "shadow_frac_loop": 0, "bulbs": 0}
     m0 = _shared_mask(loop.leg0, loop.leg1, radius_m)
     seglen0 = [seg_len_m(loop.leg0[i], loop.leg0[i + 1]) for i in range(len(loop.leg0) - 1)]
     leg0_m = sum(seglen0) or 1.0
@@ -460,6 +479,9 @@ def corridor_stats(loop: Loop,
         stem_back = 0.0
 
     shadow = sum(l for i, l in enumerate(seglen0) if m0[i] or m0[i + 1])
+    # v2 (M9): the same corridor read over the WHOLE ride, not just leg0 —
+    # `shadow_frac` is a leg0 fraction and reads high on short forward legs.
+    shadow_loop = shadow + sum(l for i, l in enumerate(seglen1) if m1[i] or m1[i + 1])
     # bulbs: unshared runs of leg0 >= bulb_min_m
     bulb_min = PARAMS["bulb_min_m"]
     bulbs, run = 0, 0.0
@@ -477,6 +499,7 @@ def corridor_stats(loop: Loop,
         "stem_back_m": round(stem_back, 1),
         "stem_frac": round((stem_out + stem_back) / loop.total_m, 4) if loop.total_m else 0.0,
         "shadow_frac": round(shadow / leg0_m, 4),
+        "shadow_frac_loop": round(shadow_loop / loop.total_m, 4) if loop.total_m else 0.0,
         "bulbs": bulbs,
     }
 
@@ -589,7 +612,8 @@ def _loop_edge_index(loop: Loop, exemption_m: float):
     return keyset, segs
 
 
-def bank_distinctness(loops, exemption_m: float = PARAMS["start_exemption_m"]):
+def bank_distinctness(loops, exemption_m: float = PARAMS["start_exemption_m"],
+                      served_slots: int = SERVED_SLOTS):
     """Near-duplication WITHIN one served bank of K — the cross-candidate axis
     no per-loop metric sees (wayfinder #46).
 
@@ -602,6 +626,13 @@ def bank_distinctness(loops, exemption_m: float = PARAMS["start_exemption_m"]):
     turnarounds sharing corridor), and `common_trunk_frac_{25,33,50,75}` (loop
     fraction on edges used by >= that share of the bank — the forced-spine vs
     pairwise-avoidable decomposition).
+
+    `max_pair_overlap_served` is the same read restricted to the Served
+    Surface — each served loop (slot < `served_slots`) against the OTHER served
+    loops of its bank. That is Gate v2's T2 after the 2026-09-07 amendment
+    (ADR-0041 §Amendment 1): the distinctness a Rider can hold side by side.
+    `max_pair_overlap` stays the whole-bank read, demoted to the advisory Bank
+    Distinctness row. Deep-bank loops carry `None` for the served read.
 
     Returns a list parallel to `loops`; each entry merges into that loop's
     record. Banks of <2 loops yield zeros.
@@ -616,27 +647,46 @@ def bank_distinctness(loops, exemption_m: float = PARAMS["start_exemption_m"]):
     out = []
     for i, L in enumerate(loops):
         keyset_i, segs_i = idx[i]
-        rec = {"max_pair_overlap": 0.0, "max_pair_overlap_raw": 0.0, "best_twin_sep_m": 0.0}
+        rec = {"max_pair_overlap": 0.0, "max_pair_overlap_raw": 0.0, "best_twin_sep_m": 0.0,
+               "max_pair_overlap_served": None, "best_twin_slot": None,
+               "pair_overlap_fwd": 0.0, "pair_overlap_ret": 0.0}
         if n >= 2 and L.total_m:
-            best = best_raw = best_sep = 0.0
+            best = best_raw = best_sep = best_served = 0.0
+            best_fwd = best_ret = 0.0
+            best_j = -1
             for j in range(n):
                 if j == i:
                     continue
                 keyset_j = idx[j][0]
-                shared = shared_raw = 0.0
-                for k, sl, in_ex in segs_i:
+                shared = shared_raw = fwd = ret = 0.0
+                for si, (k, sl, in_ex) in enumerate(segs_i):
                     if k in keyset_j:
                         shared_raw += sl
                         if not in_ex:
                             shared += sl
+                            # ADR-0041 advisory: which leg the shared metres lie
+                            # on. The forward leg is what a selection-time test
+                            # can see; the return is repaired after selection.
+                            if si < L.seam_index:
+                                fwd += sl
+                            else:
+                                ret += sl
                 frac = shared / L.total_m
                 if frac > best:
-                    best, best_sep = frac, haversine_m(tas[i], tas[j])
+                    best, best_sep, best_j = frac, haversine_m(tas[i], tas[j]), j
+                    best_fwd, best_ret = fwd, ret
+                if loops[j].slot < served_slots and frac > best_served:
+                    best_served = frac
                 if shared_raw / L.total_m > best_raw:
                     best_raw = shared_raw / L.total_m
             rec["max_pair_overlap"] = round(best, 4)
             rec["max_pair_overlap_raw"] = round(best_raw, 4)
             rec["best_twin_sep_m"] = round(best_sep, 1)
+            rec["best_twin_slot"] = best_j
+            rec["pair_overlap_fwd"] = round(best_fwd / L.total_m, 4)
+            rec["pair_overlap_ret"] = round(best_ret / L.total_m, 4)
+            if L.slot < served_slots:
+                rec["max_pair_overlap_served"] = round(best_served, 4)
         for share, tag in ((0.75, "75"), (0.5, "50"), (0.33, "33"), (0.25, "25")):
             thr = max(2, int(share * n + 0.999))
             clen = (sum(sl for k, sl, ex in segs_i if not ex and freq[k] >= thr)
@@ -695,8 +745,466 @@ def analyze_loop(loop: Loop) -> dict:
         "stem_out_m": cs["stem_out_m"],
         "stem_back_m": cs["stem_back_m"],
         "shadow_frac": cs["shadow_frac"],
+        "shadow_frac_loop": cs["shadow_frac_loop"],
         "rejoin_return_frac": round(cs["stem_back_m"] / leg1_m, 4) if leg1_m else 0.0,
         "compactness": round(compactness(loop), 4),
         "curviness_geom_clean": round(curviness_geom_clean(loop, spikes), 2),
         "curviness_retention": retention,
+        # v2: the Gate v2 detector bank (ADR-0041) — Retrace family, rings,
+        # crossings, reuse metres. Same pass, one record.
+        **analyze_loop_v2(loop),
     }
+
+
+# --- metrics v2 detectors (ADR-0041) ----------------------------------------
+#
+# Ported from the blind-spot prototypes (`~/.curvagen-scratch/lqbs_lib.py`,
+# research 2026-09-05-loopqual-blind-spots.md §8) and the census/P1/P2 reads that
+# ran on them, unchanged in behaviour: the numbers Baseline v2 and every
+# prototype were judged on are reproduced here to the decimal. What changed is
+# where they live — the gate's inputs are harness code now, not scratch.
+#
+#   D1  retrace runs      anti-parallel runs at r = 10 m (same pavement) and
+#                         r = 25 m (near-mirror: the other carriageway)
+#   D1b same, "unseen"    the part of a D1 run no undirected grid key repeats
+#   D3  rings             near-rejoin lobes (the product Lollipop's bulb)
+#   D3b crossings         proper self-intersections (figure-8 topology)
+#   D4  reuse             edge_reuse_geom in metres, exemption-discounted
+#
+# Retired with ADR-0041 §5: D2 (the exempt-corridor meter) and D5 (distance
+# lobes). `exempt_stats`' reuse rows survive as the D4 input and its audit trail.
+
+# The switchback-aware D1b (same-road study 2026-09-06 §7 #1). A run whose
+# partner index range overlaps its own is one pass over a road that folds back on
+# itself — a mountain hairpin — not a second pass over the same pavement. Set
+# LQ_D1B_LEGACY=1 to reproduce the pre-2026-09-07 (P1 / P1.1) reading byte for
+# byte; every number in ADR-0041 is the switchback-aware read.
+SWITCHBACK_AWARE = os.environ.get("LQ_D1B_LEGACY", "") != "1"
+
+RETRACE_RADII_M = (10.0, 25.0, 40.0)
+
+
+def xy_frame(loop: Loop):
+    """Equirectangular metres around the loop's first point (<= cm-scale error
+    over a 300 km loop for the *local* distances the detectors below use)."""
+    lat0, lon0 = grid_to_ll(loop.pts[0])
+    k = math.cos(math.radians(lat0))
+    out = []
+    for p in loop.pts:
+        lat, lon = grid_to_ll(p)
+        out.append((EARTH_R * math.radians(lon - lon0) * k,
+                    EARTH_R * math.radians(lat - lat0)))
+    return out
+
+
+def _hash_points(xy, cell):
+    g = {}
+    for i, (x, y) in enumerate(xy):
+        g.setdefault((int(x // cell), int(y // cell)), []).append(i)
+    return g
+
+
+def _nearby(g, cell, x, y, span=1):
+    ci, cj = int(x // cell), int(y // cell)
+    for di in range(-span, span + 1):
+        for dj in range(-span, span + 1):
+            for i in g.get((ci + di, cj + dj), ()):
+                yield i
+
+
+def antimirror_runs(loop: Loop, xy=None,
+                    radius_m=PARAMS["retrace_radius_m"],
+                    ang_tol_deg=PARAMS["retrace_ang_tol_deg"],
+                    min_run_m=PARAMS["retrace_min_run_m"],
+                    gap_m=PARAMS["retrace_gap_m"],
+                    min_idx_gap=PARAMS["retrace_min_idx_gap"]):
+    """D1: directed segments whose midpoint lies within `radius_m` of another
+    segment's midpoint, ridden within `ang_tol_deg` of dead-opposite, at least
+    `min_idx_gap` segments away. Maximal runs of such segments (unflagged gaps
+    <= gap_m tolerated) >= min_run_m are reported.
+
+    Exact-mirror palindromes (`find_spikes`' class) are a strict subset; a run's
+    `same_key_m` says how much of it `edge_reuse_geom`'s undirected grid key
+    already sees, so `len - same_key_m` is the D1b "unseen" metres.
+    """
+    if xy is None:
+        xy = xy_frame(loop)
+    n = len(loop.pts) - 1
+    if n < 4:
+        return []
+    mids, bears = [], []
+    for i in range(n):
+        x1, y1 = xy[i]
+        x2, y2 = xy[i + 1]
+        mids.append(((x1 + x2) / 2.0, (y1 + y2) / 2.0))
+        bears.append(bearing_deg(grid_to_ll(loop.pts[i]), grid_to_ll(loop.pts[i + 1])))
+    cell = radius_m
+    g = _hash_points(mids, cell)
+    keys = []
+    for i in range(n):
+        a, b = loop.pts[i], loop.pts[i + 1]
+        keys.append((a, b) if a <= b else (b, a))
+    keyset = {}
+    for k in keys:
+        keyset[k] = keyset.get(k, 0) + 1
+
+    flag = [False] * n
+    partner = [None] * n
+    off = [0.0] * n
+    for i in range(n):
+        xi, yi = mids[i]
+        best = None
+        for j in _nearby(g, cell, xi, yi):
+            if abs(j - i) <= min_idx_gap:
+                continue
+            xj, yj = mids[j]
+            d = math.hypot(xi - xj, yi - yj)
+            if d > radius_m:
+                continue
+            da = abs(bears[i] - bears[j])
+            if da > 180.0:
+                da = 360.0 - da
+            if abs(da - 180.0) > ang_tol_deg:
+                continue
+            if best is None or d < best[0]:
+                best = (d, j)
+        if best is not None:
+            flag[i] = True
+            partner[i] = best[1]
+            off[i] = best[0]
+
+    runs, i = [], 0
+    while i < n:
+        if not flag[i]:
+            i += 1
+            continue
+        lo = i
+        hi = i
+        gap = 0.0
+        j = i
+        while j < n:
+            if flag[j]:
+                hi = j
+                gap = 0.0
+            else:
+                gap += loop.seg_lens[j]
+                if gap > gap_m:
+                    break
+            j += 1
+        length = sum(loop.seg_lens[lo:hi + 1])
+        if length >= min_run_m:
+            fl = [k for k in range(lo, hi + 1) if flag[k]]
+            if SWITCHBACK_AWARE:
+                pj_all = [partner[k] for k in fl]
+                p_lo, p_hi = min(pj_all), max(pj_all)
+                if p_lo <= hi and p_hi >= lo:
+                    i = hi + 1
+                    continue
+            same = sum(loop.seg_lens[k] for k in fl if keyset[keys[k]] > 1)
+            offs = [off[k] for k in fl]
+            pj = [partner[k] for k in fl]
+            runs.append({
+                "lo": lo, "hi": hi,
+                "len_m": length,
+                "flagged_m": sum(loop.seg_lens[k] for k in fl),
+                "same_key_m": same,
+                "mean_offset_m": sum(offs) / len(offs) if offs else 0.0,
+                "max_offset_m": max(offs) if offs else 0.0,
+                "cum_lo": loop.cum[lo],
+                "cum_hi": loop.cum[hi + 1],
+                "partner_lo": min(pj), "partner_hi": max(pj),
+                "apex_ll": grid_to_ll(loop.pts[(lo + hi) // 2]),
+            })
+        i = hi + 1
+    return runs
+
+
+def zone_of(loop: Loop, cum_lo, cum_hi,
+            exemption_m=None, seam_slack_m=PARAMS["retrace_seam_slack_m"]):
+    """Where a run sits: inside the Start Exemption, across the seam, or mid-leg."""
+    if exemption_m is None:
+        exemption_m = PARAMS["start_exemption_m"]
+    seam_cum = loop.cum[loop.seam_index]
+    if (cum_lo <= seam_cum <= cum_hi
+            or min(abs(cum_lo - seam_cum), abs(cum_hi - seam_cum)) <= seam_slack_m):
+        return "seam"
+    if cum_hi <= exemption_m or cum_lo >= loop.total_m - exemption_m:
+        return "exempt"
+    return "mid"
+
+
+def reuse_stats(loop: Loop, exemption_m=None):
+    """D4: `edge_reuse_geom` in metres, discounted and undiscounted.
+
+    `reuse_disc_m` is the gate's D4 input (reuse outside the Start Exemption);
+    `reuse_hidden_m` is what the exemption absorbs — the audit trail for it.
+    """
+    if exemption_m is None:
+        exemption_m = PARAMS["start_exemption_m"]
+    reuse_disc = edge_reuse_geom(loop, exemption_m) * loop.total_m
+    reuse_raw = edge_reuse_geom(loop, 0.0) * loop.total_m
+    return {
+        "reuse_disc_m": round(reuse_disc, 1),
+        "reuse_raw_m": round(reuse_raw, 1),
+        "reuse_hidden_m": round(reuse_raw - reuse_disc, 1),
+    }
+
+
+def _iq(xy, idx, perim):
+    a2 = 0.0
+    m = len(idx)
+    for t in range(m):
+        x1, y1 = xy[idx[t]]
+        x2, y2 = xy[idx[(t + 1) % m]]
+        a2 += x1 * y2 - x2 * y1
+    area = abs(a2) / 2.0
+    return 4.0 * math.pi * area / (perim * perim) if perim else 0.0
+
+
+def near_rejoin_rings(loop: Loop, xy=None,
+                      radius_m=PARAMS["ring_touch_radius_m"],
+                      min_ring_m=PARAMS["ring_min_m"],
+                      min_ring_iq=PARAMS["ring_min_iq"],
+                      endpoint_guard_m=PARAMS["ring_endpoint_guard_m"],
+                      stride_m=PARAMS["ring_stride_m"]):
+    """D3: self-touches — the path returns to within `radius_m` of an earlier
+    point after >= `min_ring_m` of riding. The SMALLER arc is the ring (the lobe
+    a rider reads as a Lollipop bulb); the larger arc is the main path. The
+    global start->start closure is excluded by construction (ring = min arc).
+    Degenerate "rings" that are really out-and-backs are rejected by the
+    isoperimetric quotient of the sub-arc.
+
+    Points are decimated to ~`stride_m` before the pair search (a 40 m touch
+    radius cannot resolve finer), which makes the search O(n) with a hash grid.
+    """
+    if xy is None:
+        xy = xy_frame(loop)
+    n = len(loop.pts)
+    total = loop.total_m
+    keep = [0]
+    last = 0.0
+    for i in range(1, n):
+        if loop.cum[i] - last >= stride_m:
+            keep.append(i)
+            last = loop.cum[i]
+    kxy = [xy[i] for i in keep]
+    cell = radius_m
+    g = _hash_points(kxy, cell)
+    cand = []
+    for a, i in enumerate(keep):
+        xi, yi = kxy[a]
+        best = None
+        for b in _nearby(g, cell, xi, yi):
+            if b <= a:
+                continue
+            j = keep[b]
+            arc = loop.cum[j] - loop.cum[i]
+            ring = min(arc, total - arc)
+            if ring < min_ring_m:
+                continue
+            d = math.hypot(xi - kxy[b][0], yi - kxy[b][1])
+            if d > radius_m:
+                continue
+            if loop.cum[i] < endpoint_guard_m and (total - loop.cum[j]) < endpoint_guard_m:
+                continue
+            if best is None or ring < best[0]:
+                best = (ring, i, j, arc, d)
+        if best is not None:
+            cand.append(best)
+    cand.sort()
+    used = bytearray(n)
+    out = []
+    for ring, i, j, arc, d in cand:
+        # OVERLAP GUARD, FIXED (proto/v4-p1, curvagen-valhalla#10). The first
+        # prototype tested only the two ENDPOINT indices while marking the whole
+        # arc used, so one physical near-rejoin came back as a nest of dozens of
+        # shifted rings (defect atlas v2 §7.7: a 52.6 km Belgrade loop returned
+        # 19 rings of 25.7-26.2 km, all the same feature). Sample the whole
+        # candidate arc instead and reject it when most of it is already spoken
+        # for. Sampled, not summed, so the guard stays O(1) per candidate.
+        if used[i] or used[j]:
+            continue
+        if arc <= total - arc:
+            idx = list(range(i, j + 1))
+        else:
+            idx = list(range(j, n)) + list(range(0, i + 1))
+        m = len(idx)
+        probes = [idx[(k * (m - 1)) // 19] for k in range(20)] if m > 1 else idx
+        if sum(used[t] for t in probes) > 0.5 * len(probes):
+            continue
+        iq = _iq(xy, idx, ring)
+        if iq < min_ring_iq:
+            continue
+        for t in idx:
+            used[t] = 1
+        out.append({
+            "i": i, "j": j, "ring_m": ring, "ring_iq": iq,
+            "inner_arc": arc <= total - arc,
+            "cum_i": loop.cum[i], "cum_j": loop.cum[j],
+            "touch_ll": grid_to_ll(loop.pts[i]),
+            "gap_m": d,
+        })
+    out.sort(key=lambda r: -r["ring_m"])
+    return out
+
+
+def _seg_cross(p, p2, q, q2):
+    def cr(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+    d1, d2 = cr(q, q2, p), cr(q, q2, p2)
+    d3, d4 = cr(p, p2, q), cr(p, p2, q2)
+    return ((d1 > 0) != (d2 > 0)) and ((d3 > 0) != (d4 > 0))
+
+
+def _ang(a, b):
+    return math.degrees(math.atan2(b[1] - a[1], b[0] - a[0])) % 180.0
+
+
+def self_intersections(loop: Loop, xy=None,
+                       min_arc_m=PARAMS["xing_min_arc_m"],
+                       min_angle_deg=PARAMS["xing_min_angle_deg"],
+                       cluster_m=PARAMS["xing_cluster_m"]):
+    """D3b: PROPER crossings of non-adjacent segments (figure-8 / theta).
+
+    `min_arc_m` drops crossings whose two segments are close along the path
+    (junction jitter). `min_angle_deg` drops near-parallel and near-antiparallel
+    pairs — an exact retrace with 1 m snap jitter zig-zags across itself and
+    would otherwise register hundreds of spurious crossings (that shape is the
+    retrace detector's business). Crossings within `cluster_m` of each other are
+    one event (a physical junction ridden twice yields several segment-pair
+    hits).
+    """
+    if xy is None:
+        xy = xy_frame(loop)
+    n = len(xy) - 1
+    cell = 60.0
+    g = {}
+    for i in range(n):
+        x1, y1 = xy[i]
+        x2, y2 = xy[i + 1]
+        for cx in range(int(min(x1, x2) // cell), int(max(x1, x2) // cell) + 1):
+            for cy in range(int(min(y1, y2) // cell), int(max(y1, y2) // cell) + 1):
+                g.setdefault((cx, cy), []).append(i)
+    seen = set()
+    raw = []
+    for lst in g.values():
+        for a in range(len(lst)):
+            for b in range(a + 1, len(lst)):
+                i, j = lst[a], lst[b]
+                if i > j:
+                    i, j = j, i
+                if (i, j) in seen:
+                    continue
+                seen.add((i, j))
+                if j - i < 2:
+                    continue
+                arc = loop.cum[j] - loop.cum[i + 1]
+                if arc < min_arc_m or (loop.total_m - arc) < min_arc_m:
+                    continue
+                if not _seg_cross(xy[i], xy[i + 1], xy[j], xy[j + 1]):
+                    continue
+                ang = abs(_ang(xy[i], xy[i + 1]) - _ang(xy[j], xy[j + 1])) % 180.0
+                ang = min(ang, 180.0 - ang)
+                if ang < min_angle_deg:
+                    continue
+                raw.append({"i": i, "j": j, "arc_m": arc, "angle_deg": ang,
+                            "ring_m": min(arc, loop.total_m - arc),
+                            "xy": xy[i], "at_ll": grid_to_ll(loop.pts[i])})
+    raw.sort(key=lambda r: -r["ring_m"])
+    out = []
+    for r in raw:
+        if any(math.hypot(r["xy"][0] - o["xy"][0], r["xy"][1] - o["xy"][1]) <= cluster_m
+               for o in out):
+            continue
+        out.append(r)
+    return out
+
+
+def retrace_family(rec) -> bool:
+    """ADR-0041 R1: the one meter group whose fires the Rider recognises —
+    a same-pavement run >= 500 m (D1), OR reuse outside the Start Exemption
+    >= 500 m (D4), OR a near-mirror run >= 1.5 km (D1L). Reads a per-loop
+    record (dict), so the gate and the harness cannot drift apart."""
+    return (rec["am10_max_run_m"] >= PARAMS["retrace_d1_m"]
+            or rec["reuse_disc_m"] >= PARAMS["retrace_d4_m"]
+            or rec["am25_max_run_m"] >= PARAMS["retrace_d1l_m"])
+
+
+def analyze_loop_v2(loop: Loop) -> dict:
+    """The v2 detector block for one loop: D1 at three radii with zone splits,
+    D3 rings, D3b crossings, D4 reuse metres, and the R1 family verdict."""
+    xy = xy_frame(loop)
+    rec = {}
+    for rad in RETRACE_RADII_M:
+        runs = antimirror_runs(loop, xy, radius_m=rad)
+        tot = sum(x["flagged_m"] for x in runs)
+        same = sum(x["same_key_m"] for x in runs)
+        byzone = {"exempt": 0.0, "seam": 0.0, "mid": 0.0}
+        byzone_new = {"exempt": 0.0, "seam": 0.0, "mid": 0.0}
+        for x in runs:
+            z = zone_of(loop, x["cum_lo"], x["cum_hi"])
+            byzone[z] += x["flagged_m"]
+            byzone_new[z] += x["flagged_m"] - x["same_key_m"]
+        tag = f"am{int(rad)}"
+        rec[tag + "_n"] = len(runs)
+        rec[tag + "_m"] = round(tot, 1)
+        rec[tag + "_same_key_m"] = round(same, 1)
+        rec[tag + "_new_m"] = round(tot - same, 1)
+        rec[tag + "_max_run_m"] = round(max((x["len_m"] for x in runs), default=0.0), 1)
+        for z in byzone:
+            rec[f"{tag}_{z}_m"] = round(byzone[z], 1)
+            rec[f"{tag}_{z}_new_m"] = round(byzone_new[z], 1)
+        if rad == 25.0:
+            rec["am25_runs"] = [
+                {k: (round(v, 1) if isinstance(v, float) else v)
+                 for k, v in x.items() if k != "apex_ll"}
+                | {"zone": zone_of(loop, x["cum_lo"], x["cum_hi"]),
+                   "apex_ll": [round(c, 5) for c in x["apex_ll"]]}
+                for x in sorted(runs, key=lambda y: -y["len_m"])[:4]
+            ]
+    rec.update(reuse_stats(loop))
+    rings = [x for x in near_rejoin_rings(loop, xy)
+             if zone_of(loop, x["cum_i"], x["cum_j"]) != "exempt"]
+    seam_cum = loop.cum[loop.seam_index]
+    rec["ring_n"] = len(rings)
+    rec["ring_max_m"] = round(max((x["ring_m"] for x in rings), default=0.0), 1)
+    rec["ring_total_m"] = round(sum(x["ring_m"] for x in rings), 1)
+    rec["rings"] = [{"ring_m": round(x["ring_m"], 1), "iq": round(x["ring_iq"], 3),
+                     "cum_i": round(x["cum_i"], 1), "cum_j": round(x["cum_j"], 1),
+                     "gap_m": round(x["gap_m"], 1),
+                     "in_leg": ("leg0" if x["cum_j"] <= seam_cum
+                                else ("leg1" if x["cum_i"] >= seam_cum else "cross")),
+                     "ll": [round(c, 5) for c in x["touch_ll"]]}
+                    for x in sorted(rings, key=lambda y: -y["ring_m"])[:4]]
+    si = self_intersections(loop, xy)
+    rec["xing_n"] = len(si)
+    rec["xing_max_ring_m"] = round(max((x["ring_m"] for x in si), default=0.0), 1)
+    rec["retrace_d1"] = rec["am10_max_run_m"] >= PARAMS["retrace_d1_m"]
+    rec["retrace_d4"] = rec["reuse_disc_m"] >= PARAMS["retrace_d4_m"]
+    rec["retrace_d1l"] = rec["am25_max_run_m"] >= PARAMS["retrace_d1l_m"]
+    rec["retrace_family"] = retrace_family(rec)
+    return rec
+
+
+# --- provenance (ADR-0041 §7) -----------------------------------------------
+
+PROVENANCE_FIELDS = ("builder", "rung", "tier", "relaxed", "gated", "bridges", "full_repair")
+
+
+def provenance_of(candidate, mode: str) -> dict:
+    """The fork's additive per-candidate `provenance` object, flattened.
+
+    The engine states how each served loop was built — `builder` (pair /
+    rescue / route_leg), the fallback `rung`, the rank `tier`, the relaxation
+    rung, whether the Defect Gate passed it (`gated` == the dirty tier), and
+    the pair repair counts. D4's "was this a Fallback Loop" was a geometric
+    guess before this field existed (research 2026-09-05-loopqual-blind-spots
+    §5, M11); it is a read now.
+
+    Absent — an older engine, or serving mode, where the orchestrator drops the
+    field — every column is None, so loops.jsonl keeps one schema either way.
+    """
+    p = candidate.get("provenance") if isinstance(candidate, dict) else None
+    if mode == "serving" or not isinstance(p, dict):
+        return {f"prov_{k}": None for k in PROVENANCE_FIELDS}
+    return {f"prov_{k}": p.get(k) for k in PROVENANCE_FIELDS}
