@@ -116,7 +116,8 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_pair_relaxed_last(config.get<bool>("thor.roundtrip_pair_relaxed_last", false)),
       roundtrip_pair_eval_total(config.get<uint32_t>("thor.roundtrip_pair_eval_total", 0)),
       roundtrip_pair_relax_eval_cap(config.get<uint32_t>("thor.roundtrip_pair_relax_eval_cap", 0)),
-      roundtrip_pair_share_relax(config.get<bool>("thor.roundtrip_pair_share_relax", false)) {
+      roundtrip_pair_share_relax(config.get<bool>("thor.roundtrip_pair_share_relax", false)),
+      roundtrip_pair_rescue_last(config.get<bool>("thor.roundtrip_pair_rescue_last", false)) {
 
   // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10): build the road-identity sidecar at
   // engine start (first thor worker; later workers hit the cached instance) so the

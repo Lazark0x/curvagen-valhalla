@@ -3373,6 +3373,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         " share_relax=" + (roundtrip_pair_share_relax ? "1" : "0") +
         " relax_cap=" + std::to_string(roundtrip_pair_relax_eval_cap) +
         " eval_total=" + std::to_string(roundtrip_pair_eval_total) +
+        " rescue_last=" + (roundtrip_pair_rescue_last ? "1" : "0") +
         " cache=" + std::to_string(pair_cache.size()) + " keys_held=" +
         std::to_string(std::count_if(pair_cache.begin(), pair_cache.end(),
                                      [](const auto& kv) { return !kv.second.keys.ridden.empty(); })));
@@ -3429,8 +3430,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   //    leg, distance error, self-overlap) is P2's job.
   const bool built_rank = roundtrip_built_ranking;
   const bool relaxed_last = roundtrip_pair_relaxed_last;
+  const bool rescue_last = pairs && roundtrip_pair_rescue_last;
   std::stable_sort(loops.begin(), loops.end(),
-                   [built_rank, relaxed_last](const Loop& a, const Loop& b) {
+                   [built_rank, relaxed_last, rescue_last](const Loop& a, const Loop& b) {
                      if (!built_rank) {
                        if (a.fallback != b.fallback)
                          return !a.fallback;
@@ -3440,6 +3442,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                      // loop's score.
                      if (a.tier() != b.tier())
                        return a.tier() < b.tier();
+                     // proto/v4-p2.1 (d): within a tier, the rescue builder's loops — no pair
+                     // certificate, the slow heavy-reuse ones — rank behind pair-built loops.
+                     if (rescue_last && a.pair_built != b.pair_built)
+                       return a.pair_built;
                      // proto/v4-p2.1: within a tier, loops the relaxation ladder admitted
                      // rank after the ones that met the per-leg threshold.
                      if (relaxed_last && (a.relaxed != 0) != (b.relaxed != 0))

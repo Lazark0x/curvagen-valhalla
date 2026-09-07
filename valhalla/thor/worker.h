@@ -251,6 +251,7 @@ protected:
   uint32_t roundtrip_pair_eval_total; // leg mode: fresh evaluations per REQUEST across all rungs (0 = per-rung budget only)
   uint32_t roundtrip_pair_relax_eval_cap; // leg mode: fresh evaluations per RELAXATION rung (0 = roundtrip_pair_eval_cap)
   bool roundtrip_pair_share_relax;        // ladder the whole-pair threshold with the leg (+0.15, +0.30, off)
+  bool roundtrip_pair_rescue_last;        // rank rescue-built (non-pair) loops behind pair-built ones within a tier
 
 private:
   std::string service_name() const override {
