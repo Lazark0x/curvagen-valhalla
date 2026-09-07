@@ -7,7 +7,13 @@
 
 ## TL;DR verdict
 
-_(filled when the primary reading lands — see §4.)_
+**Distinctness at selection moves the served surface most of the way and stops short of Gate v2's T2, and every variant that gets close costs 1.22–1.34× at the median.** P2.1's best points: **d** (per-leg 0.35 laddered, whole-pair 0.6 against the built bank, one 1 200-evaluation budget, rescue-built loops ranked last) — served `bank_overlap_mean` **0.4443** (1.133× prod; bar ≤ 1.10× = 0.4315) and `near_dup > 0.6` **24.3 %** (bar ≤ 19.4 %), wall p50 **1.22×** the pooled brackets (bar 1.10×); **c** (the same at a 2 000 budget, rescue loops not re-ranked) — 0.4521 / **22.4 %**, 1.23×; **a2** (0.5 threshold) — 0.4657 / **21.7 %**, 1.34×. From P2's 0.5879 / 50.4 % that is −0.14 / −26 to −29 pp. Everything else holds on every variant: R1 Retrace family 1.9–3.0 %, R2 spikes 0, R4 552/552, R5 0, T1 1.04–1.06 / 1.19–1.29 / 1.09–1.16×, **T4 1.12–1.28× (passes)**, T5 36–47 m, T6 1.6–4.2 %, memory ≤ 2.4 GiB.
+
+- **What did it.** The per-leg test alone (a1) fixes the forward leg but not the count (0.494 / 29 %); the whole-pair 0.6 test against the *built* bank (a2 vs a1) is what brings the near-dups down, because T2's criterion is whole-loop overlap > 0.6 against any bank member; the tighter threshold (c) buys the mean; `rescue_last` (d) clears the served surface of the rescue builder's loops (16 % → 2 %). P2's own filter tightened (v0b) buys a quarter of that for the same latency.
+- **What is left.** The served **forward** legs are now as distinct as prod's (0.234 vs 0.242 of the loop); the **return** legs carry the whole residual (0.210 vs 0.151) — the returns are `route_leg` repairs built after selection that no selection-time test can see — and half of the remaining near-dups have their best sibling in slots 6–11, the ladder's fills that T2 charges to the served loops.
+- **What it costs.** The evaluation budget was the first latency regression (a0: 5 224 evaluations, 1.47×; v0: OOM) and is now bounded (one total per request, fresh evaluations only, memory-light rejects); with it back at P2's cost (d: 107 ms) the median is still 1.22× — the rest is building the distinct sinks' returns (more full repairs, 3.4 rescue builds per request against P2's 0.9).
+- **Gurka 51 green** (P2e / P2f on the comb map); the branch carries the mechanism as ten default-off knobs.
+- **Verdict for the ladder:** T2 cannot be met inside T3 on this mechanism as measured; the Pareto front is §8, the recommendation there. The keep / shelve call is Andrey's on the galleries (Appendix B).
 
 ## 1. The mechanism
 
@@ -112,7 +118,46 @@ ADR-0041's Baseline v2 figure for T5 (3 462 m) does not reproduce on the served 
 
 ## 5. T2 anatomy
 
-_(per-leg split, per block / level / slot, relaxation and rescue counts, where near-dups remain.)_
+### 5.1 Which leg carries the residual (`leg_overlap_served.py`, A+B slots 0–5, best sibling by exemption-discounted overlap = the T2 meter)
+
+| run | served mean | = forward + return | forward share of the forward leg (mean; > 0.5) | return share of the return leg (mean; > 0.5) |
+|---|---|---|---|---|
+| prod | 0.3923 | 0.2416 + 0.1507 | 0.477 ; 54.5 % | 0.295 ; 21.9 % |
+| P2 + xcand | 0.5879 | 0.3423 + 0.2456 | 0.682 ; 81.9 % | 0.492 ; 51.9 % |
+| a1 (leg only) | 0.4937 | 0.2751 + 0.2186 | 0.562 ; 59.0 % | 0.424 ; 42.6 % |
+| a2 | 0.4657 | 0.2629 + 0.2028 | 0.540 ; 56.7 % | 0.394 ; 37.3 % |
+| c (0.35) | 0.4521 | 0.2544 + 0.1977 | 0.526 ; 55.9 % | 0.382 ; 36.4 % |
+| **d** | **0.4443** | **0.2341 + 0.2103** | **0.489 ; 49.5 %** | **0.401 ; 39.4 %** |
+
+**The forward leg is fixed; the return leg is the residual.** On d the served forward legs are as distinct as prod's (0.234 vs 0.242 of the loop; 49.5 % share more than half the leg with a sibling against prod's 54.5 %). The return legs came down with them — from P2's 0.246 to 0.198–0.210 — which is the working hypothesis half-confirmed (sinks off the same trunk do share less of the way home), but they stop 0.05–0.06 above prod's 0.151, and that difference *is* the T2 gap (0.4443 − 0.3923 = 0.052). The reason is the one P2 §12 named: the whole-pair test judges the candidate's pair (tree path + Suurballe's second path) against the *built* bank, but the candidate's own return is repaired by `route_leg` after selection in ~92 % of loops, and nothing sees where that repair goes; the xcand penalty (0.2, cap 4) is the only pressure on it. Strict-vs-strict served pairs still read 25 % near-dup on d for exactly this reason (§5.3).
+
+### 5.2 Per block, level, slot (`served_surface.py`, `t2_anatomy.py`)
+
+| | prod | a2 | c | d |
+|---|---|---|---|---|
+| block A (Vračar) | 0.3738 / 12.5 % | 0.4135 / 19.0 % | **0.3810 / 17.8 %** | 0.4212 / 28.0 % |
+| block B (demand cells) | 0.4007 / 15.3 % | 0.4895 / 23.0 % | 0.4844 / 24.5 % | **0.4549 / 22.7 %** |
+| c0.5 / c0.7 / c1.0 | .404/16.8 · .386/12.6 · .379/12.2 | .451/18.1 · .471/24.6 · .484/25.1 | .438/20.1 · .454/22.3 · .472/25.7 | .454/27.0 · .452/23.6 · .426/21.0 |
+| slots 0 … 5 (mean) | .448 .467 .404 .317 .335 .384 | .451 .511 .445 .467 .488 .433 | .489 .464 .450 .462 .438 .410 | .494 .451 .410 .433 .441 .438 |
+| near-dups whose best sibling sits in slots 6–11 | 19.9 % | 32.9 % | 47.7 % | 48.2 % |
+
+Block A is within reach on c (0.381 / 17.8 % against A's own prod 0.374 / 12.5 %); block B — the demand cells, 50–300 km asks in the mountains and the plain — is where the gap sits. **Half of c's and d's near-dups have their best sibling in the deep bank**: the ladder's fills (and the rescue builder's) are what T2 charges to the served loops — the meter reads slots 0–5 against all twelve.
+
+### 5.3 By provenance (`t2_anatomy.py`, the ledger's `pair-leg` line joined to the response; 320 of 320 A+B requests matched)
+
+| served loop vs its best sibling | a2 | c | d |
+|---|---|---|---|
+| strict vs strict | 0.456 / 20.8 % (n 1 125) | 0.438 / 22.7 % (882) | 0.442 / 25.2 % (1 192) |
+| strict vs relaxed | 0.481 / 23.8 % (365) | 0.462 / 24.9 % (567) | 0.466 / 28.6 % (461) |
+| strict vs rescue | 0.502 / 27.8 % (97) | 0.430 / 18.2 % (88) | 0.391 / 14.0 % (164) |
+| rescue vs rescue | 0.505 / 24.4 % (156) | 0.527 / 27.4 % (190) | 0.497 / 5.0 % (40) |
+| served loops that are rescue-built | 313 (16 %) | 342 (18 %) | **42 (2 %)** |
+
+`rescue_last` (d) takes the rescue builder's loops off the served surface (313 → 42) and their pairwise near-dups with it (rescue vs rescue 27 % → 5 %), which is where d's served-mean gain over c comes from; what it cannot touch is strict-vs-strict and strict-vs-relaxed — the return-repair residual of §5.1 and the deep-bank charge of §5.2.
+
+### 5.4 Served-slot cleanliness on d (`slot_clean.py`, switchback-aware D1b; slots 0–2 / 3–5 / all)
+
+Near-mirror mechanism (F02) **0.3 / 0.0 / 0.1 %**; same-pavement (F01) 0.0 / 0.0 / 0.1 %; D1b ≥ 500 m 3.4 / 2.1 / 3.4 % (mean unseen 53 / 46 / 53 m); rings (F22) 16.2 / 13.3 / 14.3 % of loops (34.2 % carry ≥ 1 near-rejoin ring, 0.42 per loop — the residual P2 named); `clean` 13.6 / 11.9 / 12.0 %; fallback-like heavy reuse 1.5 / 4.3 / 4.5 %. The retrace family stays where P2 put it (R1 2.0 %); distinctness at selection did not buy it back.
 
 ## 6. Latency
 
@@ -168,11 +213,12 @@ Served-surface T2 against wall p50 (× the pooled brackets A + B, 1.153 s; T4 ×
 
 ## 9. Open questions
 
-1. **What T2 measures.** `max_pair_overlap` is each served loop against all twelve; with a ladder for fills, slots 6–11 are by construction the loops that failed the strict test. Read against slots 0–5 only, c's served surface is probably near the bar (not computed here — `t2_anatomy.py` §5 gives the sibling's slot for the near-dups; a served-vs-served variant of the meter is a five-line change in `metrics.py`). ADR question.
-2. **The whole-pair test against the built bank rejects 865–893 candidates per request** and is what sends 3 slots per request to the rescue builder. A test that keys on the *forward leg + the pair's return* but tolerates the repaired return's sharing (the xcand penalty already pushes repairs off shared corridors) might keep the pair-built share up; unmeasured.
-3. **Budget vs threshold.** Only two budgets (2 000; d's 1 200) and two thresholds (0.5, 0.35) were run at the correct semantics; the front is coarse. The evaluation cost per candidate (~95–130 µs, tile lookups in the arc walk) is the constant to attack if the mechanism is kept — caching canonical ids on the pass's arcs (built once per request) would remove the tile lookups from the walk.
-4. **Rescue-built loops on the served surface** (25–34 % of slots 0–5 in a2 / c): they carry no pair certificate; whether they are the near-dups, §5 says; whether `rescue_last` (d) helps or merely reorders, d says.
-5. **Gurka cannot read the ledger** (`logging::GetLogger` is a one-shot static): P2b's "std_err for the record" never printed; the rt-debug mirror is the workaround. Worth a small fix in the harness before more ledger-driven pins are written.
+1. **What T2 measures.** `max_pair_overlap` is each served loop against all twelve; with a ladder for fills, slots 6–11 are by construction the loops that failed the strict test, and §5.2 measured that 48 % of c's and d's near-dups have their best sibling there (prod: 20 %). A served-vs-served read of the meter (slots 0–5 against 0–5) is a five-line change in `metrics.py` and was not computed here. ADR question.
+2. **The return repair is the residual** (§5.1): the served returns are built after selection and the selection-time tests judge Suurballe's second path instead. The levers are P1.1's: a stronger xcand surcharge on the repairs for the pair mode, or the ADR-0040 built-loop filter applied to repairs only — both measured expensive before, neither measured on top of P2.1.
+3. **The whole-pair test against the built bank rejects 865–893 candidates per request** and is what sends 3 slots per request to the rescue builder. A test that keys on the *forward leg + the pair's return* but tolerates the repaired return's sharing (the xcand penalty already pushes repairs off shared corridors) might keep the pair-built share up; unmeasured.
+4. **Budget vs threshold.** Only two budgets (2 000; d's 1 200) and two thresholds (0.5, 0.35) were run at the correct semantics; the front is coarse. The evaluation cost per candidate (~95–130 µs, tile lookups in the arc walk) is the constant to attack if the mechanism is kept — caching canonical ids on the pass's arcs (built once per request) would remove the tile lookups from the walk.
+5. **Rescue-built loops on the served surface** (16–18 % of served loops in a2 / c): `rescue_last` (d) removes them from it (2 %) and their pairwise near-dups with them; it cannot touch strict-vs-strict.
+6. **Gurka cannot read the ledger** (`logging::GetLogger` is a one-shot static): P2b's "std_err for the record" never printed; the rt-debug mirror is the workaround. Worth a small fix in the harness before more ledger-driven pins are written.
 
 ## Appendix A — commands
 
