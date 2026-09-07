@@ -42,4 +42,14 @@ jobs:
             ENABLE_TESTS=Off
           push: true
           provenance: false
-          tags: ghcr.io/lazark0x/valhalla-curvature:amd64
+          # Two tags on purpose. `:amd64` is the floating tag the deploy's
+          # VALHALLA_IMAGE points at (curvagen-meta/deploy/.env.production) — it
+          # always means "what prod should be running". `:amd64-<sha>` is the
+          # immutable one, and it is the warm-rollback target: with only the
+          # floating tag, the moment a build lands the previous engine is
+          # reachable by digest alone and nothing on the box records it. Roll
+          # back by setting VALHALLA_IMAGE to the previous `:amd64-<sha>` and
+          # `docker compose up -d valhalla` (wayfinder curvagen-valhalla#18).
+          tags: |
+            ghcr.io/lazark0x/valhalla-curvature:amd64
+            ghcr.io/lazark0x/valhalla-curvature:amd64-${{ github.sha }}
