@@ -1906,8 +1906,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       if (!separated(rest[i]))
         continue;
       if (pairs) {
-        if (rung_budget_spent())
-          break; // proto/v4-p2.1: the rung's evaluation budget bounds the backfill walk too
+        // proto/v4-p2.1: the rung's evaluation budget bounds the backfill walk too (fresh
+        // evaluations only; a cached verdict is free)
+        const auto cached = pair_cache.find(rest[i]);
+        if ((cached == pair_cache.end() || !cached->second.checked) && rung_budget_spent())
+          break;
         const PairEval& pe = eval_pair(rest[i]);
         if (!pe.ok)
           continue;
@@ -3014,10 +3017,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   while (true) {
     if (loops.size() >= want)
       break;
-    if (pairs && !rescue_pass && rung_budget_spent()) {
-      underfill_cause = "evalcap"; // proto/v4-p2.1: this rung's evaluation budget is spent
-      break;
-    }
     if (qi >= queue.size() || attempts >= attempt_cap) {
       if (roundtrip_f09_budget ? !stall_granted : !widened) {
         stall_granted = true;
@@ -3036,6 +3035,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (!built_separated(cands[ci].ll))
       continue;
     if (pairs && !rescue_pass) {
+      // proto/v4-p2.1: the rung's budget bounds FRESH evaluations only — a cached verdict
+      // (the chosen set, everything the backfill already walked) is always processed.  The
+      // first cut checked the budget at the top of the loop and starved rung 0 of its own
+      // chosen candidates whenever the backfill had spent the budget (run p2-1-a0).
+      const auto cached = pair_cache.find(ci);
+      if ((cached == pair_cache.end() || !cached->second.checked) && rung_budget_spent()) {
+        underfill_cause = "evalcap"; // this rung's evaluation budget is spent
+        break;
+      }
       // proto/v4-p2: a selection-time reject (no pair, off band, twin ride, near-dup)
       // costs a path walk, not a search, so it does not spend the attempt budget.
       const PairEval& pe = eval_pair(ci);
