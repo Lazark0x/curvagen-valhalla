@@ -58,6 +58,7 @@ All on the prod-equivalent Serbia tiles, corpus-v2 (552 requests, K = 12), engin
 | **a2** | `p21a2` | a1 with the whole-pair test **on, fixed at 0.6** (redefined after a1 — see below) | `p2-1-a2/` | leg laddered + whole-pair-vs-built at T2's own criterion |
 | **c** | `p21c` | the better of a1 / a2 with `leg_sharing_frac` 0.35 | `p2-1-c/` | the tighter threshold |
 | b | `p21b` | the better of a1 / a2 + `diversity_w` 2.0 — if time allows | `p2-1-b/` | the diversity term |
+| **d** | `p21d` | a2 at `eval_total` 1 200 (`eval_cap` 1 200, `relax_eval_cap` 150) + `roundtrip_pair_rescue_last` (rescue-built loops rank behind pair-built ones within a tier) — binary `f4a50bdbb` | `p2-1-d/` | the decision run: the T3 side of the front |
 | baseline bracket **B** | `p21baseB` | — | `census-v2-p21-baseB/` | latency bracket after the variants (T3 pools A + B) |
 
 **Bracket A** (12:23–12:32Z, `census-v2-p21-baseA/`): wall p50 **1.165 s**, p95 3.337 s, fills 550/552, failures 0, engine-stage total 824.4 ms mean / 709.5 ms p50, attempts 12.56 — against the P2 session's prod-condition bracket X (1.189 s / 3.123 s, 860.7 / 757.0 ms). Its meters are **byte-identical to bracket X's** (`same_meters.py`: 0 of 6 621 loops differ — deterministic engine, same binary and config), so the switchback-aware detector read of X (`p21bx`) is the read of every prod-condition baseline bracket in this session.
@@ -124,6 +125,10 @@ Variant v0 (`v8003-p21-v0.json`: the P2 binary `83837debc`, xcand 0.2, `roundtri
 The first corpus run of variant a (`p2-1-a0/`, binary `6f396e85f`) had the per-rung evaluation budget checked at the top of the build loop. On requests where the selection walk (sector shortlist + backfill under the strict test) had already spent rung 0's 3 000 evaluations, the build loop broke before building even the chosen candidates — a typical ledger line reads `chosen=11 … rung_evals=3000/62/0/0 … leg_relaxed=12 leg_relax_rung=1`: eleven chosen, none built at rung 0, the whole bank built at rung 1 (threshold 0.65) with 62 fresh evaluations. `underfill=evalcap` on 112 of the first 197 requests. The fix (`a4591a321`) bounds fresh evaluations only. a0 is kept as evidence and read in §4 as "the ladder-only variant" (effective threshold 0.65–0.80 on those requests); it is not the primary.
 
 _(a0's numbers: filled from `read-a0.txt`.)_
+
+### 7.3 Not built: the leg test before the pair construct
+
+Suggested for d: walk the tree path (the label chain) for the forward keys and reject a leg-sharing sink *before* constructing its pair. The a2 ledger says it would not pay here: the leg test rejects 183 sinks per request, the whole-pair-vs-built test 865 (which needs the full walk), and 77 % of evaluations are `no_pair` / `band` rejects that today pay only the O(1) existence check and the construct — a pre-walk would add a tile-lookup walk to those. The evaluation budget is the lever that buys evaluation back, and d takes it (1 200 total, 150 per relaxation rung).
 
 ## 8. Pareto front / recommendation for the v4 build
 
