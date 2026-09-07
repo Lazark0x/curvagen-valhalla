@@ -32,10 +32,24 @@ def main(argv=None):
                         "(default: --engine in engine mode; disabled in serving mode)")
     r.add_argument("--workers", type=int, default=None,
                    help="parallel requests (default: 3 engine mode, 1 serving mode)")
+    r.add_argument("--analysis-workers", type=int, default=None,
+                   help="processes for the metrics pass (default: one per core). The "
+                        "detector bank costs ~75 ms per loop, so this is not the "
+                        "request concurrency — it runs after the corpus is fired.")
     r.add_argument("--no-way", action="store_true", help="skip the edge_reuse_way pass")
     r.add_argument("--engine-note", default="",
                    help="free-text engine provenance stamped into responses and reports")
     r.set_defaults(func=runner.run)
+
+    a = sub.add_parser("reanalyze",
+                       help="re-read a saved run's responses with the current metrics "
+                            "(no requests fired)")
+    a.add_argument("--run", required=True, help="an existing run dir (needs responses/)")
+    a.add_argument("--out", default=None,
+                   help="write the re-read here instead of in place (responses/ symlinked)")
+    a.add_argument("--workers", type=int, default=None,
+                   help="analysis processes (default: one per core)")
+    a.set_defaults(func=runner.reanalyze)
 
     c = sub.add_parser("compare", help="per-metric delta table between two report.json files")
     c.add_argument("baseline")
