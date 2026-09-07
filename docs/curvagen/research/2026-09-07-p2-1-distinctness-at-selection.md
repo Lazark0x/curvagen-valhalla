@@ -54,17 +54,23 @@ All on the prod-equivalent Serbia tiles, corpus-v2 (552 requests, K = 12), engin
 | baseline bracket **A** | `p21baseA` | — | `census-v2-p21-baseA/` | latency bracket before the variants |
 | a0 | `p21a0` | `leg_sharing` 0.5, `built_keys`, `leg_relax`, `relaxed_last`, `eval_cap` 3 000/rung — binary `6f396e85f` (budget checked at the top of the build loop) | `p2-1-a0/` | **the starved rung 0** (§7.2): effectively the ladder at 0.65–0.80; prices the 3 000 budget |
 | v0b | `p21v0b` | new knobs off, `roundtrip_sharing_frac` 0.4, `eval_cap` 3 000 (P2 semantics: filter dropped past the cap) | `p2-1-v0b/` | what P2's whole-pair filter buys inside a budget |
-| **a** (primary) | `p21a` | as a0, binary `53dbd1474` (budget bounds fresh evaluations) | `p2-1-a/` | the per-leg threshold at 0.5, T2 ceiling of the mechanism |
-| **d** | `p21d` | a at `eval_cap` 1 000/rung + `eval_total` 2 000/request | `p2-1-d/` | the latency-viable budget — the decision run, moved ahead of b / c once a0 priced 3 000 at 1.46× p50 |
-| **b** | `p21b` | d + `diversity_w` 2.0 | `p2-1-b/` | the diversity term |
-| **c** | `p21c` | d with `leg_sharing_frac` 0.35 | `p2-1-c/` | the tighter threshold |
+| **a1** | `p21a1` | binary `23ae41e64`: per-leg 0.5, built keys, ladder, relaxed_last, **whole-pair test off**, `eval_total` 2 000, `eval_cap` 2 000, `relax_eval_cap` 300 | `p2-1-a1/` | the leg test alone, at P2's evaluation volume |
+| **a2** | `p21a2` | a1 with the whole-pair test **on and laddered** (`share_relax`: 0.6 → 0.75 → 0.9 → off) | `p2-1-a2/` | leg + whole-pair-vs-built, laddered together |
+| **c** | `p21c` | the better of a1 / a2 with `leg_sharing_frac` 0.35 | `p2-1-c/` | the tighter threshold |
+| b | `p21b` | the better of a1 / a2 + `diversity_w` 2.0 — if time allows | `p2-1-b/` | the diversity term |
 | baseline bracket **B** | `p21baseB` | — | `census-v2-p21-baseB/` | latency bracket after the variants (T3 pools A + B) |
 
 **Bracket A** (12:23–12:32Z, `census-v2-p21-baseA/`): wall p50 **1.165 s**, p95 3.337 s, fills 550/552, failures 0, engine-stage total 824.4 ms mean / 709.5 ms p50, attempts 12.56 — against the P2 session's prod-condition bracket X (1.189 s / 3.123 s, 860.7 / 757.0 ms). Its meters are **byte-identical to bracket X's** (`same_meters.py`: 0 of 6 621 loops differ — deterministic engine, same binary and config), so the switchback-aware detector read of X (`p21bx`) is the read of every prod-condition baseline bracket in this session.
 
 **a0** (12:40–12:54Z): T2 **0.4829 / 21.0 %** (1.231× / +6.6 pp, FAIL — but −0.105 / −29 pp from P2's 0.5879 / 50.4 %; block A 0.4677 / 23.3 %, block B 0.4899 / 19.9 %; c0.5 0.4716 / 16.6 %, c0.7 0.5061 / 24.9 %, c1.0 0.4848 / 24.9 %); fills 552/552, failures 0; wall p50 **1.700 s** (1.46× bracket A), p95 **10.06 s**; engine-stage total 1 442 ms (eval 672 ms mean, p50 269, max 6 829); evaluations 5 224 per request (p50 3 461; `rung_evals` means 2 730 / 1 221 / 738 / 535), `leg_share` 224, whole-pair `share` **1 773** (P2: 130 — the built-loop keys see the repaired returns), `leg_relaxed` 8.48 per request (464 requests with any; highest rung 1 / 2 / 3 on 318 / 90 / 56), rescue loops 955 (P2: 477), `underfill=evalcap` on 438; container memory max 2.4 GiB. Per slot: relaxed share 59 % (slot 0) → 82 % (slot 11); pair-built 81–91 %; tier 0 95 % in slots 0–9.
 
-_(v0b, a, d, b, c and bracket B follow as each lands.)_
+**v0b** (12:54–13:05Z, `p2-1-v0b/`; the P2 mechanism, new knobs off, `roundtrip_sharing_frac` 0.4 inside `roundtrip_pair_eval_cap` 3 000 with P2's semantics — the filter is dropped past the cap, the walk goes on): T2 **0.5508 / 42.0 %** (1.404× / +27.6 pp, FAIL; block A 0.4832 / 30.2 %, block B 0.5815 / 47.4 %); fills 552/552, failures 0; wall p50 **1.567 s** (1.35× bracket A), p95 5.15 s; engine-stage total 1 165 ms (eval 338 ms mean, max 4 938); evaluations 3 700 per request (p50 3 057, **max 31 070** — with the filter dropped the walk is bounded only by the bank filling), whole-pair `share` rejects 803 per request, rescue loops 667 (70 requests); memory max 1.65 GiB. **P2's own filter, tightened to 0.4, buys 0.037 of the served mean and −8 pp of near-dups for a third more latency** — the pair-keyed whole-pair test is the wrong instrument, as P2 §5 said.
+
+_(a1, a2, c, b and bracket B follow as each lands; the fixed **a** at 3 000/rung was dropped from the matrix once a0 and v0b had priced that budget — see §3.1.)_
+
+### 3.1 Why the matrix changed mid-session
+
+a0 (the first cut) put T2 within 1.6 pp of the near-dup bar and 0.05 off the mean bar — but at 1.46× wall p50, and the ledger said why: the per-rung budget multiplies (four rungs × 3 000 fresh evaluations on hard requests), and the dominant rejecter was not the leg test but P2's whole-pair 0.6 `pair_shares`, now keyed on built loops and never relaxed, so every rung was spent re-rejecting on it. The evaluation volume *is* the latency regression (P2: 113 ms of evaluation at 1 710 per request; a0: 672 ms at 5 224). So instead of b / c on the 3 000 budget: **one total budget per request (2 000, P2's own volume), the relaxation rungs re-testing the cached candidates first and evaluating at most 300 new ones each, and the whole-pair test either off (a1) or laddered with the leg (a2)** — a1 vs a2 tells whether the T2 gain comes from the leg test or from the whole-pair-vs-built test; then c (0.35) on the better of the two, b (diversity) if time allows. The coordinator's independent read of a0 reached the same diagnosis.
 
 ## 4. Gate v2 — all tiers, all runs
 
