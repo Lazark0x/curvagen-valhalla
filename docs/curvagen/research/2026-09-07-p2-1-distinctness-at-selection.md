@@ -48,16 +48,19 @@ All on the prod-equivalent Serbia tiles, corpus-v2 (552 requests, K = 12), engin
 |---|---|---|---|---|
 | v0 | `p21v0` | P2 binary, `roundtrip_pair_eval_cap` 1e6, `roundtrip_sharing_frac` 0.4 | `p2-1-v0/` | **OOM-killed after 15 requests** (§7.1) — evidence only |
 | baseline bracket **A** | `p21baseA` | — | `census-v2-p21-baseA/` | latency bracket before the variants |
-| **a** (primary) | `p21a` | `leg_sharing` 0.5, `built_keys`, `leg_relax`, `relaxed_last`, `diversity_w` 0 | `p2-1-a/` | the per-leg threshold |
-| v0b | `p21v0b` | new knobs off, `roundtrip_sharing_frac` 0.4 | `p2-1-v0b/` | what P2's whole-pair filter buys inside a 3 000 budget |
-| **b** | `p21b` | a + `diversity_w` 2.0 | `p2-1-b/` | the diversity term |
-| **c** | `p21c` | a with `leg_sharing_frac` 0.35 | `p2-1-c/` | the tighter threshold |
-| **d** | `p21d` | decided from a/b/c (§3.1) | `p2-1-d/` | the decision run |
+| a0 | `p21a0` | `leg_sharing` 0.5, `built_keys`, `leg_relax`, `relaxed_last`, `eval_cap` 3 000/rung — binary `6f396e85f` (budget checked at the top of the build loop) | `p2-1-a0/` | **the starved rung 0** (§7.2): effectively the ladder at 0.65–0.80; prices the 3 000 budget |
+| v0b | `p21v0b` | new knobs off, `roundtrip_sharing_frac` 0.4, `eval_cap` 3 000 (P2 semantics: filter dropped past the cap) | `p2-1-v0b/` | what P2's whole-pair filter buys inside a budget |
+| **a** (primary) | `p21a` | as a0, binary `53dbd1474` (budget bounds fresh evaluations) | `p2-1-a/` | the per-leg threshold at 0.5, T2 ceiling of the mechanism |
+| **d** | `p21d` | a at `eval_cap` 1 000/rung + `eval_total` 2 000/request | `p2-1-d/` | the latency-viable budget — the decision run, moved ahead of b / c once a0 priced 3 000 at 1.46× p50 |
+| **b** | `p21b` | d + `diversity_w` 2.0 | `p2-1-b/` | the diversity term |
+| **c** | `p21c` | d with `leg_sharing_frac` 0.35 | `p2-1-c/` | the tighter threshold |
 | baseline bracket **B** | `p21baseB` | — | `census-v2-p21-baseB/` | latency bracket after the variants (T3 pools A + B) |
 
 **Bracket A** (12:23–12:32Z, `census-v2-p21-baseA/`): wall p50 **1.165 s**, p95 3.337 s, fills 550/552, failures 0, engine-stage total 824.4 ms mean / 709.5 ms p50, attempts 12.56 — against the P2 session's prod-condition bracket X (1.189 s / 3.123 s, 860.7 / 757.0 ms). Its meters are **byte-identical to bracket X's** (`same_meters.py`: 0 of 6 621 loops differ — deterministic engine, same binary and config), so the switchback-aware detector read of X (`p21bx`) is the read of every prod-condition baseline bracket in this session.
 
-_(the variants' status and headline numbers follow as each lands.)_
+**a0** (12:40–12:54Z): T2 **0.4829 / 21.0 %** (1.231× / +6.6 pp, FAIL — but −0.105 / −29 pp from P2's 0.5879 / 50.4 %; block A 0.4677 / 23.3 %, block B 0.4899 / 19.9 %; c0.5 0.4716 / 16.6 %, c0.7 0.5061 / 24.9 %, c1.0 0.4848 / 24.9 %); fills 552/552, failures 0; wall p50 **1.700 s** (1.46× bracket A), p95 **10.06 s**; engine-stage total 1 442 ms (eval 672 ms mean, p50 269, max 6 829); evaluations 5 224 per request (p50 3 461; `rung_evals` means 2 730 / 1 221 / 738 / 535), `leg_share` 224, whole-pair `share` **1 773** (P2: 130 — the built-loop keys see the repaired returns), `leg_relaxed` 8.48 per request (464 requests with any; highest rung 1 / 2 / 3 on 318 / 90 / 56), rescue loops 955 (P2: 477), `underfill=evalcap` on 438; container memory max 2.4 GiB. Per slot: relaxed share 59 % (slot 0) → 82 % (slot 11); pair-built 81–91 %; tier 0 95 % in slots 0–9.
+
+_(v0b, a, d, b, c and bracket B follow as each lands.)_
 
 ## 4. Gate v2 — all tiers, all runs
 
