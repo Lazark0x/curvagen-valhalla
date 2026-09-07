@@ -161,12 +161,55 @@ Served-surface T2 against wall p50 (× bracket A 1.165 s), every P2-family point
 
 ## Appendix A — commands
 
-_(filled at the end.)_
+```bash
+# the engine patch (reproducible, anchor-asserted) and the build in the warm audit container (-j3: -j8 OOM-kills the compiler in a 5.8 GiB VM)
+python3 ~/.curvagen-scratch/p21/patch_p21.py                       # the first commit's edits on 4402a2604
+docker cp src/thor/route_action.cc rt-p1-build:/src/valhalla/src/thor/   # etc.; then
+docker exec rt-p1-build bash -lc 'cd /src/valhalla/build && make -j3 valhalla_service gurka_roundtrip_audit'
+docker exec rt-p1-build bash -lc 'cd /src/valhalla/build && ./test/gurka/gurka_roundtrip_audit --gtest_brief=1'   # + gurka_motorcycle_roundtrip, gurka_roundtrip_distinctness
+
+# engine configs, layered inside rt-p1-build on /tmp/v8003-p2v2-xcand.json (P2 knee + pair pass + xcand 0.2 cap 4)
+ls /tmp/v8003-p21-*.json      # v0, v0b, a (= a0), a1, a2, c-on-a2, d; baseline /tmp/v8004-xcand.json in rt-p11-base
+
+# the runs: one engine at a time, 3 workers, way pass on, an engine watchdog + memory log per run
+~/.curvagen-scratch/p21/p21-run.sh <base|p2> <tag> <cfg> <outdir> "<note>"          # wraps p2_lib.sh's run_base / run_p2
+~/.curvagen-scratch/p21/p21-next.sh <prev-log> <PREV> <var> <tag> <kind> <tag> <cfg> <outdir> "<note>"   # hand-off: previous variant's detector pass in the gap, then the next run
+~/.curvagen-scratch/p21/p21-rebuild-then-{a,a1,a2,d}.sh                              # wait for a marker, rebuild, gurka smoke, launch
+
+# readings
+python3 ~/.curvagen-scratch/p21/served_surface.py prod=results/census-v2-p2-baseX p2x=results/p2-v2-xcand c=results/p2-1-c ...   # T2
+python3 ~/.curvagen-scratch/p21/gate_v2_read.py cen=results/census-v2-b4f514d7f:p2cen prodX=results/census-v2-p2-baseX:p21bx c=results/p2-1-c:p21c ...
+~/.curvagen-scratch/p2/p2-analyse-all.sh p2-1-c p21c p2-v2-xcand p2v2x census-v2-p2-baseX p21bx   # switchback-aware detectors
+python3 ~/.curvagen-scratch/p21/p21_ledger.py ~/.curvagen-scratch/p2/eng-p21c.log     # the appended fields, per-rung evaluations, memory guard, per-slot provenance
+python3 ~/.curvagen-scratch/p2/{p2_ledger,ledger_agg,stage_total_p2}.py ...           # the P2 parsers, unchanged, still run
+python3 ~/.curvagen-scratch/p21/leg_overlap_served.py ... ; python3 ~/.curvagen-scratch/p21/t2_anatomy.py c=results/p2-1-c:~/.curvagen-scratch/p2/eng-p21c.log
+~/.curvagen-scratch/p21/p21-read.sh <var> <tag>   # light bundle;  ~/.curvagen-scratch/p21/p21-final.sh <best> <tag>   # the end-of-session bundle incl. galleries
+```
 
 ## Appendix B — artefacts
 
-_(filled at the end.)_
+| Path | What |
+|---|---|
+| `tools/loopqual/results/p2-1-{v0,v0b,a0,a1,a2,c,d}/` | the runs (552 responses each except v0; `loops.jsonl`, `report.{json,md}`); `p2-1-<best>/compare/`, `gallery-p2-1-*.html` |
+| `tools/loopqual/results/census-v2-p21-base{A,B}/` | the session's baseline brackets (meters byte-identical to `census-v2-p2-baseX`) |
+| `~/.curvagen-scratch/p2/eng-p21{baseA,baseB,v0,v0b,a0,a1,a2,c,d}.log` | engine ledgers (`pair-select` with the appended fields, `pair-leg`, the P1.1 lines) |
+| `~/.curvagen-scratch/p21/` | drivers (`p21-run.sh`, `p21-next.sh`, `p21-rebuild-then-*.sh`), per-run logs + memory watch (`watch-*.log`), readings (`read-*.txt`, `gate-*.txt`, `final.txt`), the patch script, the readers (`served_surface.py`, `gate_v2_read.py`, `leg_overlap_served.py`, `t2_anatomy.py`, `p21_ledger.py`, `same_meters.py`, `p21_gallery.py`), the ticket comments |
+| `~/.curvagen-scratch/{p21a0,p21a1,p21a2,p21c,p21d,p2v2x,p21bx}*.jsonl` | detector output (switchback-aware D1b) for the P2.1 runs and, for the first time, the prod-condition P2 and baseline runs |
+| `~/.curvagen-scratch/p21/gurka-p21-audit.log`, `gurka-p21-others.log`, `build-p21-*.log` | the 51-green run and the builds |
+
+Containers `rt-p1-build` (:8003) and `rt-p11-base` (:8004) are left running with their engines stopped; `valhalla-local` (:8002) and the :8791 results server were never addressed.
 
 ## Appendix C — the branch
 
-_(filled at the end.)_
+`proto/v4-p2.1`, cut from `proto/v4-p2` @ `4402a2604`; **nothing pushed**.
+
+| commit | what |
+|---|---|
+| `6f396e85f` | the mechanism: per-leg forward-sharing threshold, built-loop bank keys, diversity term, relaxation ladder + relaxed-last ranking, per-rung evaluation budget (first cut), memory-light rejects, ledger fields, gurka P2e / P2f (comb map) |
+| `a4591a321` | the budget bounds fresh evaluations only (a0's starved rung 0) |
+| `53dbd1474` | `roundtrip_pair_eval_total` — one budget per request |
+| `d3126916c` + `23ae41e64` | `roundtrip_pair_relax_eval_cap`, `roundtrip_pair_share_relax` (declared, then wired) |
+| `f4a50bdbb` | `roundtrip_pair_rescue_last` (decision run d) |
+| docs commits | this document, written incrementally (`206149156` … ) |
+
+Knobs added (all `thor.`, all default off / 0): `roundtrip_pair_leg_sharing` (false), `roundtrip_pair_leg_sharing_frac` (0.5), `roundtrip_pair_built_keys` (false), `roundtrip_pair_diversity_w` (0), `roundtrip_pair_leg_relax` (false), `roundtrip_pair_relaxed_last` (false), `roundtrip_pair_eval_total` (0), `roundtrip_pair_relax_eval_cap` (0), `roundtrip_pair_share_relax` (false), `roundtrip_pair_rescue_last` (false); `roundtrip_pair_eval_cap` keeps its P2 meaning unless `roundtrip_pair_leg_sharing` is on. The diversity term (`roundtrip_pair_diversity_w`) is implemented and gurka-covered by construction (w = 0 is P2's order) but **was not measured** on the corpus — variant b was dropped from the matrix for time once the budget axis turned out to matter more. `clang-format` (host 23.1) was applied to the changed hunks only (`git clang-format`); whole-file formatting would have re-flowed ~700 unrelated lines.
