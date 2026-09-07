@@ -21,7 +21,9 @@ set(sources
   map_matcher.cc
   optimized_route_action.cc
   optimizer.cc
+  road_twin_index.cc
   roundtrip_expansion.cc
+  roundtrip_pairs.cc
   route_matcher.cc
   status_action.cc
   trace_attributes_action.cc
