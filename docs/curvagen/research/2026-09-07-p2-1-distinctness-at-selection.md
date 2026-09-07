@@ -74,7 +74,30 @@ a0 (the first cut) put T2 within 1.6 pp of the near-dup bar and 0.05 off the mea
 
 ## 4. Gate v2 — all tiers, all runs
 
-_(filled as runs land; T2 first.)_
+Read by `gate_v2_read.py` (served surface = blocks A + B, slots 0–5; R1 = D1 `am10_max_run_m ≥ 500` ∨ D4 `reuse_disc_m ≥ 500` ∨ D1L `am25_max_run_m ≥ 1500` on the switchback-aware detector output; the reader reproduces ADR-0041's R1 43.9 / 2.4 / 3.8 %, T6 and T1). Bars: T1 per level vs the census run `census-v2-b4f514d7f` (`curviness_geom_clean`, whole corpus); T3 vs the pooled brackets A + B (until B lands: bracket A 1.165 s); T4 on A + B vs prod's A + B p95 (bracket X 2.977 s, bracket A 3.337 s — the pooled figure is used when B lands); T5 reported on both surfaces (§4.1). Columns: census (`cen`), prod condition (`prodX`, = brackets A/B byte-for-byte), P2 + xcand (`p2x`, the same detector read for the first time), the P2.1 runs.
+
+| tier | bar | cen | prodX | p2x | a0 | v0b | a1 | a2 | c |
+|---|---|---|---|---|---|---|---|---|---|
+| R1 Retrace family, served | ≤ 5 % | 43.9 | 43.8 | 2.8 | **3.0** ✓ | n/a | | | |
+| R2 `spike_ge_500m` | 0 | 0 | 0 | 0 | **0** ✓ | 0 ✓ | | | |
+| R3 dist err c0.5 / c0.7 / c1.0 mean (p90) | ≤ 0.22 (0.42) / 0.32 (0.65) / 0.32 (0.65) | .169/.108/.134 | .139/.109/.134 | .134/.104/.109 | **.155/.115/.119** (p90 .27/.20/.20) ✓ | .136/.108/.108 ✓ | | | |
+| R4 fills 12/12 | 552 | 550 | 550 | 552 | **552** ✓ | 552 ✓ | | | |
+| R5 failures | 0 | 0 | 0 | 0 | **0** ✓ | 0 ✓ | | | |
+| T1 curviness c0.5 / c0.7 / c1.0 (all, ×census) | ≥ 0.95× | 1 | 1.01/1.01/1.00 | 1.06/1.28/1.21 | **1.04/1.24/1.11** ✓ | 1.04/1.24/1.12 ✓ | | | |
+| **T2** served mean / near_dup > 0.6 | ≤ 0.4315 / ≤ 19.4 % | .4412/23.8 | .3923/14.4 | .5879/50.4 | **.4829/21.0** ✗ (1.231×/+6.6 pp) | .5508/42.0 ✗ | | | |
+| T3 wall p50 (× bracket A 1.165 s) | ≤ 1.10× | 1.305 | 1.189 | 1.486† | **1.700 = 1.46×** ✗ | 1.567 = 1.35× ✗ | | | |
+| T4 wall p95 A+B (× prod 2.98–3.34 s) | ≤ 1.30× | 3.50 | 2.977 | 5.459† | **7.72 = 2.3×** ✗ | 4.42 = 1.3–1.5× ✗ | | | |
+| T5 near-mirror mean m, A+B served (bar 1 198 = 0.25 × 4 792) | ≤ 1 198 | 4 792 | 4 861 | 29 | **44** ✓ | n/a | | | |
+| T5 on the ADR surface, all blocks s0–2 (bar 865 = 0.25 × 3 462) | ≤ 865 | 3 462 | 3 359 | 41 | **51** ✓ | n/a | | | |
+| T6 deep-bank Retrace family | ≤ 53 % | 53.0 | 51.1 | 2.7 | **1.6** ✓ | n/a | | | |
+| C1 `spike_ge_30m` · C2 `edge_reuse_geom` served | report | 0 · .021 | 0 · .021 | 0 · 0 | 0 · 0 | 0 · 0 | | | |
+| A4 D1b ≥ 500 m served | advisory | 55.1 | 56.7 | 3.1 | 4.7 | n/a | | | |
+
+† the P2-session `p2-v2-xcand` run overlapped detector passes; its latency is not a reading (P2 §7.8 re-measured it uncontended at 1.102 s / 4.05 s).
+
+### 4.1 The T5 erratum
+
+ADR-0041's Baseline v2 figure for T5 (3 462 m) does not reproduce on the served surface as the ADR defines it (blocks A + B, slots 0–5 → **4 792 m**; prod-condition bracket 4 861); it reproduces exactly on **all blocks, slots 0–2** (3 462; P2 reads 41 there against the ADR's 44 — the ADR's P2 figure was read before the xcand re-run). Both bars are reported; every P2-family run passes both by two orders of magnitude, so the erratum does not change a verdict — the v4 build task should pin the surface in `gate_v2.py`.
 
 ## 5. T2 anatomy
 
