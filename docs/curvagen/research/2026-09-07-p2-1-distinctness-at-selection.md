@@ -10,7 +10,7 @@
 **Distinctness at selection moves the served surface most of the way and stops short of Gate v2's T2, and every variant that gets close costs 1.22–1.34× at the median.** P2.1's best points: **d** (per-leg 0.35 laddered, whole-pair 0.6 against the built bank, one 1 200-evaluation budget, rescue-built loops ranked last) — served `bank_overlap_mean` **0.4443** (1.133× prod; bar ≤ 1.10× = 0.4315) and `near_dup > 0.6` **24.3 %** (bar ≤ 19.4 %), wall p50 **1.22×** the pooled brackets (bar 1.10×); **c** (the same at a 2 000 budget, rescue loops not re-ranked) — 0.4521 / **22.4 %**, 1.23×; **a2** (0.5 threshold) — 0.4657 / **21.7 %**, 1.34×. From P2's 0.5879 / 50.4 % that is −0.14 / −26 to −29 pp. Everything else holds on every variant: R1 Retrace family 1.9–3.0 %, R2 spikes 0, R4 552/552, R5 0, T1 1.04–1.06 / 1.19–1.29 / 1.09–1.16×, **T4 1.12–1.28× (passes)**, T5 36–47 m, T6 1.6–4.2 %, memory ≤ 2.4 GiB.
 
 - **What did it.** The per-leg test alone (a1) fixes the forward leg but not the count (0.494 / 29 %); the whole-pair 0.6 test against the *built* bank (a2 vs a1) is what brings the near-dups down, because T2's criterion is whole-loop overlap > 0.6 against any bank member; the tighter threshold (c) buys the mean; `rescue_last` (d) clears the served surface of the rescue builder's loops (16 % → 2 %). P2's own filter tightened (v0b) buys a quarter of that for the same latency.
-- **What is left.** The served **forward** legs are now as distinct as prod's (0.234 vs 0.242 of the loop); the **return** legs carry the whole residual (0.210 vs 0.151) — the returns are `route_leg` repairs built after selection that no selection-time test can see — and half of the remaining near-dups have their best sibling in slots 6–11, the ladder's fills that T2 charges to the served loops.
+- **What is left.** The served **forward** legs are now as distinct as prod's (0.234 vs 0.242 of the loop); the **return** legs carry the whole residual (0.210 vs 0.151) — the returns are `route_leg` repairs built after selection that no selection-time test can see — and half of the remaining near-dups have their best sibling in slots 6–11, the ladder's fills that T2 charges to the served loops. Read served-vs-served (slots 0–5 against 0–5 only; §9 Q1, measured after the session) d is **0.3370 / 13.8 % — 1.063× / +2.2 pp vs prod**, inside the ratchet's shape; c 1.107×. The diversity term (b2) is inert.
 - **What it costs.** The evaluation budget was the first latency regression (a0: 5 224 evaluations, 1.47×; v0: OOM) and is now bounded (one total per request, fresh evaluations only, memory-light rejects); with it back at P2's cost (d: 107 ms) the median is still 1.22× — the rest is building the distinct sinks' returns (more full repairs, 3.4 rescue builds per request against P2's 0.9).
 - **Gurka 51 green** (P2e / P2f on the comb map); the branch carries the mechanism as ten default-off knobs.
 - **Verdict for the ladder:** T2 cannot be met inside T3 on this mechanism as measured; the Pareto front is §8, the recommendation there. The keep / shelve call is Andrey's on the galleries (Appendix B).
@@ -63,7 +63,7 @@ All on the prod-equivalent Serbia tiles, corpus-v2 (552 requests, K = 12), engin
 | **a1** | `p21a1` | binary `23ae41e64`: per-leg 0.5, built keys, ladder, relaxed_last, **whole-pair test off**, `eval_total` 2 000, `eval_cap` 2 000, `relax_eval_cap` 300 | `p2-1-a1/` | the leg test alone, at P2's evaluation volume |
 | **a2** | `p21a2` | a1 with the whole-pair test **on, fixed at 0.6** (redefined after a1 — see below) | `p2-1-a2/` | leg laddered + whole-pair-vs-built at T2's own criterion |
 | **c** | `p21c` | the better of a1 / a2 with `leg_sharing_frac` 0.35 | `p2-1-c/` | the tighter threshold |
-| b | `p21b` | the better of a1 / a2 + `diversity_w` 2.0 — if time allows | `p2-1-b/` | the diversity term |
+| b2 | `p21b2` | **d** + `roundtrip_pair_diversity_w` 2.0 (run after bracket B, same session) | `p2-1-b2/` | the diversity term (ticket lever 2) |
 | **d** | `p21d` | **c** (0.35) at `eval_total` 1 200 (`eval_cap` 1 200, `relax_eval_cap` 150) + `roundtrip_pair_rescue_last` (rescue-built loops rank behind pair-built ones within a tier) — binary `f4a50bdbb` | `p2-1-d/` | the decision run: the T3 side of the front |
 | baseline bracket **B** | `p21baseB` | — | `census-v2-p21-baseB/` | latency bracket after the variants (T3 pools A + B) |
 
@@ -84,6 +84,8 @@ All on the prod-equivalent Serbia tiles, corpus-v2 (552 requests, K = 12), engin
 **d** (13:51–14:01Z, `p2-1-d/`; c at `eval_total` 1 200 / `relax_eval_cap` 150 + `rescue_last`; the `engine` note in its `report.json` was written before the re-base on c and says "a2" — the config file and the ledger are the record): T2 **0.4443 / 24.3 %** (1.133× / +9.9 pp, FAIL — the best served *mean* of the session, 0.013 above the bar, with the most near-dups of the leg + whole-pair variants; block A 0.4212 / 28.0 %, block B 0.4549 / 22.7 %; c0.5 0.4538 / 27.0 %, c0.7 0.4524 / 23.6 %, c1.0 0.4258 / 21.0 %); fills 552/552, failures 0; wall p50 **1.407 s** (1.21× bracket A), p95 4.26 s; engine-stage total 1 000 ms (eval **112 ms** mean, max 680 — the budget cut took 64 ms off c's evaluation and the wall p50 moved 10 ms: the leg variants' latency floor is not the walk); evaluations 1 172 per request (the budget), `leg_share` 241, whole-pair `share` 564, chosen 5.24, pair-built 8.87 + rescue loops **3.43** per request (340 requests), relaxed loops 1.95; `rescue_last` moved the rescue loops off the served surface — slots 0–1 are 94 % pair-built (c: 67–70 %), and the relaxed loops that were behind them now show in slots 2–5 (4.7–10.9 %); memory max 1.56 GiB.
 
 **Bracket B** (14:04–14:12Z, `census-v2-p21-baseB/`): wall p50 **1.139 s**, p95 3.174 s, fills 550/552, failures 0, engine-stage total 809 ms mean / 715.5 ms p50, attempts 12.56; meters byte-identical to bracket A (0 of 6 621 loops differ). The two brackets sit 2.3 % apart (1.165 / 1.139 s); T3 is read against their pooled p50 (§6).
+
+**b2** (14:21–14:32Z, `p2-1-b2/`; d + the diversity term, `roundtrip_pair_diversity_w` 2.0 — survivors of a sector's shortlist ordered by `score / (1 + 2·s)`, `s` = the whole-pair twins-aware sharing with the pairs already chosen; the seed rotation over the ordered survivors unchanged): T2 **0.4448 / 24.6 %** (1.134× / +10.2 pp) against d's 0.4443 / 24.3 %; fills 552/552, failures 0, spikes 0; wall p50 **1.405 s** (1.22× pooled; d 1.407 s), p95 4.48 s; engine-stage 1 009 ms mean / 817.5 ms p50 (d 1 000 / 816); curviness 298.6 / 245.5 / 253.2 (d 298.6 / 245.8 / 253.8). **6 373 of 6 624 loops are byte-identical to d's** by (request, slot, length). The term is inert, as §1 predicted: it only re-orders the survivors of one sector, and the seed rotation picks among them regardless of the order; ledger `div_w=2.0`, `share` 562 / `leg_share` 239 per request (d 565 / 241). Ticket lever (2) is measured and closed.
 
 ### 3.1 Why the matrix changed mid-session
 
@@ -205,6 +207,7 @@ Served-surface T2 against wall p50 (× the pooled brackets A + B, 1.153 s; T4 ×
 | a2 | leg 0.5 laddered + whole-pair 0.6 vs built, total 2 000 | 1 880 | 0.4657 / **21.7 %** | 1.34× | 1.28× |
 | c | a2 at 0.35 | 1 908 | **0.4521 / 22.4 %** | 1.23× | 1.14× |
 | d | c at 1 200 total + rescue-built last | 1 172 | **0.4443** / 24.3 % | **1.22×** | 1.14× |
+| b2 | d + diversity term 2.0 | 1 172 | 0.4448 / 24.6 % | 1.22× | 1.16× |
 | **bars** | | | **≤ 0.4315 / ≤ 19.4 %** | **≤ 1.10×** | **≤ 1.30×** |
 
 **Verdict.** Distinctness at selection moves T2 a long way — from 1.50× / +36 pp (P2) to 1.13× / +9.9 pp (d) or 1.15× / +8 pp (c) — and it does so with R1–R5, T1, T4, T5 and T6 intact, no spikes, full fills and a bounded memory footprint. It does not reach T2, and every point that gets close costs 1.22–1.34× at the median (T3 bar 1.10×; P2 itself 0.96×), a floor that the evaluation budget does not move (d: evaluation back at P2's cost, median still 1.22×). Two structural reasons, both visible in the ledgers: (1) the Served Surface is judged against the *whole* bank, so the relaxation ladder that keeps R4 at 552/552 fills slots 6–11 with loops that T2 then charges to slots 0–5 — the whole-pair test against the built bank (a2 vs a1) is what caps that, and it already sits at T2's own 0.6; (2) the forward-distinct sinks are the less-connected ones — more rescue builds (3.0 per request against P2's 0.9), more geometry-gate fires, and a selection walk that spends its whole budget finding 5.6–7 strict candidates per request — so part of the latency is the price of distinct sinks, not of the walk.
@@ -214,6 +217,17 @@ Served-surface T2 against wall p50 (× the pooled brackets A + B, 1.153 s; T4 ×
 ## 9. Open questions
 
 1. **What T2 measures.** `max_pair_overlap` is each served loop against all twelve; with a ladder for fills, slots 6–11 are by construction the loops that failed the strict test, and §5.2 measured that 48 % of c's and d's near-dups have their best sibling there (prod: 20 %). A served-vs-served read of the meter (slots 0–5 against 0–5) is a five-line change in `metrics.py` and was not computed here. ADR question.
+   **Measured after the session (14:40Z, `~/.curvagen-scratch/p21/served_vs_served.py` — each served loop against the other served loops of its bank only, slots 0–5 vs 0–5, the same exemption-discounted overlap):**
+
+   | run | T2 as written (vs the whole bank) | served-vs-served (0–5 vs 0–5) | vs prod on that read | near-dups whose best sibling is in slots 6–11 |
+   |---|---|---|---|---|
+   | prod (X) | 0.3923 / 14.4 % | **0.3171 / 11.6 %** | — | 20 % |
+   | P2 + xcand | 0.5879 / 50.4 % | 0.5524 / 45.5 % | 1.74× / +33.9 pp | 17 % |
+   | c | 0.4521 / 22.4 % | 0.3512 / 12.2 % | 1.107× / +0.6 pp | 48 % |
+   | **d** | 0.4443 / 24.3 % | **0.3370 / 13.8 %** | **1.063× / +2.2 pp** | 48 % |
+   | b2 | 0.4448 / 24.6 % | 0.3383 / 13.8 % | 1.067× / +2.2 pp | 49 % |
+
+   Among the loops the rider is served, d sits inside the ratchet's shape (≤ 1.10× and ≤ +5 pp) and c on its edge; P2 fails on either read; the T3 miss stands on both. Which read Gate v2 means is the ADR's call, not this prototype's — the front is the input.
 2. **The return repair is the residual** (§5.1): the served returns are built after selection and the selection-time tests judge Suurballe's second path instead. The levers are P1.1's: a stronger xcand surcharge on the repairs for the pair mode, or the ADR-0040 built-loop filter applied to repairs only — both measured expensive before, neither measured on top of P2.1.
 3. **The whole-pair test against the built bank rejects 865–893 candidates per request** and is what sends 3 slots per request to the rescue builder. A test that keys on the *forward leg + the pair's return* but tolerates the repaired return's sharing (the xcand penalty already pushes repairs off shared corridors) might keep the pair-built share up; unmeasured.
 4. **Budget vs threshold.** Only two budgets (2 000; d's 1 200) and two thresholds (0.5, 0.35) were run at the correct semantics; the front is coarse. The evaluation cost per candidate (~95–130 µs, tile lookups in the arc walk) is the constant to attack if the mechanism is kept — caching canonical ids on the pass's arcs (built once per request) would remove the tile lookups from the walk.
@@ -251,12 +265,13 @@ python3 ~/.curvagen-scratch/p21/leg_overlap_served.py ... ; python3 ~/.curvagen-
 
 | Path | What |
 |---|---|
-| `tools/loopqual/results/p2-1-{v0,v0b,a0,a1,a2,c,d}/` | the runs (552 responses each except v0; `loops.jsonl`, `report.{json,md}`); `p2-1-<best>/compare/`, `gallery-p2-1-*.html` |
+| `tools/loopqual/results/p2-1-{v0,v0b,a0,a1,a2,c,d,b2}/` | the runs (552 responses each except v0; `loops.jsonl`, `report.{json,md}`); `p2-1-<best>/compare/`, `gallery-p2-1-*.html` |
 | `tools/loopqual/results/census-v2-p21-base{A,B}/` | the session's baseline brackets (meters byte-identical to `census-v2-p2-baseX`) |
-| `~/.curvagen-scratch/p2/eng-p21{baseA,baseB,v0,v0b,a0,a1,a2,c,d}.log` | engine ledgers (`pair-select` with the appended fields, `pair-leg`, the P1.1 lines) |
+| `~/.curvagen-scratch/p2/eng-p21{baseA,baseB,v0,v0b,a0,a1,a2,c,d,b2}.log` | engine ledgers (`pair-select` with the appended fields, `pair-leg`, the P1.1 lines) |
 | `~/.curvagen-scratch/p21/` | drivers (`p21-run.sh`, `p21-next.sh`, `p21-rebuild-then-*.sh`), per-run logs + memory watch (`watch-*.log`), readings (`read-*.txt`, `gate-*.txt`, `final.txt`), the patch script, the readers (`served_surface.py`, `gate_v2_read.py`, `leg_overlap_served.py`, `t2_anatomy.py`, `p21_ledger.py`, `same_meters.py`, `p21_gallery.py`), the ticket comments |
 | `~/.curvagen-scratch/{p21a0,p21a1,p21a2,p21c,p21d,p2v2x,p21bx}*.jsonl` | detector output (switchback-aware D1b) for the P2.1 runs and, for the first time, the prod-condition P2 and baseline runs |
 | `~/.curvagen-scratch/p21/gurka-p21-audit.log`, `gurka-p21-others.log`, `build-p21-*.log` | the 51-green run and the builds |
+| `~/.curvagen-scratch/p21/served_vs_served.py`, `served_surface.py`, `gate_v2_read.py`, `leg_overlap_served.py` | the T2 readers: served-vs-served (§9 Q1), the pinned served-surface read, the Gate v2 table, the per-leg split |
 
 Containers `rt-p1-build` (:8003) and `rt-p11-base` (:8004) are left running with their engines stopped; `valhalla-local` (:8002) and the :8791 results server were never addressed.
 
