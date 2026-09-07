@@ -87,24 +87,24 @@ a0 (the first cut) put T2 within 1.6 pp of the near-dup bar and 0.05 off the mea
 
 Read by `gate_v2_read.py` (served surface = blocks A + B, slots 0–5; R1 = D1 `am10_max_run_m ≥ 500` ∨ D4 `reuse_disc_m ≥ 500` ∨ D1L `am25_max_run_m ≥ 1500` on the switchback-aware detector output; the reader reproduces ADR-0041's R1 43.9 / 2.4 / 3.8 %, T6 and T1). Bars: T1 per level vs the census run `census-v2-b4f514d7f` (`curviness_geom_clean`, whole corpus); T3 vs the pooled brackets A + B (until B lands: bracket A 1.165 s); T4 on A + B vs prod's A + B p95 (bracket X 2.977 s, bracket A 3.337 s — the pooled figure is used when B lands); T5 reported on both surfaces (§4.1). Columns: census (`cen`), prod condition (`prodX`, = brackets A/B byte-for-byte), P2 + xcand (`p2x`, the same detector read for the first time), the P2.1 runs.
 
-| tier | bar | cen | prodX | p2x | a0 | v0b | a1 | a2 | c |
-|---|---|---|---|---|---|---|---|---|---|
-| R1 Retrace family, served | ≤ 5 % | 43.9 | 43.8 | 2.8 | **3.0** ✓ | n/a | | | |
-| R2 `spike_ge_500m` | 0 | 0 | 0 | 0 | **0** ✓ | 0 ✓ | | | |
-| R3 dist err c0.5 / c0.7 / c1.0 mean (p90) | ≤ 0.22 (0.42) / 0.32 (0.65) / 0.32 (0.65) | .169/.108/.134 | .139/.109/.134 | .134/.104/.109 | **.155/.115/.119** (p90 .27/.20/.20) ✓ | .136/.108/.108 ✓ | | | |
-| R4 fills 12/12 | 552 | 550 | 550 | 552 | **552** ✓ | 552 ✓ | | | |
-| R5 failures | 0 | 0 | 0 | 0 | **0** ✓ | 0 ✓ | | | |
-| T1 curviness c0.5 / c0.7 / c1.0 (all, ×census) | ≥ 0.95× | 1 | 1.01/1.01/1.00 | 1.06/1.28/1.21 | **1.04/1.24/1.11** ✓ | 1.04/1.24/1.12 ✓ | | | |
-| **T2** served mean / near_dup > 0.6 | ≤ 0.4315 / ≤ 19.4 % | .4412/23.8 | .3923/14.4 | .5879/50.4 | **.4829/21.0** ✗ (1.231×/+6.6 pp) | .5508/42.0 ✗ | | | |
-| T3 wall p50 (× bracket A 1.165 s) | ≤ 1.10× | 1.305 | 1.189 | 1.486† | **1.700 = 1.46×** ✗ | 1.567 = 1.35× ✗ | | | |
-| T4 wall p95 A+B (× prod 2.98–3.34 s) | ≤ 1.30× | 3.50 | 2.977 | 5.459† | **7.72 = 2.3×** ✗ | 4.42 = 1.3–1.5× ✗ | | | |
-| T5 near-mirror mean m, A+B served (bar 1 198 = 0.25 × 4 792) | ≤ 1 198 | 4 792 | 4 861 | 29 | **44** ✓ | n/a | | | |
-| T5 on the ADR surface, all blocks s0–2 (bar 865 = 0.25 × 3 462) | ≤ 865 | 3 462 | 3 359 | 41 | **51** ✓ | n/a | | | |
-| T6 deep-bank Retrace family | ≤ 53 % | 53.0 | 51.1 | 2.7 | **1.6** ✓ | n/a | | | |
-| C1 `spike_ge_30m` · C2 `edge_reuse_geom` served | report | 0 · .021 | 0 · .021 | 0 · 0 | 0 · 0 | 0 · 0 | | | |
-| A4 D1b ≥ 500 m served | advisory | 55.1 | 56.7 | 3.1 | 4.7 | n/a | | | |
+| tier | bar | cen | prod (X ≡ A ≡ B) | P2 + xcand | v0b | a0 | a1 | a2 | c | d |
+|---|---|---|---|---|---|---|---|---|---|---|
+| R1 Retrace family, served | ≤ 5 % | 43.9 | 43.8 | 2.8 | n/a | 3.0 ✓ | 2.4 ✓ | 1.9 ✓ | 2.2 ✓ | **2.0 ✓** |
+| R2 `spike_ge_500m` | 0 | 0 | 0 | 0 | 0 ✓ | 0 ✓ | 0 ✓ | 0 ✓ | 0 ✓ | **0 ✓** |
+| R3 dist err mean c0.5 / c0.7 / c1.0 | ≤ .22 / .32 / .32 | .169/.108/.134 | .139/.109/.134 | .134/.104/.109 | .136/.108/.108 ✓ | .155/.115/.119 ✓ | .142/.107/.138 ✓ | .164/.117/.130 ✓ | ✓ | ✓ |
+| R4 fills 12/12 | 552 | 550 | 550 | 552 | 552 ✓ | 552 ✓ | 552 ✓ | 552 ✓ | 552 ✓ | **552 ✓** |
+| R5 failures | 0 | 0 | 0 | 0 | 0 ✓ | 0 ✓ | 0 ✓ | 0 ✓ | 0 ✓ | **0 ✓** |
+| T1 curviness c0.5 / c0.7 / c1.0 (all, × census) | ≥ 0.95× | 1 | 1.01/1.01/1.00 | 1.06/1.28/1.21 | 1.04/1.24/1.12 ✓ | 1.04/1.24/1.11 ✓ | 1.06/1.29/1.16 ✓ | 1.05/1.24/1.11 ✓ | 1.05/1.24/1.10 ✓ | **1.04/1.19/1.09 ✓** |
+| **T2** served mean / near_dup > 0.6 | ≤ 0.4315 / ≤ 19.4 % | .4412/23.8 | .3923/14.4 | .5879/50.4 | .5508/42.0 ✗ | .4829/21.0 ✗ | .4937/29.1 ✗ | .4657/21.7 ✗ | .4521/22.4 ✗ | **.4443/24.3 ✗** (1.133× / +9.9 pp) |
+| T3 wall p50 (× pooled A+B 1.153 s) | ≤ 1.10× | 1.305 | 1.189 (X) | 1.102 = 0.96× | 1.567 = 1.36× ✗ | 1.700 = 1.47× ✗ | 1.416 = 1.23× ✗ | 1.546 = 1.34× ✗ | 1.417 = 1.23× ✗ | **1.407 = 1.22× ✗** |
+| T4 wall p95 A+B (× pooled 2.993 s) | ≤ 1.30× | 3.50 | 2.977 (X) | 3.559 = 1.19× | 4.418 = 1.48× ✗ | 7.723 = 2.58× ✗ | 3.339 = 1.12× ✓ | 3.834 = 1.28× ✓ | 3.419 = 1.14× ✓ | **3.421 = 1.14× ✓** |
+| T5 near-mirror mean m, A+B served (bar 1 198 = 0.25 × 4 792) | ≤ 1 198 | 4 792 | 4 861 | 29 | n/a | 44 ✓ | 39 ✓ | 47 ✓ | 45 ✓ | **36 ✓** |
+| T5 on the ADR surface, all blocks s0–2 (bar 865 = 0.25 × 3 462) | ≤ 865 | 3 462 | 3 359 | 41 | n/a | 51 ✓ | 43 ✓ | ✓ | ✓ | ✓ |
+| T6 deep-bank Retrace family | ≤ 53 % | 53.0 | 51.1 | 2.7 | n/a | 1.6 ✓ | 3.5 ✓ | 4.2 ✓ | 3.6 ✓ | **2.6 ✓** |
+| C1 `spike_ge_30m` · C2 `edge_reuse_geom` served | report | 0 · .021 | 0 · .021 | 0 · 0 | 0 · 0 | 0 · 0 | 0 · 0 | 0 · 0 | 0 · 0 | 0 · 0 |
+| A4 D1b ≥ 500 m served | advisory | 55.1 | 56.7 | 3.1 | n/a | 4.7 | 4.4 | 5.2 | 5.2 | 4.3 |
 
-† the P2-session `p2-v2-xcand` run overlapped detector passes; its latency is not a reading (P2 §7.8 re-measured it uncontended at 1.102 s / 4.05 s).
+**Every P2.1 variant holds R1–R5, T1, T4, T5 and T6; none holds T2, and none holds T3** — the leg variants' median sits at 1.22–1.34× the pooled brackets, the mechanism's latency floor (§6). The P2 + xcand latency row is the uncontended re-run of P2 §7.8 (`p2-v2-xcand-uncontended`); the contended `p2-v2-xcand` run (1.486 s / 5.459 s) is not a reading.
 
 ### 4.1 The T5 erratum
 
@@ -116,7 +116,20 @@ _(per-leg split, per block / level / slot, relaxation and rescue counts, where n
 
 ## 6. Latency
 
-_(brackets, stage anatomy, per-ask if the tail moved.)_
+Same-session brackets A (12:23Z, before the variants) and B (14:04Z, after): **1.165 s / 1.139 s** wall p50 (2.3 % apart), A+B-block p95 2.922 / 3.174 s; pooled over both (1 104 requests): **p50 1.153 s, p95 3.225 s, A+B p95 2.993 s**. Per-request wall from each response's `meta.latency_s` (`pool_lat.py`); engine stages from the ledger (`stage_total_p2.py`, means ms; the pair pass and the pair evaluation are included in the total).
+
+| run | wall p50 | wall p95 | p95 A+B | **T3** | **T4** | engine total (p50) | attempts | astar | astar_fb | pairs | eval |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| pooled brackets A+B | 1.153 s | 3.225 s | 2.993 s | 1.00× | 1.00× | 824 / 809 (710 / 716) | 12.56 | 531 / 519 | 168 / 164 | — | — |
+| P2 + xcand, uncontended | 1.102 s | 4.053 s | 3.559 s | **0.956×** | 1.19× | 850 (637) | 13.06 | 387 | 41 | 185 | 102 |
+| v0b | 1.567 s | 5.149 s | 4.418 s | 1.36× | 1.48× | 1 165 (911) | 13.00 | 433 | 51 | 202 | 331 |
+| a0 | 1.700 s | 10.055 s | 7.723 s | 1.47× | 2.58× | 1 442 (953) | 12.84 | 424 | 53 | 187 | 639 |
+| a1 | 1.416 s | 5.691 s | 3.339 s | 1.23× | 1.12× | 1 205 (889) | 12.14 | 516 | 75 | 231 | 212 |
+| a2 | 1.546 s | 4.711 s | 3.834 s | 1.34× | 1.28× | 1 058 (887) | 11.76 | 471 | 71 | 197 | 177 |
+| c | 1.417 s | 4.360 s | 3.419 s | 1.23× | 1.14× | 991 (829) | 11.62 | 441 | 61 | 183 | 170 |
+| **d** | **1.407 s** | 4.256 s | 3.421 s | **1.22×** | **1.14×** | 1 000 (816) | 11.19 | 489 | 68 | 194 | 107 |
+
+**Anatomy.** Against P2 + xcand (0.956×), the leg variants add 0.3 s at the median from three places: (1) the **evaluation walk** — 2 000 evaluations cost 170–212 ms against P2's 102 at 600; the budget cut to 1 200 (d) takes it to 107 ms, i.e. back to P2's level; (2) **the return builds** — `astar` 441–516 ms against P2's 387 and `astar_fb` 61–75 against 41: the forward-distinct sinks are the less-connected ones, so more returns need the full P1.1 repair and more go to the rescue builder (3.0–3.4 rescue loops per request against P2's 0.9; requests with a geometry-gate reject 186 in a2 against 73); (3) the pair pass itself is unchanged (183–231 ms). d shows the floor: with the evaluation cost back at P2's level the median is still 1.22× — **the remaining cost is the price of building the distinct sinks' returns, not of finding them.** The tail behaves: T4 passes for every leg variant (1.12–1.28×), and the a0 outlier (2.58×) was the unbounded per-rung budget — the per-request total removed it. Memory: 1.6–2.4 GiB peak per container across the variants (v0: OOM at 5.8 GiB).
 
 ## 7. What did not work
 
