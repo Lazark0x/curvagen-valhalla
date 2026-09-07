@@ -1,0 +1,83 @@
+# P2.1 — distinctness at selection: the per-leg sharing threshold on the pair's forward leg
+
+- **Date:** 2026-09-07 (curvagen-valhalla [#14](https://github.com/Lazark0x/curvagen-valhalla/issues/14), P2.1 of the round-trip v4 ladder [#4](https://github.com/Lazark0x/curvagen-valhalla/issues/4); Gate v2 = [ADR-0041](../adr/0041-roundtrip-v4-loop-quality-gate-v2.md))
+- **Scope:** a **throwaway prototype** on branch `proto/v4-p2.1`, cut from `proto/v4-p2` @ `4402a2604` (the measured P2 binary `83837debc` plus its docs). One question: can the pair pass's bank be made distinct **at selection** — before any search, where the pass already holds every candidate's pair — so that P2 meets Gate v2's served-surface distinctness ratchet (**T2**) while keeping what P2 won (R1–R5, T1, T3–T5). Nothing pushed; no production traffic; `valhalla-local` (:8002) and the :8791 results server never addressed.
+- **Method:** P2 §7's paired protocol on corpus-v2 (552 requests, K = 12, engine mode, 3 workers, way pass on), **both engines at the production configuration** (`roundtrip_xcand_penalty` 0.2 cap 4): baseline `b4f514d7f` on :8004 (`rt-p11-base`), P2.1 on :8003 (`rt-p1-build`), one engine at a time, same-session baseline brackets A and B around the variants. Readings: `served_surface.py` (T2, reproduces ADR-0041's prod / knee / P2 = 0.3923 / 14.4 %, 0.4475 / 22.0 %, 0.5879 / 50.4 %), `gate_v2_read.py` (every tier; reproduces the ADR's R1 43.9 / 2.4 / 3.8 %, T6, T1), the switchback-aware detector pass (`p2-analyse-all.sh`), `leg_overlap_served.py` (per-leg anatomy), the engine's own ledger.
+- **Session note:** built and measured by an AFK agent 2026-09-07; this document was written incrementally as each run landed (the P2 session's lesson).
+
+## TL;DR verdict
+
+_(filled when the primary reading lands — see §4.)_
+
+## 1. The mechanism
+
+P2's diagnosis (its §7.8, §12): the pair-keyed K × K filter is nearly inert (0.018) because it judges the *pair* while the rider gets the *repair*, and because its 0.6 threshold is on the whole pair — a forward trunk shared over 60 % of the forward leg is ~30 % of a loop. On the Served Surface (blocks A + B, slots 0–5, prod config) P2's excess sits on **both** legs: best-sibling overlap 0.588 = forward 0.342 + return 0.246 against prod's 0.392 = 0.242 + 0.151; the forward share of the forward leg is 0.68 (> 0.5 on 81.9 % of served loops) against prod's 0.48, the return share of the return leg 0.49 against 0.30 (`leg_overlap_served.py`, this session). The working hypothesis: sinks clustered on the same trunk also share the way home, so thinning forward trunks at selection pulls the returns along.
+
+Everything below sits in `src/thor/route_action.cc` on top of P2, all behind knobs that default **off** (the P2 behaviour is byte-identical when unset; the P2.1 configs turn them on):
+
+| knob (`thor.`) | default | what it does |
+|---|---|---|
+| `roundtrip_pair_leg_sharing` | false | the **per-leg threshold at selection**. `PairKeys` gains `fwd_ridden` (canonical road id → metres beyond the Start Exemption on the TREE path, which *is* the served forward leg; the 2.5 % orientation swaps ride the other path out and are ignored) and `fwd_total` (the tree path's length). `fwd_shared_fraction(cand, prev)` = Σ metres of `cand.fwd_ridden` whose key is among `prev.ridden` or `prev.twins`, over `cand.fwd_total`. A candidate is refused when that fraction `>` the threshold against ANY entry of the bank being tested: at the sector shortlist and the backfill against `pair_selected_keys`, at dequeue (and inside `attempt_pair_build`) against `pair_built_keys`. Ledger `leg_share=`. |
+| `roundtrip_pair_leg_sharing_frac` | 0.5 | the threshold, as a fraction of the forward leg (0.5 = variants a/b, 0.35 = variant c). |
+| `roundtrip_pair_built_keys` | false | **built-loop keys**: at the commit site the bank entry is keyed on the BUILT loop via `loop_keylen(*built)` — both legs as served, twins as `twins` — for EVERY committed loop (rescue-built too), not `pair_cache[cand].keys`. Later candidates are then tested against the returns actually served. |
+| `roundtrip_pair_diversity_w` | 0 | the **diversity term** in the sector pick: survivors are ordered by `score / (1 + w · s)`, `s` = max over `pair_selected_keys` of the whole-pair twins-aware `shared_fraction`; the seed rotation over the ordered survivors is unchanged (it bounds the term: the term orders, the seed still picks among the survivors). |
+| `roundtrip_pair_leg_relax` | false | the **relaxation ladder** for the fills bar: after the main `build_loop()` and before the twin last resort / rescue pass, if `loops.size() < want`, the queue is re-walked (`qi = 0`) at `frac + 0.15`, then `frac + 0.30`, then with the leg test off — stopping when full. Loops admitted under a rung carry `Loop.relaxed` (1–3). Builds spend attempts like any other; the ladder is granted the missing count + `kAttemptSlack` once (the rescue pass is granted `want` + slack). The whole-pair filter stays on at every rung — rung 3 *is* P2's selection contract inside a budget. Ledger `leg_relaxed=` (loops), `leg_relax_rung=` (highest rung used). |
+| `roundtrip_pair_relaxed_last` | false | ranking: within a tier, non-relaxed before relaxed, then score. |
+| `roundtrip_pair_eval_cap` (P2 knob, re-purposed in leg mode) | 600 | **the per-rung evaluation budget.** In P2 the cap *dropped the filter* past N evaluations and the walk went on. In leg mode it bounds the WALK: fresh pair evaluations per rung (selection + backfill + main walk = rung 0; each relaxation rung its own), and a rung whose budget is spent ends its walk (`underfill=evalcap`) and hands the queue to the next rung. Cached verdicts are free on a re-walk. Set to **3 000** in every P2.1 config (≈ 2× P2's mean of 1 710). Ledger `rung_evals=e0/e1/e2/e3`. |
+
+Two things the v0 run forced (§7): rejected evaluations are **memory-light** — a `no_pair` / `band` / `fwd_illegal` / `twin` verdict keeps `checked / ok / reject` and releases the arc paths and the key containers (`release_eval`); accepted candidates keep their record. The ledger carries a coarse memory guard: `cache=` (evaluations cached) and `keys_held=` (entries still holding keys). A second ledger line, `roundtrip pair-leg: req=<lat>_<lon>_<target>_<seed>_<curv>_<hw> slots=<slot>:<rung>/<pair_built>/<tier> …`, gives the per-slot provenance keyed by request so it can be joined to the response (three workers interleave the ledger). Every new pair-select field is **appended** after `bad_ret_edge=`; the P2 parsers (`p2_ledger.py`, `ledger_agg.py`, `stage_total_p2.py`) read the prefix and still run on the new ledger (§Appendix A).
+
+## 2. Gurka — 51 green
+
+`gurka_roundtrip_audit` **26/26** (4.6 s) · `gurka_motorcycle_roundtrip` **22/22** · `gurka_roundtrip_distinctness` **3/3** on the P2.1 binary (`~/.curvagen-scratch/p21/gurka-p21-audit.log`, `gurka-p21-others.log`); the 49 P2 tests unchanged (every new knob is off by default).
+
+**The comb map** (`RtP21Comb`, `test/gurka/test_roundtrip_audit.cc`): two trunk roads leave the start S, each carrying two curvy lobes at the band distance, every lobe with its own long straight road home through an exempt stem — trunk 1 `S-M-J` (M inside the Start Exemption, M-J 3.01 km, curvature 8), lobes `J-A` / `J-B` (0.8 km, curvature 15), returns `A-Q-S` / `B-Q-S`; trunk 2 the mirror image with lobes at curvature 6. Target 11.5 km. The geometry is chosen so that the lobes' forward legs (5.25 / 5.32 km) are in the band, the trunk-only sinks J / K (4.46 km) and the *outward* arrivals along the return roads (7.27 / 7.52 km) are out of it — the first cut of the map had those in band, and the lobe candidates inherited the straight chain's curviness from the first label seen at the junction (P2's `pair_adopt` re-hangs the label, not the score), which put the trunk-only sinks first and made the control land on different trunks by accident. The trunk beyond the exemption is **57 % of the second lobe's forward leg but 23 % of its loop**: P2's whole-pair 0.6 cliff keeps both trunk-1 lobes, the per-leg threshold at 0.5 refuses the second one, and the ladder's first rung (0.65) admits it while the trunk-only sinks (67 %) stay refused.
+
+| test | pins | result |
+|---|---|---|
+| `RtP21Comb.P2e_ForwardLegsLeaveOnDifferentTrunks` | **control** (P2, leg sharing off, K = 2): slots 0–1 = `S-M-J-A` and `S-M-J-B` — both on trunk 1 (asserted, so the pin is non-vacuous); **treatment** (per-leg 0.5): slot 0 `S-M-J-A`, slot 1 `S-N-K-C` — the second slot leaves on the other trunk, refused at selection before any search | PASS |
+| `RtP21Comb.P2f_RelaxationFillsTheBankAndRanksLast` | K = 4 against a forward-distinct supply of 2 with the ladder on: the bank fills 4/4; the engine's own counters read `leg_share=6 leg_relaxed=2 rung=1` and the per-slot line `0:0/1/0 1:0/1/0 2:1/1/0 3:1/1/0` (rung / pair-built / tier) — slots 0–1 are the two strict loops on different trunks (A, then D — the seed rotation's pick in sector 1), slots 2–3 the rung-1 loops (B, C); **control** with `relaxed_last` off: the score order puts both trunk-1 lobes into slots 0–1 | PASS |
+
+One harness finding on the way: nothing under `gurka::do_action` can re-point the logger — `midgard::logging::GetLogger` is a one-shot static, initialised as the null logger by `buildtiles` — so P2b's `std_err` setting never printed anything, and P2f reads the engine's `ROUNDTRIP_DEBUG` stderr mirror (which now also echoes the per-slot line) instead of the ledger.
+
+## 3. The runs
+
+_(table filled as runs land.)_
+
+## 4. Gate v2 — all tiers, all runs
+
+_(filled as runs land; T2 first.)_
+
+## 5. T2 anatomy
+
+_(per-leg split, per block / level / slot, relaxation and rescue counts, where near-dups remain.)_
+
+## 6. Latency
+
+_(brackets, stage anatomy, per-ask if the tail moved.)_
+
+## 7. What did not work
+
+### 7.1 v0 — the uncapped whole-pair filter (config only, the P2 binary)
+
+Variant v0 (`v8003-p21-v0.json`: the P2 binary `83837debc`, xcand 0.2, `roundtrip_pair_eval_cap` 1 000 000, `roundtrip_sharing_frac` 0.4) answered **15 requests** and was **OOM-killed** at the first 200 km Belgrade asks (`rt-p1-build` `OOMKilled=true`; the remaining 537 requests read status 0 in ~1 ms; the Docker VM's 5.77 GiB is shared by both containers, 3 workers). The last completed 200 km request's ledger (`~/.curvagen-scratch/p2/eng-p21v0.log`, request 17): `pair-select: considered=44906 no_pair=11977 band=15456 twin=1234 share=19689 chosen=9; built=8` on a harvest of 617 684 labels / 285 753 junctions. With the sharing test never dropped and a strict threshold, the sector shortlist filled only 9 sectors, and the backfill and the refill queue walked essentially the whole band — 44 906 pair evaluations for one request against P2's mean of 1 710 (p50 730) — every one cached as a full `PairEval` (two arc vectors, a `PairKeys` with an `unordered_map` of ~300 roads and a twin set): three concurrent 200 km requests blew the memory, and the latency would have been seconds per request as well. **The uncapped K × K filter is not a usable variant as-is**; `results/p2-1-v0/` is kept as evidence and not measured. The consequences are built into P2.1: the per-rung evaluation budget and the memory-light rejects of §1; v0 is re-run bounded on the new binary as **v0b** (`roundtrip_pair_eval_cap` 3 000, `roundtrip_sharing_frac` 0.4, new knobs off) — "what does P2's whole-pair filter buy inside a budget".
+
+## 8. Pareto front / recommendation for the v4 build
+
+_(filled at the end.)_
+
+## 9. Open questions
+
+_(filled at the end.)_
+
+## Appendix A — commands
+
+_(filled at the end.)_
+
+## Appendix B — artefacts
+
+_(filled at the end.)_
+
+## Appendix C — the branch
+
+_(filled at the end.)_
