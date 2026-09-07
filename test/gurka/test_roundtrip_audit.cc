@@ -22,16 +22,17 @@
 
 #include "baldr/graphreader.h"
 #include "gurka.h"
-#include "midgard/logging.h"
-#include "thor/road_twin_index.h"
 #include "midgard/encoded.h"
+#include "midgard/logging.h"
 #include "midgard/pointll.h"
 #include "test.h"
+#include "thor/road_twin_index.h"
 
 #include <boost/format.hpp>
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <set>
 #include <string>
@@ -2629,4 +2630,232 @@ TEST_F(RtP2Grid, P2d_DistinctSinksInsideTheBand) {
         EXPECT_EQ(f.count(w), 0u) << "slot " << r << " rides " << w << " both ways";
   }
   EXPECT_GE(in_band, 3) << "fewer than three loops inside the distance band";
+}
+
+// ---------------------------------------------------------------------------------
+// P2e / P2f — the COMB (proto/v4-p2.1, curvagen-valhalla#14): distinctness AT SELECTION.
+//
+// Two trunk roads leave the start S, each carrying two curvy lobes at the band distance,
+// and every lobe has its own long straight road home that reaches S through an exempt stem:
+//
+//   trunk 1  S-M-J   (M 1.46 km from S, inside the Start Exemption; M-J 3.01 km, curv 8)
+//            lobes J-A (0.78 km), J-B (0.85 km), curvature 15; returns A-Q-S (5.86 km) and
+//            B-Q-S (6.10 km), Q 1.41 km north-west of S, inside the exemption
+//   trunk 2  S-N-K, lobes K-C, K-D (curvature 6), returns C-R-S, D-R-S — the mirror image.
+//
+// Target 11.5 km (band 4.72-6.79 km): the lobes' forward legs are 5.25 / 5.32 km (in), the
+// trunk-only sinks J / K 4.46 km (out), and riding a return road OUTWARD reaches a lobe at
+// 7.27 / 7.52 km (out) — so every lobe candidate carries its trunk chain and nothing else
+// in the band ties with it.  Each pair is in band (A 12.5 km, B 12.8 km).  The trunk beyond
+// the exemption is 57 % OF THE SECOND LOBE'S FORWARD LEG but only 23 % OF ITS LOOP, so P2's
+// whole-pair 0.6 cliff keeps both trunk-1 lobes (the control) while the per-leg threshold
+// at 0.5 refuses the second one (P2e); at the ladder's first rung (0.65) it is admitted
+// while J / K (67 % of their leg) still are not (P2f).  Roads meeting at a junction fail the
+// twin index's span test and the two returns of a trunk converge on Q at 9 deg, so nothing
+// reads as a twin or a parallel; no two roads cross.
+// ---------------------------------------------------------------------------------
+class RtP21Comb : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                A
+
+
+
+
+
+                                                           J
+
+      Q
+                                                                   B
+
+
+
+
+                              M
+
+
+
+                S
+
+
+
+                              N
+
+
+
+
+                                                                   D
+      R
+
+                                                           K
+
+
+
+
+
+                                                                C
+
+
+
+)";
+    gurka::ways ways;
+    for (const char* w :
+         {"SM", "MJ", "JA", "JB", "AQ", "BQ", "QS", "SN", "NK", "KC", "KD", "CR", "DR", "RS"})
+      ways.insert({w, {{"highway", "secondary"}}});
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 100);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/rt_p21_comb");
+
+    auto reader = test::make_clean_graphreader(map.config.get_child("mjolnir"));
+    std::map<baldr::GraphId, uint8_t> curv;
+    auto set = [&](const std::string& a, const std::string& b, uint8_t c) {
+      curv[std::get<0>(gurka::findEdgeByNodes(*reader, layout, a, b))] = c;
+      curv[std::get<0>(gurka::findEdgeByNodes(*reader, layout, b, a))] = c;
+    };
+    for (const auto* t : {"SM", "MJ", "SN", "NK"})
+      set(std::string(1, t[0]), std::string(1, t[1]), 8);
+    set("J", "A", 15);
+    set("J", "B", 15);
+    set("K", "C", 6);
+    set("K", "D", 6);
+    test::customize_edges(map.config,
+                          [&curv](const baldr::GraphId& edgeid, baldr::DirectedEdge& edge) {
+                            auto it = curv.find(edgeid);
+                            if (it != curv.end())
+                              edge.set_curvature(it->second);
+                          });
+  }
+  static valhalla::Api
+  run(gurka::map& m, uint32_t k, bool leg_sharing, bool relax, bool relaxed_last) {
+    m.config.put("thor.roundtrip_pair_pass", true);
+    m.config.put("thor.roundtrip_pair_leg_sharing", leg_sharing);
+    m.config.put("thor.roundtrip_pair_leg_sharing_frac", 0.5);
+    m.config.put("thor.roundtrip_pair_built_keys", true);
+    m.config.put("thor.roundtrip_pair_leg_relax", relax);
+    m.config.put("thor.roundtrip_pair_relaxed_last", relaxed_last);
+    return gurka::do_action(valhalla::Options::route, m, {"S", "S"}, "motorcycle",
+                            {{"/roundtrip/target_distance", "11500"},
+                             {"/roundtrip/num_candidates", std::to_string(k)},
+                             {"/costing_options/motorcycle/reuse_penalty", "0.8"},
+                             {"/costing_options/motorcycle/prefer_curvature", "0.5"}});
+  }
+  // The trunk a served loop rides OUT on: 1 (M-J), 2 (N-K), 0 if neither or both.
+  static int fwd_trunk(const valhalla::Api& api, int r) {
+    const auto f = leg_names(api, r, 0);
+    const int t1 = count_name(f, "MJ"), t2 = count_name(f, "NK");
+    return t1 && !t2 ? 1 : (t2 && !t1 ? 2 : 0);
+  }
+  static void dump(const valhalla::Api& api, const char* tag) {
+    for (int r = 0; r < api.trip().routes_size(); ++r)
+      std::cerr << tag << " slot " << r << " legs[0] = " << dump_path(leg_names(api, r, 0))
+                << "| legs[1] = " << dump_path(leg_names(api, r, 1)) << "\n";
+  }
+  // "k=v" on a ledger line, "" when absent.
+  static std::string field(const std::string& line, const std::string& key) {
+    const auto p = line.find(" " + key + "=");
+    if (p == std::string::npos)
+      return "";
+    const auto s = p + key.size() + 2;
+    const auto e = line.find(' ', s);
+    return line.substr(s, e == std::string::npos ? std::string::npos : e - s);
+  }
+};
+gurka::map RtP21Comb::map = {};
+
+TEST_F(RtP21Comb, P2e_ForwardLegsLeaveOnDifferentTrunks) {
+  // CONTROL — P2 (per-leg sharing off): the two curviest lobes hang off trunk 1, the
+  // whole-pair filter sees 23 % shared and passes both, and slots 0-1 leave the start on
+  // the same road.
+  auto ctl = run(map, 2, false, false, false);
+  ASSERT_EQ(ctl.trip().routes_size(), 2) << "control did not fill K = 2";
+  dump(ctl, "[P2e] control");
+  EXPECT_EQ(fwd_trunk(ctl, 0), 1);
+  EXPECT_EQ(fwd_trunk(ctl, 1), 1)
+      << "MAP NOT DISCRIMINATING: the P2 control did not put both served loops on trunk 1";
+
+  // TREATMENT — the per-leg threshold at 0.5: the second lobe of trunk 1 shares 57 % of
+  // its forward leg with the first and is refused at selection, before any search; the
+  // second slot leaves on trunk 2.
+  auto result = run(map, 2, true, false, false);
+  ASSERT_EQ(result.trip().routes_size(), 2) << "P2.1 did not fill K = 2";
+  dump(result, "[P2e] per-leg 0.5");
+  EXPECT_EQ(fwd_trunk(result, 0), 1) << "the curvier trunk's lobe should still lead";
+  EXPECT_EQ(fwd_trunk(result, 1), 2) << "the served forward legs share a trunk";
+}
+
+TEST_F(RtP21Comb, P2f_RelaxationFillsTheBankAndRanksLast) {
+  // The selection ledger.  Nothing under gurka::do_action can re-point the logger (it is a
+  // one-shot static, initialised as the null logger by buildtiles), so the engine's
+  // ROUNDTRIP_DEBUG stderr mirror is read instead: the "[rt-debug] after main loop:" line
+  // (printed after the ladder) carries leg_share / leg_relaxed / rung, and
+  // "[rt-debug] pair-leg:" the per-slot rung / pair-built / tier.
+  auto last_line = [](const std::string& text, const std::string& tag) {
+    std::string out;
+    size_t p = 0;
+    while ((p = text.find(tag, p)) != std::string::npos) {
+      const auto e = text.find('\n', p);
+      out = text.substr(p, e == std::string::npos ? std::string::npos : e - p);
+      p = e == std::string::npos ? text.size() : e;
+    }
+    return out;
+  };
+
+  // TREATMENT — K = 4 against a forward-distinct supply of 2: the main walk builds one
+  // loop per trunk and refuses the rest; the ladder's first rung (0.65) admits the second
+  // lobe of each trunk (57 %) and still refuses the trunk-only sinks (67 %); relaxed loops
+  // rank after the two that met the threshold, so slots 0-1 keep leaving on different
+  // trunks and the relaxed ones sit in slots 2-3.
+  setenv("ROUNDTRIP_DEBUG", "1", 1);
+  testing::internal::CaptureStderr();
+  auto result = run(map, 4, true, true, true);
+  const std::string dbg = testing::internal::GetCapturedStderr();
+  unsetenv("ROUNDTRIP_DEBUG");
+  ASSERT_EQ(result.trip().routes_size(), 4) << "the relaxation ladder did not fill K = 4";
+  dump(result, "[P2f] relax + relaxed_last");
+  EXPECT_EQ(fwd_trunk(result, 0) + fwd_trunk(result, 1), 3)
+      << "slots 0-1 do not leave on different trunks (relaxed loops not ranked last?)";
+  for (int r = 0; r < 4; ++r)
+    EXPECT_NE(fwd_trunk(result, r), 0) << "slot " << r << " rides no trunk out";
+  const std::string select = last_line(dbg, "[rt-debug] after main loop:");
+  const std::string legline = last_line(dbg, "[rt-debug] pair-leg:");
+  ASSERT_FALSE(select.empty()) << "no '[rt-debug] after main loop:' line on stderr";
+  ASSERT_FALSE(legline.empty()) << "no '[rt-debug] pair-leg:' line on stderr";
+  std::cerr << "[P2f] " << select << "\n[P2f] " << legline << "\n";
+  EXPECT_EQ(field(select, "leg_relaxed"), "2") << select;
+  EXPECT_EQ(field(select, "rung"), "1") << select;
+  EXPECT_NE(field(select, "leg_share"), "0") << select;
+  EXPECT_NE(legline.find("slots=0:0/1/0 1:0/1/0 2:1/1/0 3:1/1/0"), std::string::npos)
+      << "per-slot relax rungs / pair-built / tier: " << legline;
+
+  // CONTROL — relaxed_last off: the ranking is by score alone, and trunk 1's second lobe
+  // (curvature 15) outranks trunk 2's first (curvature 6) into slot 1.
+  auto ctl = run(map, 4, true, true, false);
+  ASSERT_EQ(ctl.trip().routes_size(), 4);
+  dump(ctl, "[P2f] control (relaxed_last off)");
+  EXPECT_EQ(fwd_trunk(ctl, 0), 1);
+  EXPECT_EQ(fwd_trunk(ctl, 1), 1) << "CONTROL BROKEN: without relaxed_last the score order "
+                                     "should put both trunk-1 lobes into slots 0-1";
 }

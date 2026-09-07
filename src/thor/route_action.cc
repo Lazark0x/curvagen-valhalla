@@ -1,10 +1,10 @@
 #include "baldr/attributes_controller.h"
 #include "midgard/logging.h"
 #include "proto/common.pb.h"
-#include "thor/route_matcher.h"
 #include "thor/road_twin_index.h"
 #include "thor/roundtrip_expansion.h"
 #include "thor/roundtrip_pairs.h"
+#include "thor/route_matcher.h"
 #include "thor/triplegbuilder.h"
 #include "thor/worker.h"
 
@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <limits>
@@ -1576,6 +1577,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::unordered_map<uint64_t, double> ridden; // canonical id -> metres, beyond the exemption
     std::unordered_set<uint64_t> twins;          // sidecar twins of the ridden edges
     double total = 0;                            // loop metres
+    // proto/v4-p2.1: the FORWARD leg alone — the tree path, which IS the served forward
+    // leg (the 2.5 % orientation swaps ride the other path out; ignored) — canonical id
+    // -> metres beyond the exemption, and the leg's whole length.  What the per-leg
+    // sharing threshold reads.  Empty on a built-loop bank entry (never read there).
+    std::unordered_map<uint64_t, double> fwd_ridden;
+    double fwd_total = 0;
   };
   struct PairEval {
     RoundTripPairPass::Pair pair;
@@ -1604,13 +1611,61 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         shared += len;
     return shared / a.total;
   };
+  // proto/v4-p2.1 (curvagen-valhalla#14): distinctness at selection.
+  const bool leg_mode = roundtrip_pair_leg_sharing;
+  double leg_frac_active = roundtrip_pair_leg_sharing_frac; // raised by the relaxation ladder
+  bool leg_test_off = false;                                // the ladder's last rung
+  uint8_t leg_relax_rung = 0; // rung the build loop runs under (0 = the main walk)
+  uint32_t pair_leg_share_rejects = 0, pair_leg_relaxed = 0;
+  uint8_t pair_leg_relax_rung_used = 0;
+  // In leg mode the evaluation cap is a PER-RUNG budget of fresh pair evaluations (the
+  // v0 lesson: a strict filter that is never dropped walked 45 k candidates on one 200 km
+  // ask, cached every one of them, and was OOM-killed); a rung whose budget is spent hands
+  // the queue to the next rung instead of walking on.
+  uint32_t rung_evals = 0;
+  uint32_t rung_eval_count[4] = {0, 0, 0, 0};
+  auto rung_budget_spent = [&]() { return leg_mode && rung_evals >= roundtrip_pair_eval_cap; };
   auto pair_shares = [&](const PairKeys& k, const std::vector<PairKeys>& bank) -> bool {
-    if (!roundtrip_pair_sharing || pair_sinks_considered > roundtrip_pair_eval_cap)
-      return false; // best effort: past the evaluation cap the near-dup filter is dropped
+    if (!roundtrip_pair_sharing)
+      return false;
+    // P2: best effort — past the evaluation cap the near-dup filter is dropped.  P2.1 leg
+    // mode: the cap bounds the WALK (per rung), never the test.
+    if (!leg_mode && pair_sinks_considered > roundtrip_pair_eval_cap)
+      return false;
     for (const auto& prev : bank)
       if (shared_fraction(k, prev) > roundtrip_sharing_frac)
         return true;
     return false;
+  };
+  // proto/v4-p2.1: the per-leg test — the candidate's forward leg against a bank entry's
+  // roads and their twins, as a fraction of the FORWARD leg.  A shared trunk out of the
+  // start is ~30 % of a loop (invisible to the whole-pair 0.6 cliff) and 50-80 % of the
+  // leg the rider rides out.
+  auto fwd_shared_fraction = [&](const PairKeys& cand, const PairKeys& prev) -> double {
+    if (cand.fwd_total <= 0.0)
+      return 0.0;
+    double shared = 0.0;
+    for (const auto& [k, len] : cand.fwd_ridden)
+      if (prev.ridden.count(k) || prev.twins.count(k))
+        shared += len;
+    return shared / cand.fwd_total;
+  };
+  auto leg_shares = [&](const PairKeys& k, const std::vector<PairKeys>& bank) -> bool {
+    if (!leg_mode || leg_test_off)
+      return false;
+    for (const auto& prev : bank)
+      if (fwd_shared_fraction(k, prev) > leg_frac_active)
+        return true;
+    return false;
+  };
+  // proto/v4-p2.1: a rejected evaluation keeps its verdict and drops its payload — the arc
+  // paths and the key containers are what the v0 cache ran out of memory on.  A twin
+  // reject is re-evaluated from scratch by the last resort (checked = false), so it is
+  // released too.
+  auto release_eval = [](PairEval& pe) {
+    std::vector<uint32_t>().swap(pe.pair.tree);
+    std::vector<uint32_t>().swap(pe.pair.other);
+    pe.keys = PairKeys{};
   };
   auto eval_pair = [&](uint32_t ci) -> PairEval& {
     PairEval& pe = pair_cache[ci];
@@ -1618,6 +1673,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       return pe;
     pe.checked = true;
     ++pair_sinks_considered;
+    ++rung_evals; // proto/v4-p2.1: the rung's budget counts fresh evaluations only
+    ++rung_eval_count[leg_relax_rung];
     const auto t_eval = ledger_clock::now();
     struct EvalTimer {
       double& acc;
@@ -1631,6 +1688,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (!pe.pair.exists) {
       ++pair_none; // Suurballe's existence condition: an edge every route home crosses
       pe.reject = "no_pair";
+      release_eval(pe);
       return pe;
     }
     pe.total_len = pe.pair.tree_len + pe.pair.other_len;
@@ -1656,6 +1714,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
           std::cerr << "\n";
         }
       }
+      release_eval(pe);
       return pe;
     }
     // Curviness over BOTH legs, the twins-aware self-overlap (forward vs return AND
@@ -1692,6 +1751,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       const uint64_t canon = canon_of(e, de);
       fwd_ids.insert(canon);
       pe.keys.ridden[canon] += elen;
+      pe.keys.fwd_ridden[canon] += elen; // proto/v4-p2.1: the forward leg's own record
       if (twin_index) {
         tw.clear();
         twin_index->append_twins(canon, tw);
@@ -1699,6 +1759,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         pe.keys.twins.insert(tw.begin(), tw.end());
       }
     }
+    pe.keys.fwd_total = len; // proto/v4-p2.1: the tree path's whole length, exempt stem included
     // The second path is ridden home backwards, so its distance from the start IS the
     // return's distance from the ride end: the exemption test reads the same number.
     cum = 0.0;
@@ -1742,6 +1803,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       if (!fwd_ok(pe.pair.tree) && !fwd_ok(pe.pair.other)) {
         ++pair_fwd_illegal;
         pe.reject = "fwd_illegal";
+        release_eval(pe);
         return pe;
       }
     }
@@ -1752,6 +1814,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       ++pair_twin_rejects; // the geometry gate's twin-ride verdict, at selection
       pe.reject = "twin";
       pair_twin_candidates.push_back(ci);
+      release_eval(pe);
       return pe;
     }
     // Selection score: the pair's whole-loop curviness discounted by its distance error
@@ -1792,13 +1855,28 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
           ++pair_share_rejects;
           continue;
         }
+        if (leg_shares(pe.keys, pair_selected_keys)) {
+          ++pair_leg_share_rejects; // proto/v4-p2.1: a shared forward trunk, at selection
+          continue;
+        }
         surv.push_back(pick);
       }
       if (surv.empty())
         continue;
-      std::stable_sort(surv.begin(), surv.end(), [&](uint32_t a, uint32_t c) {
-        return pair_cache[a].score > pair_cache[c].score;
-      });
+      // proto/v4-p2.1: the diversity term — a survivor's score is discounted by its
+      // whole-pair sharing with the chosen set, score / (1 + w * s), BEFORE the seed
+      // rotation; the rotation is unchanged and bounds what the term can do (it orders
+      // the survivors, the seed still picks among them).  w = 0 is P2's order exactly.
+      std::unordered_map<uint32_t, double> div_score;
+      for (uint32_t c : surv) {
+        double s = 0.0;
+        if (roundtrip_pair_diversity_w > 0.0)
+          for (const auto& prev : pair_selected_keys)
+            s = std::max(s, shared_fraction(pair_cache[c].keys, prev));
+        div_score[c] = pair_cache[c].score / (1.0 + roundtrip_pair_diversity_w * s);
+      }
+      std::stable_sort(surv.begin(), surv.end(),
+                       [&](uint32_t a, uint32_t c) { return div_score[a] > div_score[c]; });
       const uint32_t pick = surv[(seed + b) % static_cast<uint32_t>(surv.size())];
       chosen.push_back(pick);
       pair_selected_keys.push_back(pair_cache[pick].keys);
@@ -1828,11 +1906,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       if (!separated(rest[i]))
         continue;
       if (pairs) {
+        if (rung_budget_spent())
+          break; // proto/v4-p2.1: the rung's evaluation budget bounds the backfill walk too
         const PairEval& pe = eval_pair(rest[i]);
         if (!pe.ok)
           continue;
         if (pair_shares(pe.keys, pair_selected_keys)) {
           ++pair_share_rejects;
+          continue;
+        }
+        if (leg_shares(pe.keys, pair_selected_keys)) {
+          ++pair_leg_share_rejects;
           continue;
         }
         pair_selected_keys.push_back(pe.keys);
@@ -2161,6 +2245,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     uint8_t pair_bridges = 0;             // non-reversible return stretches repaired with a local A*
     bool pair_full_repair = false;        // the whole return was rebuilt with route_leg (P1.1)
     double pair_cost = 0, pair_surplus = 0, pair_fwd_len = 0, pair_ret_len = 0;
+    // proto/v4-p2.1: admitted under relaxation rung 1-3 of the per-leg threshold (0 = the
+    // main walk); with roundtrip_pair_relaxed_last it ranks after the non-relaxed ones.
+    uint8_t relaxed = 0;
     // Rank tier, absolute: clean hard-exclude < twins released < soft leash < gated.
     uint8_t tier() const {
       return gated ? 3 : rung;
@@ -2622,6 +2709,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       ++pair_share_rejects;
       return std::nullopt;
     }
+    if (leg_shares(pe.keys, pair_built_keys)) {
+      ++pair_leg_share_rejects; // proto/v4-p2.1
+      return std::nullopt;
+    }
     const auto& labels = expander.labels();
     // the start's partial edge: the fraction of it actually ridden as origin / destination
     auto edge_frac = [&](const GraphId& e, bool as_origin) -> double {
@@ -2923,6 +3014,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   while (true) {
     if (loops.size() >= want)
       break;
+    if (pairs && !rescue_pass && rung_budget_spent()) {
+      underfill_cause = "evalcap"; // proto/v4-p2.1: this rung's evaluation budget is spent
+      break;
+    }
     if (qi >= queue.size() || attempts >= attempt_cap) {
       if (roundtrip_f09_budget ? !stall_granted : !widened) {
         stall_granted = true;
@@ -2948,6 +3043,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         continue;
       if (pair_shares(pe.keys, pair_built_keys)) {
         ++pair_share_rejects;
+        continue;
+      }
+      if (leg_shares(pe.keys, pair_built_keys)) {
+        ++pair_leg_share_rejects; // proto/v4-p2.1: tested against the loops actually served
         continue;
       }
     }
@@ -3094,22 +3193,64 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       for (uint64_t ev : loop_edges)
         ++bank_edge_count[ev];
     }
-    if (pairs && built->cand != baldr::kInvalidLabel)
+    if (pairs && roundtrip_pair_built_keys) {
+      // proto/v4-p2.1: key the bank on the BUILT loop — both legs as served (92 % of P2's
+      // returns are repairs the pair never described) — for every loop, rescue-built too,
+      // so later candidates are tested against the returns the rider actually gets.
+      PairKeys bk;
+      std::unordered_map<uint64_t, double> kl_twins;
+      bk.total = loop_keylen(*built, bk.ridden, kl_twins);
+      for (const auto& [t, len] : kl_twins)
+        bk.twins.insert(t);
+      pair_built_keys.push_back(std::move(bk));
+    } else if (pairs && built->cand != baldr::kInvalidLabel) {
       pair_built_keys.push_back(pair_cache[built->cand].keys);
+    }
+    built->relaxed = leg_relax_rung; // proto/v4-p2.1
+    if (leg_relax_rung) {
+      ++pair_leg_relaxed;
+      pair_leg_relax_rung_used = std::max(pair_leg_relax_rung_used, leg_relax_rung);
+    }
     if (rescue_pass)
       ++pair_rescue_loops;
     loops.push_back(std::move(*built));
   }
   };
   build_loop();
+  // proto/v4-p2.1: the RELAXATION LADDER for the fills bar.  A strict per-leg threshold
+  // leaves the bank short where the network offers fewer forward-distinct corridors than
+  // K; before the twin last resort and the rescue pass, the queue is re-walked at
+  // frac + 0.15, then + 0.30, then with the leg test off — each rung with its own
+  // evaluation budget (cached verdicts are free, so a re-walk only pays for candidates the
+  // previous rung never reached), stopping as soon as the bank is full.  The whole-pair
+  // filter stays on at every rung (rung 3 IS P2's selection contract, within a budget).
+  // Loops admitted here carry their rung (Loop.relaxed); builds spend attempts like any
+  // other, and the ladder is granted the missing count plus slack once, as the rescue
+  // pass is granted want plus slack.
+  if (pairs && leg_mode && roundtrip_pair_leg_relax && loops.size() < want) {
+    attempt_cap = std::max(attempt_cap,
+                           attempts + (want - static_cast<uint32_t>(loops.size())) + kAttemptSlack);
+    for (uint8_t rung = 1; rung <= 3 && loops.size() < want; ++rung) {
+      leg_relax_rung = rung;
+      rung_evals = 0;
+      leg_test_off = rung == 3;
+      leg_frac_active = roundtrip_pair_leg_sharing_frac + 0.15 * rung;
+      qi = 0;
+      build_loop();
+    }
+    leg_relax_rung = 0; // the twin last resort and the rescue pass are not relaxed loops
+  }
   uint32_t pair_twin_last_resort = 0;
   if (rt_debug)
-    std::cerr << "[rt-debug] after main loop: loops=" << loops.size() << " dirty=" << dirty_loops.size()
-              << " twin_candidates=" << pair_twin_candidates.size() << " considered="
-              << pair_sinks_considered << " no_pair=" << pair_none << " band=" << pair_band_rejects
-              << " twin=" << pair_twin_rejects << " share=" << pair_share_rejects << " fwd_illegal="
-              << pair_fwd_illegal << " queue=" << queue.size() << " cands=" << cands.size()
-              << " attempts=" << attempts << " underfill=" << underfill_cause << "\n";
+    std::cerr << "[rt-debug] after main loop: loops=" << loops.size()
+              << " dirty=" << dirty_loops.size() << " twin_candidates=" << pair_twin_candidates.size()
+              << " considered=" << pair_sinks_considered << " no_pair=" << pair_none
+              << " band=" << pair_band_rejects << " twin=" << pair_twin_rejects
+              << " share=" << pair_share_rejects << " fwd_illegal=" << pair_fwd_illegal
+              << " queue=" << queue.size() << " cands=" << cands.size() << " attempts=" << attempts
+              << " underfill=" << underfill_cause << " leg_share=" << pair_leg_share_rejects
+              << " leg_relaxed=" << pair_leg_relaxed << " rung=" << int(pair_leg_relax_rung_used)
+              << "\n";
   if (pairs && loops.size() < want && !pair_twin_candidates.empty()) {
     // proto/v4-p2 dirty-last: the twin-rejected pairs, built now that nothing clean is
     // left, so the geometry gate can stash them for the per-slot last resort below.
@@ -3169,30 +3310,41 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              std::to_string(gate_denied_twinride) +
              " return_bounce=" + std::to_string(gate_denied_bounce));
   if (pairs)
-    LOG_INFO("roundtrip pair-select: considered=" + std::to_string(pair_sinks_considered) +
-             " no_pair=" + std::to_string(pair_none) + " band=" +
-             std::to_string(pair_band_rejects) + " twin=" + std::to_string(pair_twin_rejects) +
-             " share=" + std::to_string(pair_share_rejects) + " chosen=" +
-             std::to_string(chosen.size()) + "; built=" + std::to_string(pair_loops_built) +
-             " reversible=" + std::to_string(pair_loops_reversible) + " bridged=" +
-             std::to_string(pair_loops_bridged) + " (runs=" + std::to_string(pair_bridge_runs) +
-             ") full_repair=" + std::to_string(pair_loops_full_repair) + " repair_failed=" +
-             std::to_string(pair_repair_failed) + " fwd_recost=" +
-             std::to_string(pair_fwd_recost) + "/" + std::to_string(pair_fwd_recost_fail) +
-             " twin_last_resort=" + std::to_string(pair_twin_last_resort) +
-             " rescue=" + std::to_string(pair_rescue_loops) + "/" +
-             std::to_string(pair_rescue_attempts) +
-             " built_share_rejects=" + std::to_string(sharing_filter_rejects) +
-             " gate_fires=" + std::to_string(gate_seam + gate_twinride + gate_bouncehits) +
-             " pair_ms=" + std::to_string(static_cast<int>(pair_pass_ms)) +
-             " eval_ms=" + std::to_string(static_cast<int>(pair_eval_ms)) +
-             " bridge_ms=" + std::to_string(static_cast<int>(bridge_ms)) +
-             " rev_fail(tile/noopp/noret/turn/gap)=" + std::to_string(rev_fail_tile) + "/" +
-             std::to_string(rev_fail_noopp) + "/" + std::to_string(rev_fail_access) + "/" +
-             std::to_string(rev_fail_turn) + "/" + std::to_string(rev_fail_gap) +
-             " fwd_illegal=" + std::to_string(pair_fwd_illegal) +
-             " swapped=" + std::to_string(pair_swapped) +
-             " bad_ret_edge=" + std::to_string(rev_bad_ret_edge));
+    LOG_INFO(
+        "roundtrip pair-select: considered=" + std::to_string(pair_sinks_considered) +
+        " no_pair=" + std::to_string(pair_none) + " band=" + std::to_string(pair_band_rejects) +
+        " twin=" + std::to_string(pair_twin_rejects) +
+        " share=" + std::to_string(pair_share_rejects) + " chosen=" + std::to_string(chosen.size()) +
+        "; built=" + std::to_string(pair_loops_built) + " reversible=" +
+        std::to_string(pair_loops_reversible) + " bridged=" + std::to_string(pair_loops_bridged) +
+        " (runs=" + std::to_string(pair_bridge_runs) +
+        ") full_repair=" + std::to_string(pair_loops_full_repair) + " repair_failed=" +
+        std::to_string(pair_repair_failed) + " fwd_recost=" + std::to_string(pair_fwd_recost) + "/" +
+        std::to_string(pair_fwd_recost_fail) +
+        " twin_last_resort=" + std::to_string(pair_twin_last_resort) +
+        " rescue=" + std::to_string(pair_rescue_loops) + "/" + std::to_string(pair_rescue_attempts) +
+        " built_share_rejects=" + std::to_string(sharing_filter_rejects) +
+        " gate_fires=" + std::to_string(gate_seam + gate_twinride + gate_bouncehits) +
+        " pair_ms=" + std::to_string(static_cast<int>(pair_pass_ms)) +
+        " eval_ms=" + std::to_string(static_cast<int>(pair_eval_ms)) +
+        " bridge_ms=" + std::to_string(static_cast<int>(bridge_ms)) +
+        " rev_fail(tile/noopp/noret/turn/gap)=" + std::to_string(rev_fail_tile) + "/" +
+        std::to_string(rev_fail_noopp) + "/" + std::to_string(rev_fail_access) + "/" +
+        std::to_string(rev_fail_turn) + "/" + std::to_string(rev_fail_gap) + " fwd_illegal=" +
+        std::to_string(pair_fwd_illegal) + " swapped=" + std::to_string(pair_swapped) +
+        " bad_ret_edge=" + std::to_string(rev_bad_ret_edge) +
+        // proto/v4-p2.1: APPENDED, never inserted — the P2 parsers read the prefix.
+        " leg_share=" + std::to_string(pair_leg_share_rejects) +
+        " leg_relaxed=" + std::to_string(pair_leg_relaxed) +
+        " leg_relax_rung=" + std::to_string(pair_leg_relax_rung_used) +
+        " div_w=" + std::to_string(roundtrip_pair_diversity_w) +
+        " built_keys=" + (roundtrip_pair_built_keys ? "1" : "0") + " rung_evals=" +
+        std::to_string(rung_eval_count[0]) + "/" + std::to_string(rung_eval_count[1]) + "/" +
+        std::to_string(rung_eval_count[2]) + "/" + std::to_string(rung_eval_count[3]) +
+        // the coarse memory guard: evaluations cached, entries still holding keys
+        " cache=" + std::to_string(pair_cache.size()) + " keys_held=" +
+        std::to_string(std::count_if(pair_cache.begin(), pair_cache.end(),
+                                     [](const auto& kv) { return !kv.second.keys.ridden.empty(); })));
   LOG_INFO("roundtrip rungs: r0=" + std::to_string(rung_hits[0]) +
            " r1=" + std::to_string(rung_hits[1]) + " r2=" + std::to_string(rung_hits[2]) +
            " none=" + std::to_string(rung_hits[3]) +
@@ -3245,17 +3397,24 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   //    can see.  Clean-first is the one axis P1 adds; ranking the BUILT loop (return
   //    leg, distance error, self-overlap) is P2's job.
   const bool built_rank = roundtrip_built_ranking;
-  std::stable_sort(loops.begin(), loops.end(), [built_rank](const Loop& a, const Loop& b) {
-    if (!built_rank) {
-      if (a.fallback != b.fallback)
-        return !a.fallback;
-      return a.curviness > b.curviness;
-    }
-    // proto/v4-p1.1: rung/gate tier first (absolute), then the BUILT loop's score.
-    if (a.tier() != b.tier())
-      return a.tier() < b.tier();
-    return a.score > b.score;
-  });
+  const bool relaxed_last = roundtrip_pair_relaxed_last;
+  std::stable_sort(loops.begin(), loops.end(),
+                   [built_rank, relaxed_last](const Loop& a, const Loop& b) {
+                     if (!built_rank) {
+                       if (a.fallback != b.fallback)
+                         return !a.fallback;
+                       return a.curviness > b.curviness;
+                     }
+                     // proto/v4-p1.1: rung/gate tier first (absolute), then the BUILT
+                     // loop's score.
+                     if (a.tier() != b.tier())
+                       return a.tier() < b.tier();
+                     // proto/v4-p2.1: within a tier, loops the relaxation ladder admitted
+                     // rank after the ones that met the per-leg threshold.
+                     if (relaxed_last && (a.relaxed != 0) != (b.relaxed != 0))
+                       return a.relaxed == 0;
+                     return a.score > b.score;
+                   });
 
   {
     // proto/v4-p1: surface the served order so the ranking change is auditable in the
@@ -3291,6 +3450,21 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
               std::to_string(L.pair_bridges) + "/" + (L.pair_full_repair ? "1" : "0");
       }
       LOG_INFO("roundtrip pair-ranks: " + pr);
+      // proto/v4-p2.1: slot:relax-rung/pair-built/tier, keyed by request (start, target,
+      // seed, prefer_curvature, use_highways) so the per-slot read can be joined to the
+      // response — three workers interleave the ledger.
+      std::string pl;
+      for (size_t li = 0; li < loops.size(); ++li)
+        pl += (li ? " " : "") + std::to_string(li) + ":" + std::to_string(loops[li].relaxed) + "/" +
+              (loops[li].pair_built ? "1" : "0") + "/" + std::to_string(loops[li].tier());
+      const auto& co = options.costings().find(options.costing_type())->second.options();
+      char key[96];
+      std::snprintf(key, sizeof(key), "%.5f_%.5f_%d_%u_%.2f_%.2f", options.locations(0).ll().lat(),
+                    options.locations(0).ll().lng(), static_cast<int>(target), seed,
+                    co.prefer_curvature(), co.use_highways());
+      LOG_INFO("roundtrip pair-leg: req=" + std::string(key) + " slots=" + pl);
+      if (rt_debug) // gurka cannot read the ledger (the logger is a one-shot static)
+        std::cerr << "[rt-debug] pair-leg: slots=" << pl << "\n";
     }
   }
 

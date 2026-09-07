@@ -88,11 +88,9 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_built_ranking(config.get<bool>("thor.roundtrip_built_ranking", true)),
       roundtrip_geometry_gate(config.get<bool>("thor.roundtrip_geometry_gate", true)),
       roundtrip_gate_twin_ride_m(config.get<double>("thor.roundtrip_gate_twin_ride_m", 500.0)),
-      roundtrip_gate_return_bounce_m(
-          config.get<double>("thor.roundtrip_gate_return_bounce_m", 30.0)),
+      roundtrip_gate_return_bounce_m(config.get<double>("thor.roundtrip_gate_return_bounce_m", 30.0)),
       roundtrip_fallback_rungs(config.get<bool>("thor.roundtrip_fallback_rungs", true)),
-      roundtrip_gate_refill_budget(
-          config.get<uint32_t>("thor.roundtrip_gate_refill_budget", 0)),
+      roundtrip_gate_refill_budget(config.get<uint32_t>("thor.roundtrip_gate_refill_budget", 0)),
       roundtrip_fallback_parallel_rung(
           config.get<bool>("thor.roundtrip_fallback_parallel_rung", false)),
       roundtrip_f09_budget(config.get<bool>("thor.roundtrip_f09_budget", true)),
@@ -108,7 +106,14 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_pair_return_legal(config.get<bool>("thor.roundtrip_pair_return_legal", true)),
       roundtrip_pair_eval_cap(config.get<uint32_t>("thor.roundtrip_pair_eval_cap", 600)),
       roundtrip_pair_two_way_tree(config.get<bool>("thor.roundtrip_pair_two_way_tree", true)),
-      roundtrip_pair_twin_reject(config.get<bool>("thor.roundtrip_pair_twin_reject", true)) {
+      roundtrip_pair_twin_reject(config.get<bool>("thor.roundtrip_pair_twin_reject", true)),
+      roundtrip_pair_leg_sharing(config.get<bool>("thor.roundtrip_pair_leg_sharing", false)),
+      roundtrip_pair_leg_sharing_frac(
+          config.get<double>("thor.roundtrip_pair_leg_sharing_frac", 0.5)),
+      roundtrip_pair_built_keys(config.get<bool>("thor.roundtrip_pair_built_keys", false)),
+      roundtrip_pair_diversity_w(config.get<double>("thor.roundtrip_pair_diversity_w", 0.0)),
+      roundtrip_pair_leg_relax(config.get<bool>("thor.roundtrip_pair_leg_relax", false)),
+      roundtrip_pair_relaxed_last(config.get<bool>("thor.roundtrip_pair_relaxed_last", false)) {
 
   // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10): build the road-identity sidecar at
   // engine start (first thor worker; later workers hit the cached instance) so the

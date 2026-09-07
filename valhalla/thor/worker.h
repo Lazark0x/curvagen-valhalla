@@ -225,6 +225,29 @@ protected:
   uint32_t roundtrip_pair_eval_cap;    // pair evaluations per request before the near-dup filter is dropped
   bool roundtrip_pair_two_way_tree;    // prefer two-way arrivals as tree arcs (the forward legs)
   bool roundtrip_pair_twin_reject;     // reject a pair riding a twin (fwd-vs-ret or ret-vs-ret) at selection
+  // proto/v4-p2.1 (curvagen-valhalla#14): distinctness AT SELECTION.  All default off,
+  // so the P2 behaviour is byte-identical when unset.
+  //   roundtrip_pair_leg_sharing       reject a candidate whose FORWARD leg (the tree path
+  //                                    = the served forward leg) shares more than
+  //                                    roundtrip_pair_leg_sharing_frac of its length with
+  //                                    a chosen / built loop's roads or their twins.  In
+  //                                    this mode roundtrip_pair_eval_cap is a PER-RUNG
+  //                                    budget of fresh pair evaluations, never a filter
+  //                                    drop.
+  //   roundtrip_pair_built_keys        key the built bank on the BUILT loop (both legs as
+  //                                    served, every loop) instead of on the pair.
+  //   roundtrip_pair_diversity_w       order a sector's survivors by score / (1 + w * s),
+  //                                    s = max whole-pair sharing with the chosen set.
+  //   roundtrip_pair_leg_relax         bank short after the main walk: re-walk the queue
+  //                                    at frac + 0.15, + 0.30, then leg test off.
+  //   roundtrip_pair_relaxed_last      rank loops admitted under a relaxed rung after the
+  //                                    non-relaxed ones within their tier.
+  bool roundtrip_pair_leg_sharing;
+  double roundtrip_pair_leg_sharing_frac;
+  bool roundtrip_pair_built_keys;
+  double roundtrip_pair_diversity_w;
+  bool roundtrip_pair_leg_relax;
+  bool roundtrip_pair_relaxed_last;
 
 private:
   std::string service_name() const override {
