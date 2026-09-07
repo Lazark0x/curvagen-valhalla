@@ -42,7 +42,22 @@ One harness finding on the way: nothing under `gurka::do_action` can re-point th
 
 ## 3. The runs
 
-_(table filled as runs land.)_
+All on the prod-equivalent Serbia tiles, corpus-v2 (552 requests, K = 12), engine mode, 3 workers, way pass on, one engine at a time, **both engines with `roundtrip_xcand_penalty` on at 0.2 cap 4** (the prod condition). Baseline = `rt-p11-base` (:8004, `b4f514d7f`, `/tmp/v8004-xcand.json` + stage timing); P2.1 = `rt-p1-build` (:8003, `proto/v4-p2.1` @ `6f396e85f`, configs `/tmp/v8003-p21-*.json` layered on `/tmp/v8003-p2v2-xcand.json` = the P2 knee + pair pass + xcand 0.2). Every P2.1 config: `roundtrip_pair_eval_cap 3000`. Drivers and logs in `~/.curvagen-scratch/p21/` (`p21-run.sh` adds an engine watchdog + a memory log per run); ledgers in `~/.curvagen-scratch/p2/eng-<tag>.log`.
+
+| run | tag | config on top of P2 + xcand 0.2 | results dir | purpose |
+|---|---|---|---|---|
+| v0 | `p21v0` | P2 binary, `roundtrip_pair_eval_cap` 1e6, `roundtrip_sharing_frac` 0.4 | `p2-1-v0/` | **OOM-killed after 15 requests** (§7.1) — evidence only |
+| baseline bracket **A** | `p21baseA` | — | `census-v2-p21-baseA/` | latency bracket before the variants |
+| **a** (primary) | `p21a` | `leg_sharing` 0.5, `built_keys`, `leg_relax`, `relaxed_last`, `diversity_w` 0 | `p2-1-a/` | the per-leg threshold |
+| v0b | `p21v0b` | new knobs off, `roundtrip_sharing_frac` 0.4 | `p2-1-v0b/` | what P2's whole-pair filter buys inside a 3 000 budget |
+| **b** | `p21b` | a + `diversity_w` 2.0 | `p2-1-b/` | the diversity term |
+| **c** | `p21c` | a with `leg_sharing_frac` 0.35 | `p2-1-c/` | the tighter threshold |
+| **d** | `p21d` | decided from a/b/c (§3.1) | `p2-1-d/` | the decision run |
+| baseline bracket **B** | `p21baseB` | — | `census-v2-p21-baseB/` | latency bracket after the variants (T3 pools A + B) |
+
+**Bracket A** (12:23–12:32Z, `census-v2-p21-baseA/`): wall p50 **1.165 s**, p95 3.337 s, fills 550/552, failures 0, engine-stage total 824.4 ms mean / 709.5 ms p50, attempts 12.56 — against the P2 session's prod-condition bracket X (1.189 s / 3.123 s, 860.7 / 757.0 ms). Its meters are **byte-identical to bracket X's** (`same_meters.py`: 0 of 6 621 loops differ — deterministic engine, same binary and config), so the switchback-aware detector read of X (`p21bx`) is the read of every prod-condition baseline bracket in this session.
+
+_(the variants' status and headline numbers follow as each lands.)_
 
 ## 4. Gate v2 — all tiers, all runs
 
