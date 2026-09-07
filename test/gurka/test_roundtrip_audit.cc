@@ -2893,3 +2893,58 @@ TEST_F(RtP21Comb, P2f_RelaxationFillsTheBankAndRanksLast) {
   EXPECT_EQ(fwd_trunk(ctl, 1), 1) << "CONTROL BROKEN: without relaxed_last the score order "
                                      "should put both trunk-1 lobes into slots 0-1";
 }
+
+// ---------------------------------------------------------------------------------
+// V4 — provenance leaves the engine (ADR-0041 §7, curvagen-valhalla#15).
+//
+// The field is what turns the harness's D4 ("was this a Fallback Loop") from a
+// geometric proxy into a read, and the served-tier check with it.  Two pins: it is
+// filled for every served candidate and reaches the JSON, and its `builder` tells the
+// truth about which stage built the return.
+TEST_F(RtP21Comb, V4a_EveryServedCandidateSaysHowItWasBuilt) {
+  std::string json;
+  map.config.put("thor.roundtrip_pair_pass", true);
+  map.config.put("thor.roundtrip_pair_leg_sharing", true);
+  map.config.put("thor.roundtrip_pair_leg_sharing_frac", 0.5);
+  map.config.put("thor.roundtrip_pair_built_keys", true);
+  map.config.put("thor.roundtrip_pair_leg_relax", true);
+  map.config.put("thor.roundtrip_pair_relaxed_last", true);
+  auto result = gurka::do_action(valhalla::Options::route, map, {"S", "S"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "11500"},
+                                  {"/roundtrip/num_candidates", "4"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.8"},
+                                  {"/costing_options/motorcycle/prefer_curvature", "0.5"}},
+                                 {}, &json);
+  ASSERT_GE(result.trip().routes_size(), 1) << "no loop served";
+  for (int r = 0; r < result.trip().routes_size(); ++r) {
+    ASSERT_TRUE(result.trip().routes(r).has_curvagen_provenance()) << "slot " << r;
+    const auto& p = result.trip().routes(r).curvagen_provenance();
+    EXPECT_TRUE(p.builder() == "pair" || p.builder() == "rescue")
+        << "slot " << r << " builder = '" << p.builder() << "' with the pair pass on";
+    EXPECT_LE(p.tier(), 3u) << "slot " << r;
+    EXPECT_LE(p.relaxed(), 3u) << "slot " << r;
+    std::cerr << "[V4a] slot " << r << " builder=" << p.builder() << " rung=" << p.rung()
+              << " tier=" << p.tier() << " relaxed=" << p.relaxed()
+              << " gated=" << p.gated() << "\n";
+  }
+  // ... and it reaches the wire, which is where the harness reads it.
+  EXPECT_NE(json.find("\"provenance\""), std::string::npos) << "no provenance object in the JSON";
+  EXPECT_NE(json.find("\"builder\""), std::string::npos);
+  EXPECT_NE(json.find("\"full_repair\""), std::string::npos);
+}
+
+TEST_F(RtP21Comb, V4b_BuilderSaysRouteLegWithoutThePairPass) {
+  map.config.put("thor.roundtrip_pair_pass", false);
+  auto result = gurka::do_action(valhalla::Options::route, map, {"S", "S"}, "motorcycle",
+                                 {{"/roundtrip/target_distance", "11500"},
+                                  {"/roundtrip/num_candidates", "2"},
+                                  {"/costing_options/motorcycle/reuse_penalty", "0.8"},
+                                  {"/costing_options/motorcycle/prefer_curvature", "0.5"}});
+  map.config.put("thor.roundtrip_pair_pass", true); // the suite's other tests own this
+  ASSERT_GE(result.trip().routes_size(), 1) << "no loop served";
+  for (int r = 0; r < result.trip().routes_size(); ++r) {
+    ASSERT_TRUE(result.trip().routes(r).has_curvagen_provenance()) << "slot " << r;
+    EXPECT_EQ(result.trip().routes(r).curvagen_provenance().builder(), "route_leg")
+        << "slot " << r << ": with the pair pass off every return is a route_leg build";
+  }
+}

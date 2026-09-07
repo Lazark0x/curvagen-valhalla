@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Gate v1.2 checker (originally the #50 prototype instrument).
+"""Gate v1.2 checker — RETIRED, kept as the ADR-0037 record.
+
+Superseded by `gate_v2.py` (ADR-0041, curvagen-valhalla#15): Gate v1.x passed every
+absolute at every curviness while 64 % of demand-cell loops carried >= 500 m of retrace
+no gate input could see (defect atlas v2). Nothing should be gated on this file again;
+it stays so the v3 thresholds and the runs judged by them remain readable.
+
+Originally the #50 prototype instrument.
 
 Gate v1.2 thresholds (2026-07-14): locked to the Andrey-approved T8 done-run
 (curvagen #61/#62, engine curvagen-valhalla:t6 @ 9ca37c5f3) with a small
