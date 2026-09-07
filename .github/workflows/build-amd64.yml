@@ -4,6 +4,13 @@ name: build-amd64
 # Cloudflare-fronted VPS deploy (ADR-0023 / ADR-0033). Runs on a native amd64 runner so
 # the Valhalla compile is fast (no QEMU). Uses Dockerfile.local (builds the checked-out
 # working tree's runner stage) so the published image is exactly this branch's engine.
+#
+# Adding an action here needs a settings change too. This fork runs Actions under
+# `allowed_actions: selected` with `github_owned_allowed: true` plus an explicit
+# allow-list of `docker/setup-buildx-action@*`, `docker/login-action@*` and
+# `docker/build-push-action@*` — the four actions below and nothing else. A new
+# third-party action fails at startup with a policy error, not a build error;
+# add its pattern under Settings -> Actions -> General first.
 
 on:
   push:
