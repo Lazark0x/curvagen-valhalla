@@ -134,11 +134,30 @@ Suggested for d: walk the tree path (the label chain) for the forward keys and r
 
 ## 8. Pareto front / recommendation for the v4 build
 
-_(filled at the end.)_
+Served-surface T2 against wall p50 (× bracket A 1.165 s), every P2-family point at prod configuration, K = 12, fills 552/552, spikes 0:
+
+| point | mechanism | evaluations / request | **T2** mean / near_dup > 0.6 | T3 p50 | T4 p95 A+B |
+|---|---|---|---|---|---|
+| P2 + xcand | pair pass, pair-keyed 0.6 filter (cap 600) | 1 710 | 0.5879 / 50.4 % | 0.95× | 1.36× |
+| v0b | whole-pair 0.4, P2 semantics inside 3 000 | 3 700 | 0.5508 / 42.0 % | 1.35× | 1.48× |
+| a1 | leg 0.5 laddered, no whole-pair test, total 2 000 | 1 867 | 0.4937 / 29.1 % | 1.22× | 1.12× |
+| a0 | leg 0.5 (rung 0 starved) + whole-pair 0.6 vs built, 3 000 / rung | 5 224 | 0.4829 / 21.0 % | 1.46× | 2.6× |
+| a2 | leg 0.5 laddered + whole-pair 0.6 vs built, total 2 000 | 1 880 | 0.4657 / 21.7 % | 1.33× | 1.29× |
+| c | a2 at 0.35 | 1 908 | **0.4521 / 22.4 %** | 1.22× | 1.31–1.46× |
+| d | c at 1 200 total + rescue-built last | _(§3)_ | _(§3)_ | _(§3)_ | _(§3)_ |
+| **bars** | | | **≤ 0.4315 / ≤ 19.4 %** | **≤ 1.10×** | **≤ 1.30×** |
+
+**Verdict.** Distinctness at selection moves T2 a long way — from 1.50× / +36 pp (P2) to 1.15× / +8 pp (c) — and it does so with R1–R5, T1, T5 and T6 intact, no spikes, full fills and a bounded memory footprint. It does not reach T2, and every point that gets close costs 1.2–1.3× at the median. Two structural reasons, both visible in the ledgers: (1) the Served Surface is judged against the *whole* bank, so the relaxation ladder that keeps R4 at 552/552 fills slots 6–11 with loops that T2 then charges to slots 0–5 — the whole-pair test against the built bank (a2 vs a1) is what caps that, and it already sits at T2's own 0.6; (2) the forward-distinct sinks are the less-connected ones — more rescue builds (3.0 per request against P2's 0.9), more geometry-gate fires, and a selection walk that spends its whole budget finding 5.6–7 strict candidates per request — so part of the latency is the price of distinct sinks, not of the walk.
+
+**Recommendation for the v4 build task:** keep the pair pass as the selection stage; carry the mechanism as *knobs* (`roundtrip_pair_leg_sharing` 0.35, built-loop keys, whole-pair 0.6 against the built bank, the relaxation ladder with relaxed-last ranking, one evaluation budget per request) — it is the cheapest lever the ladder has for T2 and it is measured; and take the T2 question back to the ADR with the front above: either the ratchet is read on the served loops *against the served surface* (slots 0–5 vs 0–5 — the rider never sees slot 9), or the budget bar for distinct banks is written in latency (1.2×), or the bank is thinned by refusing fills the way ADR-0040's item 4 did — none of which this prototype may decide.
 
 ## 9. Open questions
 
-_(filled at the end.)_
+1. **What T2 measures.** `max_pair_overlap` is each served loop against all twelve; with a ladder for fills, slots 6–11 are by construction the loops that failed the strict test. Read against slots 0–5 only, c's served surface is probably near the bar (not computed here — `t2_anatomy.py` §5 gives the sibling's slot for the near-dups; a served-vs-served variant of the meter is a five-line change in `metrics.py`). ADR question.
+2. **The whole-pair test against the built bank rejects 865–893 candidates per request** and is what sends 3 slots per request to the rescue builder. A test that keys on the *forward leg + the pair's return* but tolerates the repaired return's sharing (the xcand penalty already pushes repairs off shared corridors) might keep the pair-built share up; unmeasured.
+3. **Budget vs threshold.** Only two budgets (2 000; d's 1 200) and two thresholds (0.5, 0.35) were run at the correct semantics; the front is coarse. The evaluation cost per candidate (~95–130 µs, tile lookups in the arc walk) is the constant to attack if the mechanism is kept — caching canonical ids on the pass's arcs (built once per request) would remove the tile lookups from the walk.
+4. **Rescue-built loops on the served surface** (25–34 % of slots 0–5 in a2 / c): they carry no pair certificate; whether they are the near-dups, §5 says; whether `rescue_last` (d) helps or merely reorders, d says.
+5. **Gurka cannot read the ledger** (`logging::GetLogger` is a one-shot static): P2b's "std_err for the record" never printed; the rt-debug mirror is the workaround. Worth a small fix in the harness before more ledger-driven pins are written.
 
 ## Appendix A — commands
 
