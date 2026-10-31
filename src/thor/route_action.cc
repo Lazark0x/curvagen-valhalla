@@ -1124,6 +1124,8 @@ valhalla::Location correlate_node(const baldr::GraphId& node,
                                   const baldr::GraphId& departure_edge = {}) {
   valhalla::Location loc;
   graph_tile_ptr tile = reader.GetGraphTile(node);
+  if (!tile)
+    return loc; // no edges: every caller reads that as a turnaround with no way out
   const PointLL node_ll = tile->get_node_ll(node);
   loc.mutable_ll()->set_lng(node_ll.lng());
   loc.mutable_ll()->set_lat(node_ll.lat());
@@ -1383,6 +1385,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   auto& options = *request.mutable_options();
   const double target = options.roundtrip().target_distance();
   const uint32_t want = std::max<uint32_t>(1, options.roundtrip().num_candidates());
+  // A client that gave up is noticed at every stage boundary and every build.  Polling
+  // never decides anything but abandonment, so the budgets below stay count-based and a
+  // completed request is the same with or without it.
+  auto poke = [this]() {
+    if (interrupt)
+      (*interrupt)();
+  };
 
   // Start = locations(0); the duplicate locations(1) is ignored.
   valhalla::Location start = options.locations(0);
@@ -1430,9 +1439,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
 
   RoundTripExpansion expander;
   expander.set_chain_simplicity(roundtrip_simple_chains, twin_index);
+  expander.set_interrupt(interrupt);
   const auto t_harvest = ledger_clock::now();
   auto cands = expander.Harvest(request, *reader, mode_costing, mode, target);
   harvest_ms = ms_since(t_harvest);
+  poke();
 
   // ---------------------------------------------------------------------------------
   // proto/v4-p2 (curvagen-valhalla#11): THE PAIR PASS.  Suurballe-Tarjan's second phase
@@ -1468,6 +1479,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       return false;
     }
     const uint32_t tp = pairs->tree_parent(j);
+    if (tp == RoundTripPairPass::kNone) {
+      ++pair_cands_dropped; // a cost tie left the junction with nothing strictly below it
+      return false;
+    }
     if (expander.chain_nonsimple(tp)) {
       ++pair_cands_dropped; // F01: the cheapest arrival reverses on a ring
       return false;
@@ -1495,6 +1510,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     pairs->set_prefer_two_way_tree(roundtrip_pair_two_way_tree);
     pairs->Run();
     pair_pass_ms = ms_since(t_pairs);
+    poke();
     // The pair's forward leg is the junction's CHEAPEST arrival (the tree path to its
     // sink vertex), so a harvest candidate is kept only when its label is that arrival:
     // the harvest's per-node "curviest chain" pick gives way to the tree's own.
@@ -1687,6 +1703,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     PairEval& pe = pair_cache[ci];
     if (pe.checked)
       return pe;
+    poke();
     pe.checked = true;
     ++pair_sinks_considered;
     ++rung_evals; // proto/v4-p2.1: the rung's budget counts fresh evaluations only
@@ -2558,6 +2575,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // Defect Gate, Second Via. Returns the loop WITHOUT committing it (the caller owns
   // dedup, separation bookkeeping, and the distance-correction decision).
   auto attempt_build = [&](uint32_t ci) -> std::optional<Loop> {
+    poke();
     std::vector<PathInfo> fwd = ForwardPath(expander, cands[ci].label_index);
     if (fwd.empty())
       return std::nullopt;
@@ -2722,6 +2740,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // of it, with the rest of the loop and its twins barred from that search.  Only when
   // bridging fails does the whole return fall back to P1.1's route_leg.
   auto attempt_pair_build = [&](uint32_t ci) -> std::optional<Loop> {
+    poke();
     pair_cheap_reject = false;
     PairEval& pe = eval_pair(ci);
     if (!pe.ok) {
@@ -3517,7 +3536,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   trip.mutable_routes()->Reserve(static_cast<int>(loops.size()));
   std::vector<std::string> algorithms;
   const auto t_build = ledger_clock::now();
+  uint32_t loops_unbuilt = 0;
   for (auto& lp : loops) {
+    // Polled here rather than handed to the builder: inside the try below a disconnect
+    // would read as one bad loop.
+    poke();
     auto* route = trip.mutable_routes()->Add();
     route->mutable_legs()->Reserve(2);
     // v4 (ADR-0041 §7, curvagen-valhalla#15): state how this candidate was built.
@@ -3532,19 +3555,31 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     prov->set_gated(lp.gated);
     prov->set_bridges(lp.pair_bridges);
     prov->set_full_repair(lp.pair_full_repair);
-    {
-      valhalla::Location o = start, d = lp.turn;
-      auto& leg = *route->mutable_legs()->Add();
-      TripLegBuilder::Build(options, controller, *reader, mode_costing, lp.fwd.begin(),
-                            lp.fwd.end(), o, d, leg, algorithms, interrupt, {}, {});
-    }
-    {
-      valhalla::Location o = lp.turn, d = start;
-      auto& leg = *route->mutable_legs()->Add();
-      TripLegBuilder::Build(options, controller, *reader, mode_costing, lp.ret.begin(),
-                            lp.ret.end(), o, d, leg, algorithms, interrupt, {}, {});
+    // A pair loop is costed from the pair pass's own edges, so it can reach this point
+    // with a leg TripLegBuilder refuses (a return arriving on an edge the start never
+    // correlated).  That costs this loop, not the bank: the slot stays empty, because a
+    // refill here would mean re-running selection after the bank was ranked.
+    try {
+      {
+        valhalla::Location o = start, d = lp.turn;
+        auto& leg = *route->mutable_legs()->Add();
+        TripLegBuilder::Build(options, controller, *reader, mode_costing, lp.fwd.begin(),
+                              lp.fwd.end(), o, d, leg, algorithms, nullptr, {}, {});
+      }
+      {
+        valhalla::Location o = lp.turn, d = start;
+        auto& leg = *route->mutable_legs()->Add();
+        TripLegBuilder::Build(options, controller, *reader, mode_costing, lp.ret.begin(),
+                              lp.ret.end(), o, d, leg, algorithms, nullptr, {}, {});
+      }
+    } catch (const std::exception& e) {
+      trip.mutable_routes()->RemoveLast();
+      ++loops_unbuilt;
+      LOG_WARN("roundtrip: loop dropped at serialization: " + std::string(e.what()));
     }
   }
+  if (trip.routes().empty())
+    throw valhalla_exception_t{442};
   build_ms = ms_since(t_build);
   if (roundtrip_stage_timing) {
     auto ms = [](double v) { return std::to_string(static_cast<int>(v)); };
@@ -3560,7 +3595,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " loops=" + std::to_string(loops.size()) +
              " dirty=" + std::to_string(dirty_loops.size()) + (widened ? " widened" : "") +
              " underfill=" + underfill_cause +
-             (pairs ? " pairs=" + ms(pair_pass_ms) + " bridge=" + ms(bridge_ms) : std::string()));
+             (pairs ? " pairs=" + ms(pair_pass_ms) + " bridge=" + ms(bridge_ms) : std::string()) +
+             " unbuilt=" + std::to_string(loops_unbuilt));
   }
 }
 } // namespace thor

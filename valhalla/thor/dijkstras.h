@@ -64,6 +64,15 @@ public:
               const sif::TravelMode mode);
 
   /**
+   * Sets the functor polled during the expansion, which aborts it by throwing.
+   *
+   * @param  interrupt  the functor to poll, or nullptr for none
+   */
+  void set_interrupt(const std::function<void()>* interrupt) {
+    interrupt_ = interrupt;
+  }
+
+  /**
    * Sets the functor which will track the Dijkstra expansion.
    *
    * @param  expansion_callback  the functor to call back when the Dijkstra makes progress
@@ -171,7 +180,8 @@ protected:
   // separately from the other paths
   bool multipath_;
 
-  // TODO: add an interrupt here so that the caller can abort the main loop externally
+  // polled every kInterruptIterationsInterval settled edges so a caller can abort the main loop
+  const std::function<void()>* interrupt_ = nullptr;
 
   /**
    * Initialization prior to computing the graph expansion

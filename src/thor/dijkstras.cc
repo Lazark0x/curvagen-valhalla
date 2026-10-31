@@ -323,7 +323,12 @@ void Dijkstras::Compute(google::protobuf::RepeatedPtrField<valhalla::Location>& 
 
   // Compute the isotile
   auto cb_decision = ExpansionRecommendation::continue_expansion;
+  size_t n = 0;
   while (cb_decision != ExpansionRecommendation::stop_expansion) {
+    if (interrupt_ && (++n % kInterruptIterationsInterval) == 0) {
+      (*interrupt_)();
+    }
+
     // Get next element from adjacency list. Check that it is valid. An
     // invalid label indicates there are no edges that can be expanded.
     uint32_t predindex = adjacencylist_.pop();

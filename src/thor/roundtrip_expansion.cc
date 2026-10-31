@@ -66,6 +66,8 @@ std::vector<Turnaround> RoundTripExpansion::Harvest(valhalla::Api& api,
   // Run the forward expansion (fills bdedgelabels_). Dijkstras::Expand dispatches
   // to Compute<ExpansionType::forward> using api.options().locations() as origins.
   Dijkstras::Expand(ExpansionType::forward, api, reader, mode_costing, mode);
+  if (interrupt_)
+    (*interrupt_)();
 
   // Start point for bearing computation.
   const auto& start_ll_pb = api.options().locations(0).ll();
@@ -89,8 +91,11 @@ std::vector<Turnaround> RoundTripExpansion::ScanBand(GraphReader& reader,
   // ~1 s on a 50 km Belgrade request (measured); this is O(labels).
   // proto/v4-p1.1: cached across the primary and widened ScanBand (both use
   // hi_frac 1.18, so `hi` is identical); recomputed only if a wider band ever arrives.
-  if (reject_nonsimple_ && (nonsimple_.size() != bdedgelabels_.size() || hi > f01_hi_))
+  if (reject_nonsimple_ && (nonsimple_.size() != bdedgelabels_.size() || hi > f01_hi_)) {
     ComputeChainSimplicity(reader, hi);
+    if (interrupt_)
+      (*interrupt_)();
+  }
 
   // Post-hoc curviness-per-km + bounce rejection (ADR-0037 turnaround hardening: the
   // costing's own U-turn test — pred.opp_local_idx() == edge.localedgeidx() — admits

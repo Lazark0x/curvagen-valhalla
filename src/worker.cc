@@ -42,6 +42,10 @@ static const worker::content_type& fmt_to_mime(const Options::Format& fmt) noexc
 
 namespace {
 
+// The longest round trip the API contract serves; the engine bound matches it so every
+// value the orchestrator can send reaches the engine unchanged.
+constexpr double kMaxRoundTripTargetMeters = 300000.0;
+
 // Parses exclude_layers from JSON and adds them to the request's tile options
 void parse_exclude_layers(const boost::optional<rapidjson::Value&>& exclude_layers, Api& request) {
   static const std::unordered_set<std::string_view> kSupportedLayers =
@@ -1316,6 +1320,14 @@ void from_json(rapidjson::Document& doc, Options::Action action, Api& api) {
       pb->set_num_candidates(std::min(16u, std::max(1u, *nc)));
     if (auto sd = rapidjson::get_optional<unsigned int>(*rt, "/seed"))
       pb->set_seed(*sd);
+  }
+  // Outside the JSON block so a protobuf body is bounded too.  The target sizes the
+  // expansion and is cast to integer metres downstream; the comparison sends NaN to 0,
+  // which finds no loop.
+  if (options.has_roundtrip()) {
+    auto* pb = options.mutable_roundtrip();
+    const double td = pb->target_distance();
+    pb->set_target_distance(td > 0.0 ? std::min(td, kMaxRoundTripTargetMeters) : 0.0);
   }
 
   // whether to return guidance_views, default false
