@@ -13,8 +13,6 @@ name: build-amd64
 # add its pattern under Settings -> Actions -> General first.
 
 on:
-  push:
-    branches: [engine-first-phase2]
   workflow_dispatch: {}
 
 jobs:
