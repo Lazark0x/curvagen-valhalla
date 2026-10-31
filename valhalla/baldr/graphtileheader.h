@@ -187,6 +187,22 @@ public:
   }
 
   /**
+   * Gets the curvature metric the edges of this tile were bucketed with.
+   * @return  Returns the version, kCurvatureMetricUnknown if the tile carries no stamp.
+   */
+  uint32_t curvature_metric_version() const {
+    return static_cast<uint32_t>(curvature_metric_version_);
+  }
+
+  /**
+   * Sets the curvature metric the edges of this tile were bucketed with.
+   * @param  version  Curvature metric version.
+   */
+  void set_curvature_metric_version(const uint32_t version) {
+    curvature_metric_version_ = version;
+  }
+
+  /**
    * Set the version string.
    * @param  version Version string.
    */
@@ -713,7 +729,9 @@ protected:
   // the GraphTileHeader structure and order of data within the structure does not change
   // this should be backwards compatible. Make sure use of bits from spareword* does not
   // exceed 128 bits.
-  uint64_t spareword0_ = 0;
+  // Holds the curvature metric version: every tile written before the stamp reads 0, which is
+  // kCurvatureMetricUnknown. A new tile takes this engine's version; a rewritten one keeps its own.
+  uint64_t curvature_metric_version_ = kCurvatureMetricVersion;
 
   // for road tiles: hashed md5 of the OSM PBFs
   // for transit tiles: so far the same

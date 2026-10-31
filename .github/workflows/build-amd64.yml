@@ -47,6 +47,7 @@ jobs:
           platforms: linux/amd64
           build-args: |
             ENABLE_TESTS=Off
+            VERSION_MODIFIER=${{ github.sha }}
           push: true
           provenance: false
           # Two tags on purpose. `:amd64` is the floating tag the deploy's

@@ -28,4 +28,7 @@ message Status {
   oneof has_osm_changeset {
     uint64 osm_changeset = 10;
   }
+  // curvature metric this engine reads, and the one the loaded tiles carry; 0 = unknown
+  uint32 engine_curvature_metric = 100;
+  uint32 tileset_curvature_metric = 101;
 }

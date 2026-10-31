@@ -1,9 +1,12 @@
-#include "mjolnir/util.h"
+#include "baldr/graphconstants.h"
 #include "midgard/pointll.h"
+#include "mjolnir/util.h"
 
-#include <cmath>
 #include <gtest/gtest.h>
 
+#include <cmath>
+
+using valhalla::baldr::kCurvatureMetricVersion;
 using valhalla::midgard::PointLL;
 using valhalla::mjolnir::compute_curvature;
 
@@ -29,4 +32,20 @@ TEST(CurvatureMetric, SamplingInvariantAndStraightIsZero) {
   // Two-point edges have no curvature.
   std::vector<PointLL> two = {{20.0, 45.0}, {20.0, 45.01}};
   EXPECT_EQ(compute_curvature(two), 0u);
+}
+
+// A right angle between two equal legs on the equator turns 90 degrees over 2 legs. The buckets
+// below are worked by hand from the scale of metric version 1: deg/km / 350 * 15, rounded.
+TEST(CurvatureMetric, BucketsPinnedToTheStampedVersion) {
+  static_assert(kCurvatureMetricVersion == 1,
+                "the buckets below belong to metric 1: re-derive them for the new version");
+  auto right_angle = [](double leg_km) {
+    const double leg_deg = leg_km / 111.195;
+    return std::vector<PointLL>{{0.0, 0.0}, {leg_deg, 0.0}, {leg_deg, leg_deg}};
+  };
+  const char* bump = "compute_curvature moved: bump kCurvatureMetricVersion, then re-pin";
+  EXPECT_EQ(compute_curvature(right_angle(1.0)), 2u) << bump;  //  45 deg/km -> 1.93
+  EXPECT_EQ(compute_curvature(right_angle(0.5)), 4u) << bump;  //  90 deg/km -> 3.86
+  EXPECT_EQ(compute_curvature(right_angle(0.2)), 10u) << bump; // 225 deg/km -> 9.64
+  EXPECT_EQ(compute_curvature(right_angle(0.1)), 15u) << bump; // 450 deg/km -> capped
 }

@@ -100,6 +100,15 @@ std::string serializeStatus(Api& request) {
   }
   status_doc.AddMember("available_actions", actions_list, alloc);
 
+  const auto add_curvature_metric = [&](const char* key, const uint32_t version) {
+    const auto value =
+        version == baldr::kCurvatureMetricUnknown ? std::string("unknown") : std::to_string(version);
+    status_doc.AddMember(rapidjson::Value::StringRefType(key),
+                         rapidjson::Value().SetString(value, alloc), alloc);
+  };
+  add_curvature_metric("engine_curvature_metric", request.status().engine_curvature_metric());
+  add_curvature_metric("tileset_curvature_metric", request.status().tileset_curvature_metric());
+
   if (request.status().has_has_tiles_case())
     status_doc.AddMember("has_tiles", rapidjson::Value().SetBool(request.status().has_tiles()),
                          alloc);

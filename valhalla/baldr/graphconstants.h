@@ -211,6 +211,14 @@ constexpr uint32_t kMaxStopImpact = 7;
 constexpr uint32_t kMaxGradeFactor = 15;
 constexpr uint32_t kMaxCurvatureFactor = 15;
 
+// Which curvature metric this engine's costing reads and its tile builder writes. Stock Valhalla
+// and this fork both store 0-15, higher curvier, on different scales, so the bucket alone cannot
+// tell them apart. Bump this with any change to mjolnir::compute_curvature's buckets. Tiles carry
+// the version of the tool that built them; kCurvatureMetricUnknown means no stamp: stock tools, or
+// this fork before the stamp existed.
+constexpr uint32_t kCurvatureMetricVersion = 1;
+constexpr uint32_t kCurvatureMetricUnknown = 0;
+
 // Maximum added time along shortcuts to approximate transition costs
 constexpr uint32_t kMaxAddedTime = 255;
 

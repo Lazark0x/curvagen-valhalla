@@ -12,7 +12,7 @@ auto get_graphtile(const std::shared_ptr<GraphReader>& reader) {
   graph_tile_ptr tile = nullptr;
   for (const auto& tile_id : reader->GetTileSet()) {
     tile = reader->GetGraphTile(tile_id);
-    if (tile->id().level() < TileHierarchy::GetTransitLevel().level &&
+    if (tile && tile->id().level() < TileHierarchy::GetTransitLevel().level &&
         tile->header()->nodecount() > 0) {
       break;
     }
@@ -26,6 +26,16 @@ time_t get_tileset_last_modified(const std::shared_ptr<GraphReader>& reader) {
     return valhalla::filesystem_utils::last_write_time_t(path);
   } catch (...) {}
   return 0;
+}
+
+// Any failure to read the tileset is an honest unknown: /status is the health endpoint.
+uint32_t get_tileset_curvature_metric_version(const std::shared_ptr<GraphReader>& reader) {
+  try {
+    if (const auto tile = get_graphtile(reader)) {
+      return tile->header()->curvature_metric_version();
+    }
+  } catch (...) {}
+  return kCurvatureMetricUnknown;
 }
 
 } // namespace
@@ -50,6 +60,13 @@ void loki_worker_t::status(Api& request) const {
     auto* action_pbf = status->mutable_available_actions()->Add();
     *action_pbf = Options_Action_Enum_Name(action);
   }
+
+  // not behind verbose: a deploy check must not depend on service_limits.status.allow_verbose
+  if (!tileset_curvature_metric_version_) {
+    tileset_curvature_metric_version_ = get_tileset_curvature_metric_version(reader);
+  }
+  status->set_engine_curvature_metric(kCurvatureMetricVersion);
+  status->set_tileset_curvature_metric(*tileset_curvature_metric_version_);
 
   // only return more info if explicitly asked for (can be very expensive)
   if (!request.options().verbose() || !allow_verbose)

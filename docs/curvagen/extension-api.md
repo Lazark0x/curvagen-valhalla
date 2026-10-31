@@ -41,6 +41,30 @@ Latency ledger + why 0.2: ADR-0039. Selection-time alternative falsified: ADR-00
 
 **v4 changes where these values come from, not what they are.** ADR-0042 §2 flips fifteen `thor.roundtrip_*` defaults in `src/thor/worker.cc` to the measured configuration, xcand `true` / `0.2` / cap `4` among them — so **a service config carrying no `roundtrip_*` key at all is the measured engine**, and the box's operator-supplied `valhalla.json` no longer has to be right for prod to be right. Any `roundtrip_*` key still present in a deployed config **overrides** a v4 default: read the live `thor` block before a cutover and keep only keys whose values match the defaults. Every knob remains a knob — setting them back reaches v3 / P1 / P2 behaviour for a bisect.
 
+### Curvature metric stamp
+
+Stock Valhalla and this fork both store `DirectedEdge::curvature` as 0-15, higher curvier, on different scales, so tiles from stock tools serve silently on the wrong scale. Every tile this fork builds carries `kCurvatureMetricVersion` (`valhalla/baldr/graphconstants.h`) in the header word that was `spareword0_`; tile layout is unchanged. A tile rewritten by a later stage keeps the stamp it came with. Bump the version with any change to `compute_curvature`'s buckets.
+
+`GET /status` reports both sides, always, with no dependence on `service_limits.status.allow_verbose`:
+
+```json
+"engine_curvature_metric": "1", "tileset_curvature_metric": "unknown"
+```
+
+`tileset_curvature_metric` is `unknown` for tiles with no stamp (stock tools, or this fork before the stamp) and when no tile could be read. The engine never refuses to serve on it: unstamped tiles route exactly as before. The value comes from one tile, read once per worker.
+
+**The deploy check** (consumer: curvagen-meta's box script, curvagen-orchestrator's engine gate), after the engine answers, on the exact tileset about to serve:
+
+```sh
+curl -sf localhost:8002/status | jq -e '.engine_curvature_metric != null and .tileset_curvature_metric == .engine_curvature_metric'
+```
+
+Non-zero exit fails the deploy. The `!= null` matters: against a stock engine image both fields are absent and `null == null` is true. `unknown` fails it on purpose, so tiles built before the stamp fail until rebuilt or until an operator waives the check for that tileset. It proves one sampled tile: a directory assembled from two builds needs a rebuild, not a pass.
+
+### Engine build id
+
+`/status`'s `version` is `<valhalla version>-<git sha>` on images from `build-amd64`, the same sha as the `:amd64-<sha>` tag. An image built without the `VERSION_MODIFIER` build arg reports the bare version. Tile headers truncate this string to 15 characters; only `/status` carries the full id.
+
 ## FINGERPRINT rule
 
 **Any change in this fork that alters route output** (geometry, candidate selection, scoring, gates, knob defaults) **requires a `FINGERPRINT_VERSION` bump in curvagen-orchestrator** (`crates/cache` keying) — otherwise stale cached banks serve old-engine routes. The same rule is documented consumer-side in `engine-client`. Coordinate via a cross-linked issue pair (driving repo ↔ consumer repo).
@@ -49,3 +73,4 @@ Latency ledger + why 0.2: ADR-0039. Selection-time alternative falsified: ADR-00
 
 - 2026-07-16 — document created at the repo split (curvagen-ios ADR-0042). Surface as shipped: v3 round-trip live since 2026-07-14, xcand at strength 0.2 since 2026-07-16, `prefer_curvature` = field 101 on Valhalla 3.8.2 base.
 - 2026-09-07 — **round-trip v4** (valhalla ADR-0042, judged by ADR-0041's Gate v2): loop construction changes, the request shape does not, the response gains the additive per-candidate `provenance`, and the measured configuration moves into `worker.cc` defaults. **v4 alters route output, so the FINGERPRINT rule fires: `FINGERPRINT_VERSION` 4 → 5** in curvagen-orchestrator, in the same commit as the cutover deploy (wayfinder curvagen-valhalla#18). Rollback target is the previous immutable image tag `ghcr.io/lazark0x/valhalla-curvature:amd64-<sha>` plus the previous orchestrator — v4 keys and v3 keys coexist inside the 30 d cache TTL.
+- 2026-10-31 — **curvature metric stamp**: `kCurvatureMetricVersion` 1 written to every new tile header, `engine_curvature_metric` and `tileset_curvature_metric` added to `/status` on every call, `version` gains the git sha on `build-amd64` images. Additive; no tile layout change, no route output change, so no `FINGERPRINT_VERSION` bump. Existing tiles read `unknown` until rebuilt.

@@ -14,6 +14,7 @@
 
 #include <boost/property_tree/ptree.hpp>
 
+#include <optional>
 #include <vector>
 
 namespace valhalla {
@@ -111,6 +112,8 @@ protected:
   float min_resample;
   unsigned int max_alternates;
   bool allow_verbose;
+  // /status reports it on every call, so it is read from a tile once per worker
+  mutable std::optional<uint32_t> tileset_curvature_metric_version_;
   bool allow_hard_exclusions;
   float max_distance_disable_hierarchy_culling;
   std::unordered_set<baldr::GraphId> bbox_intersection_;

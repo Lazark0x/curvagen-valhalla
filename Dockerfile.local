@@ -29,8 +29,10 @@ RUN bash ./scripts/install-linux-deps.sh
 COPY . .
 
 ARG ENABLE_TESTS=Off
+ARG VERSION_MODIFIER=""
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc \
-      -DENABLE_TESTS=${ENABLE_TESTS} -DENABLE_SINGLE_FILES_WERROR=Off && \
+      -DENABLE_TESTS=${ENABLE_TESTS} -DENABLE_SINGLE_FILES_WERROR=Off \
+      -DVALHALLA_VERSION_MODIFIER=${VERSION_MODIFIER} && \
     make -C build all -j$(nproc) && \
     make -C build install
 
