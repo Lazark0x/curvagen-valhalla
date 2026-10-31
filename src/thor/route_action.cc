@@ -1385,9 +1385,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   auto& options = *request.mutable_options();
   const double target = options.roundtrip().target_distance();
   const uint32_t want = std::max<uint32_t>(1, options.roundtrip().num_candidates());
-  // A client that gave up is noticed at every stage boundary and every build.  Polling
-  // never decides anything but abandonment, so the budgets below stay count-based and a
-  // completed request is the same with or without it.
+  // Polled at every stage and build; it decides only abandonment, never a budget or a loop.
   auto poke = [this]() {
     if (interrupt)
       (*interrupt)();
@@ -3538,8 +3536,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   const auto t_build = ledger_clock::now();
   uint32_t loops_unbuilt = 0;
   for (auto& lp : loops) {
-    // Polled here rather than handed to the builder: inside the try below a disconnect
-    // would read as one bad loop.
+    // Outside the try below, where a disconnect would read as one bad loop.
     poke();
     auto* route = trip.mutable_routes()->Add();
     route->mutable_legs()->Reserve(2);
@@ -3555,10 +3552,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     prov->set_gated(lp.gated);
     prov->set_bridges(lp.pair_bridges);
     prov->set_full_repair(lp.pair_full_repair);
-    // A pair loop is costed from the pair pass's own edges, so it can reach this point
-    // with a leg TripLegBuilder refuses (a return arriving on an edge the start never
-    // correlated).  That costs this loop, not the bank: the slot stays empty, because a
-    // refill here would mean re-running selection after the bank was ranked.
+    // A pair loop's own edges can hold a leg TripLegBuilder refuses: that loop's slot stays empty.
     try {
       {
         valhalla::Location o = start, d = lp.turn;

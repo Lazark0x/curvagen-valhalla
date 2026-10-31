@@ -67,7 +67,7 @@ Non-zero exit fails the deploy. The `!= null` matters: against a stock engine im
 
 ## FINGERPRINT rule
 
-**Any change in this fork that alters route output** (geometry, candidate selection, scoring, gates, knob defaults) **requires a `FINGERPRINT_VERSION` bump in curvagen-orchestrator** (`crates/cache` keying) — otherwise stale cached banks serve old-engine routes. The same rule is documented consumer-side in `engine-client`. Coordinate via a cross-linked issue pair (driving repo ↔ consumer repo).
+**An image from `build-amd64` needs no `FINGERPRINT_VERSION` bump.** Cache keys in curvagen-orchestrator (`crates/cache` keying) carry the build id from `/status` `version`, so a new image rotates every key on its own, within the api's engine watch of 15 s and with no api restart. Any change in this fork that alters route output (geometry, candidate selection, scoring, gates, knob defaults) therefore ships as a new image. An image built without the `VERSION_MODIFIER` build arg reports the bare version, so it rotates nothing and does need a bump, or stale cached banks serve old-engine routes. The same rule is documented in the orchestrator's `CLAUDE.md`. Coordinate a bump via a cross-linked issue pair (driving repo ↔ consumer repo).
 
 ## Changelog
 

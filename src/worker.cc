@@ -42,8 +42,7 @@ static const worker::content_type& fmt_to_mime(const Options::Format& fmt) noexc
 
 namespace {
 
-// The longest round trip the API contract serves; the engine bound matches it so every
-// value the orchestrator can send reaches the engine unchanged.
+// The longest round trip the API contract serves, so the bound never changes a sent value.
 constexpr double kMaxRoundTripTargetMeters = 300000.0;
 
 // Parses exclude_layers from JSON and adds them to the request's tile options
@@ -1321,9 +1320,7 @@ void from_json(rapidjson::Document& doc, Options::Action action, Api& api) {
     if (auto sd = rapidjson::get_optional<unsigned int>(*rt, "/seed"))
       pb->set_seed(*sd);
   }
-  // Outside the JSON block so a protobuf body is bounded too.  The target sizes the
-  // expansion and is cast to integer metres downstream; the comparison sends NaN to 0,
-  // which finds no loop.
+  // Outside the JSON block so a protobuf body is bounded too; the comparison sends NaN to 0.
   if (options.has_roundtrip()) {
     auto* pb = options.mutable_roundtrip();
     const double td = pb->target_distance();
