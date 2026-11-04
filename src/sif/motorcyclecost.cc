@@ -7,6 +7,8 @@
 #include "sif/costconstants.h"
 #include "sif/osrm_car_duration.h"
 
+#include <algorithm>
+
 #ifdef INLINE_TEST
 #include "test.h"
 #include "worker.h"
@@ -63,6 +65,11 @@ constexpr uint32_t kCurvyBucketThreshold = 9;   // curvature >= this counts as "
 constexpr float kContinuityBreakPenalty = 8.0f; // seconds added when leaving a curvy road
 constexpr ranged_default_t<float> kPreferElevationRange{0.f, 0.0f, 1.0f};
 constexpr float kGradeReward = 0.01f; // per |weighted_grade - 6| step
+// weighted_grade is 0..15 with 6 = flat, so |weighted_grade - 6| is at most 9.
+constexpr float kMaxGradeDeviation = 9.0f;
+// Floor for the (b2) transition scale. The scale is 0.24 at prefer_curvature 1 with the
+// orchestrator's options; the floor only guards against a future discount term.
+constexpr float kMinTransitionScale = 0.1f;
 constexpr ranged_default_t<uint32_t> kMotorcycleSpeedRange{10, baldr::kMaxAssumedSpeed,
                                                            baldr::kMaxSpeedKph};
 
@@ -328,6 +335,15 @@ public:
   float curvature_factor_; // Curvature preference scaling (0 = off, 2 = max)
   float continuity_factor_ = 0.0f; // 0 = off; scales the leave-curvy penalty
   float elevation_factor_ = 0.0f;  // 0 = off; rewards graded (hilly) edges
+  // (b2) curvature rescale: multiplies the cost of every transition (1 = the fork's
+  // discounts are off). See the constructor.
+  float transition_scale_ = 1.0f;
+
+  // The smallest factor EdgeCost can emit for a road edge under these options, before
+  // EdgeFactor() (whose multipliers are all >= 1). with_fork_discounts = false leaves
+  // out the fork's prefer_curvature and prefer_elevation discounts, which gives the
+  // smallest factor upstream's own terms can emit.
+  float SmallestEdgeFactor(bool with_fork_discounts) const;
 };
 
 // Constructor
@@ -393,6 +409,39 @@ MotorcycleCost::MotorcycleCost(const Costing& costing)
 
   // ADR-0032 elevation: reward graded (hilly/scenic) edges (0 = off).
   elevation_factor_ = costing_options.prefer_elevation();
+
+  // (b2) curvature rescale. The fork's discounts lower the edge factor far below anything
+  // upstream's costing emits (smallest factor 0.20 at prefer_curvature 1 against upstream's
+  // 0.82), while every transition cost stays in seconds: turn costs, maneuver_penalty, the
+  // continuity penalty, gates and tolls. Against the cheapened roads those fixed seconds
+  // weighed up to 4x what they were designed for, and routes stopped turning onto the
+  // curvy road. Scaling every transition by the same ratio gives them their designed
+  // weight back. Relative to the roads this is the same objective as dividing every edge
+  // by the ratio, but it leaves the edge costs, and so the A* heuristic, the bidirectional
+  // A* threshold and the bucket sizes, exactly where they were: no extra search.
+  // With prefer_curvature and prefer_elevation at 0 the ratio is 1 and nothing changes.
+  transition_scale_ =
+      std::clamp(SmallestEdgeFactor(true) / SmallestEdgeFactor(false), kMinTransitionScale, 1.0f);
+}
+
+float MotorcycleCost::SmallestEdgeFactor(bool with_fork_discounts) const {
+  // Every term of EdgeCost's additive factor at its minimum: the least dense edge, the
+  // most favoured class and surface, a toll if tolls are favoured. SpeedPenalty is >= 0.
+  float highway = 0.0f;
+  for (float k : kHighwayFactor) {
+    highway = std::min(highway, highway_factor_ * k);
+  }
+  float surface = 0.0f;
+  for (float k : kSurfaceFactor) {
+    surface = std::min(surface, surface_factor_ * k);
+  }
+  float factor = kDensityFactor[0] + highway + surface + std::min(0.0f, toll_factor_);
+  if (with_fork_discounts) {
+    factor += curvature_factor_ * kForkCurvatureDiscount[baldr::kMaxCurvatureFactor] -
+              elevation_factor_ * kMaxGradeDeviation * kGradeReward;
+  }
+  // The use-based multipliers (track, living street, service road) only lower it further.
+  return factor * std::min({1.0f, track_factor_, living_street_factor_, service_factor_});
 }
 
 // Destructor
@@ -584,7 +633,7 @@ Cost MotorcycleCost::TransitionCost(const baldr::DirectedEdge* edge,
     }
   }
 
-  c.cost *= inv_distance_factor_;
+  c.cost *= inv_distance_factor_ * transition_scale_;
 
   return c;
 }
@@ -662,7 +711,7 @@ Cost MotorcycleCost::TransitionCostReverse(
     c.cost += seconds;
   }
 
-  c.cost *= inv_distance_factor_;
+  c.cost *= inv_distance_factor_ * transition_scale_;
 
   return c;
 }
