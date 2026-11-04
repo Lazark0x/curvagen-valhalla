@@ -715,6 +715,15 @@ std::string serialize(Api& api) {
       writer("gated", prov.gated());
       writer("bridges", static_cast<uint64_t>(prov.bridges()));
       writer("full_repair", prov.full_repair());
+      // research/shuffle-variety PROTOTYPE fields
+      if (prov.topup())
+        writer("topup", true);
+      if (prov.identity_size() > 0) {
+        writer.start_array("identity");
+        for (const auto id : prov.identity())
+          writer(static_cast<uint64_t>(id));
+        writer.end_array();
+      }
       writer.end_object();
     }
 

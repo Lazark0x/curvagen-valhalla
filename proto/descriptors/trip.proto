@@ -382,6 +382,10 @@ message CurvagenProvenance {
   uint32 bridges = 6;
   // The whole return was rebuilt with route_leg after the pair was selected.
   bool full_repair = 7;
+  // research/shuffle-variety PROTOTYPE: topped up from the plain run after an
+  // excluded run under-filled; the loop's road identity when emit_identity is set.
+  bool topup = 8;
+  repeated uint64 identity = 9;
 }
 
 message TripRoute {

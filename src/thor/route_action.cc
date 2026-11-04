@@ -1,4 +1,6 @@
 #include "baldr/attributes_controller.h"
+#include "midgard/encoded.h"
+#include <map>
 #include "midgard/logging.h"
 #include "proto/common.pb.h"
 #include "thor/road_twin_index.h"
@@ -396,7 +398,11 @@ void thor_worker_t::route(Api& request) {
 
   // ADR-0033: native round-trip loop action. locations are [start, start].
   if (options.has_roundtrip()) {
-    roundtrip_impl(request, costing);
+    if (options.roundtrip().exclude_turnarounds_size() > 0 ||
+        options.roundtrip().exclude_loops_size() > 0)
+      roundtrip_variety(request, costing);
+    else
+      roundtrip_impl(request, costing);
     return;
   }
 
@@ -1379,6 +1385,84 @@ double seam_stub_m(const std::vector<PathInfo>& fwd,
 // are harvested near target/2, bearing-bucketed for diversity, and each is closed by a
 // leash-penalized return with a one-shot distance correction. The N loops serialize as
 // Trip.routes (alternates), best-first by curviness-per-km.
+// research/shuffle-variety PROTOTYPE (L1 apex exclusion / L4 identity exclusion): the
+// excluded run first; when it comes back short of K and the top-up is on, one plain run
+// (same knobs, no exclusions) tops it up with loops whose turnaround is separated from the
+// fresh ones, ranked after them and tagged `topup`.  Mirrors the in-flight
+// curvagen-valhalla#28 design so the two can be measured on the same corpus.
+void thor_worker_t::roundtrip_variety(Api& request, const std::string& costing) {
+  const auto& rt = request.options().roundtrip();
+  const uint32_t want = std::max<uint32_t>(1, rt.num_candidates());
+  const double min_separation_m = 0.1 * (rt.target_distance() / 2.0);
+  const bool topup = !rt.var_no_topup();
+  Api plain = request;
+  plain.mutable_options()->mutable_roundtrip()->clear_exclude_turnarounds();
+  plain.mutable_options()->mutable_roundtrip()->clear_exclude_loops();
+  try {
+    roundtrip_impl(request, costing);
+  } catch (const valhalla_exception_t& e) {
+    if (e.code != 442 || !topup)
+      throw;
+    request.mutable_trip()->clear_routes();
+  }
+  auto& fresh = *request.mutable_trip()->mutable_routes();
+  if (rt.var_guard() > 0.0 && rt.target_distance() > 0.0) {
+    // L1g quality guard: an excluded run walks down the pool; in sparse cells the walk
+    // ends on rescue-built / soft-leash / gated loops or far off the asked distance.
+    // Such a loop is dropped here and its slot topped up from the plain run (a repeat
+    // the rider has seen beats a defect they have not).
+    auto loop_m = [](const TripRoute& r) {
+      double m = 0.0;
+      for (const auto& leg : r.legs()) {
+        const auto pts = midgard::decode<std::vector<PointLL>>(leg.shape());
+        for (size_t i = 1; i < pts.size(); ++i)
+          m += pts[i - 1].Distance(pts[i]);
+      }
+      return m;
+    };
+    google::protobuf::RepeatedPtrField<TripRoute> kept;
+    for (const auto& r : fresh) {
+      const auto& p = r.curvagen_provenance();
+      const double err = std::fabs(loop_m(r) - rt.target_distance()) / rt.target_distance();
+      if (p.builder() == "rescue" || p.rung() >= 2 || p.gated() || err > rt.var_guard())
+        continue;
+      *kept.Add() = r;
+    }
+    if (kept.size() != fresh.size())
+      LOG_INFO("roundtrip variety: guard dropped " + std::to_string(fresh.size() - kept.size()));
+    fresh.Swap(&kept);
+  }
+  if (static_cast<uint32_t>(fresh.size()) >= want || !topup)
+    return;
+  try {
+    roundtrip_impl(plain, costing);
+  } catch (const valhalla_exception_t& e) {
+    if (e.code != 442 || fresh.empty())
+      throw;
+    return;
+  }
+  auto turnaround = [](const TripRoute& r) {
+    return midgard::decode<std::vector<PointLL>>(r.legs(0).shape()).back();
+  };
+  std::vector<PointLL> served;
+  for (const auto& r : fresh)
+    served.push_back(turnaround(r));
+  const size_t fresh_count = served.size();
+  for (int i = 0; i < plain.trip().routes_size() && served.size() < want; ++i) {
+    const PointLL t = turnaround(plain.trip().routes(i));
+    if (std::all_of(served.begin(), served.end(), [&](const PointLL& s) {
+          return static_cast<double>(t.Distance(s)) >= min_separation_m;
+        })) {
+      auto* r = fresh.Add();
+      *r = plain.trip().routes(i);
+      r->mutable_curvagen_provenance()->set_topup(true);
+      served.push_back(t);
+    }
+  }
+  LOG_INFO("roundtrip variety: under-filled " + std::to_string(fresh_count) + "/" +
+           std::to_string(want) + ", topped up " + std::to_string(served.size() - fresh_count));
+}
+
 void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/) {
   auto& options = *request.mutable_options();
   const double target = options.roundtrip().target_distance();
@@ -1532,6 +1616,39 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " rehung=" + std::to_string(pair_cands_rehung));
   }
 
+  // research/shuffle-variety PROTOTYPE knobs.  splitmix64 of the seed (and of the sector)
+  // drives the new seed uses, so consecutive seeds decorrelate; every knob at its zero
+  // value leaves the v4 selection byte-identical.
+  const auto& vrt = options.roundtrip();
+  auto mix = [](uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+  };
+  // L1: served turnarounds.
+  std::vector<PointLL> excluded_lls;
+  for (const auto& ll : vrt.exclude_turnarounds())
+    excluded_lls.emplace_back(ll.lng(), ll.lat());
+  const double exclude_radius_m =
+      vrt.exclude_radius_m() > 0.0 ? vrt.exclude_radius_m() : 0.1 * (target / 2.0);
+  auto apex_excluded = [&](const PointLL& ll) {
+    for (const auto& e : excluded_lls)
+      if (static_cast<double>(ll.Distance(e)) < exclude_radius_m)
+        return true;
+    return false;
+  };
+  uint32_t var_apex_dropped = 0, var_served_rejects = 0, var_served_built_rejects = 0,
+           var_surv_dups = 0;
+  std::string var_sectors; // sector:bucket-size/evaluated/survivors/near-best, the ledger
+  if (!excluded_lls.empty()) {
+    const size_t before = cands.size();
+    cands.erase(std::remove_if(cands.begin(), cands.end(),
+                               [&](const Turnaround& t) { return apex_excluded(t.ll); }),
+                cands.end());
+    var_apex_dropped = static_cast<uint32_t>(before - cands.size());
+  }
+
   // 2) Dedup turnarounds by node (best curviness per node) so candidates are genuinely
   //    distinct loops, then bearing-bucket for diversity. The shuffle seed rotates the bucket
   //    origin, so the same (start,target,curviness) yields a different loop set per seed.
@@ -1549,12 +1666,42 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     uniq.push_back(kv.second);
   std::sort(uniq.begin(), uniq.end()); // deterministic order (unordered_map is not)
 
-  const uint32_t buckets = want;
+  // L5: the sector count may be decoupled from K; L2: the sector origin may rotate by a
+  // seed-derived angle in [0, sector).
+  const uint32_t buckets = vrt.var_buckets() > want ? vrt.var_buckets() : want;
   const float sector = 360.0f / static_cast<float>(buckets);
+  const float sector_offset =
+      vrt.var_sector_offset() ? static_cast<float>(mix(seed) % 3600u) / 10.0f : 0.0f;
   std::vector<std::vector<uint32_t>> bucketed(buckets);
   for (uint32_t i : uniq) {
-    uint32_t b = std::min(buckets - 1, static_cast<uint32_t>(cands[i].bearing_deg / sector));
+    float brg = cands[i].bearing_deg;
+    if (sector_offset > 0.0f)
+      brg = std::fmod(brg - sector_offset + 720.0f, 360.0f);
+    uint32_t b = std::min(buckets - 1, static_cast<uint32_t>(brg / sector));
     bucketed[b].push_back(i);
+  }
+  // L5 order: with more sectors than K, K evenly spread sectors (from a seed-rotated
+  // start) are walked first, then the next spread set — so the first K picks span the
+  // compass and the rest are replacements.
+  std::vector<uint32_t> sector_order;
+  if (buckets > want) {
+    const uint32_t stride = (buckets + want - 1) / want;
+    const uint32_t s0 = static_cast<uint32_t>(mix(seed ^ 0x5eedULL) % buckets);
+    std::vector<bool> seen_b(buckets, false);
+    for (uint32_t r = 0; r < stride; ++r)
+      for (uint32_t i = 0; i < want; ++i) {
+        const uint32_t b = (s0 + r + i * stride) % buckets;
+        if (!seen_b[b]) {
+          seen_b[b] = true;
+          sector_order.push_back(b);
+        }
+      }
+    for (uint32_t b = 0; b < buckets; ++b)
+      if (!seen_b[b])
+        sector_order.push_back(b);
+  } else {
+    for (uint32_t b = 0; b < buckets; ++b)
+      sector_order.push_back(b);
   }
   // Min-separation guard (ADR-0036 T9): node-dedup cannot see adjacent nodes
   // on the same road, and the curviness-only backfill floods the single
@@ -1671,6 +1818,29 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       return false;
     for (const auto& prev : bank)
       if (fwd_shared_fraction(k, prev) > leg_frac_active)
+        return true;
+    return false;
+  };
+  // L4: served loops by road identity, as bank keys (ridden ids + their sidecar twins).
+  std::vector<PairKeys> served_keys;
+  for (const auto& vl : vrt.exclude_loops()) {
+    PairKeys k;
+    std::vector<uint64_t> tw;
+    for (uint64_t id : vl.ids()) {
+      k.ridden[id] = 1.0;
+      if (twin_index) {
+        tw.clear();
+        twin_index->append_twins(id, tw);
+        k.twins.insert(tw.begin(), tw.end());
+      }
+    }
+    k.total = static_cast<double>(vl.ids_size());
+    served_keys.push_back(std::move(k));
+  }
+  const double served_frac = vrt.exclude_loop_frac() > 0.0 ? vrt.exclude_loop_frac() : 0.5;
+  auto served_shares = [&](const PairKeys& k) -> bool {
+    for (const auto& prev : served_keys)
+      if (shared_fraction(k, prev) > served_frac)
         return true;
     return false;
   };
@@ -1844,7 +2014,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // Per bearing sector, pick a seed-varied turnaround among the top-M curviest. seed=fixed
   // is reproducible; a fresh seed (Shuffle) rotates the pick to a different curvy loop.
   constexpr uint32_t kShuffleTopM = 8;
-  for (uint32_t b = 0; b < buckets; ++b) {
+  for (uint32_t b : sector_order) {
     auto& bk = bucketed[b];
     if (bk.empty())
       continue;
@@ -1856,26 +2026,59 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       // — no pair, off band, twin ride, near-dup of a chosen loop are all selection-time
       // rejects that never buy a build; the survivors are ranked by pair score and the
       // seed rotates among them.
+      const uint32_t shortlist = vrt.var_shortlist() ? vrt.var_shortlist() : roundtrip_pair_shortlist;
       const uint32_t topm =
-          std::min<uint32_t>(std::max<uint32_t>(1, roundtrip_pair_shortlist),
-                             static_cast<uint32_t>(bk.size()));
+          std::min<uint32_t>(std::max<uint32_t>(1, shortlist), static_cast<uint32_t>(bk.size()));
       std::vector<uint32_t> surv;
+      std::map<std::string, uint32_t> why; // research/shuffle-variety: sector reject ledger
       for (uint32_t off = 0; off < topm; ++off) {
         const uint32_t pick = bk[off];
-        if (!separated(pick))
+        if (!separated(pick)) {
+          ++why["sep"];
           continue;
+        }
         const PairEval& pe = eval_pair(pick);
-        if (!pe.ok)
+        if (!pe.ok) {
+          ++why[pe.reject];
           continue;
+        }
         if (pair_shares(pe.keys, pair_selected_keys)) {
           ++pair_share_rejects;
+          ++why["share"];
           continue;
         }
         if (leg_shares(pe.keys, pair_selected_keys)) {
           ++pair_leg_share_rejects; // proto/v4-p2.1: a shared forward trunk, at selection
+          ++why["leg"];
           continue;
         }
+        if (!served_keys.empty() && served_shares(pe.keys)) {
+          ++var_served_rejects; // L4: rides a served loop's roads
+          continue;
+        }
+        if (vrt.var_distinct() > 0.0) {
+          // L3c: survivors of one sector are usually adjacent apexes on the same curvy
+          // road — one loop, several turnarounds.  Keep only survivors distinct from the
+          // sector's earlier (curvier) ones, so the seed rotates among different loops.
+          bool dup = false;
+          for (uint32_t sv : surv)
+            if (shared_fraction(pe.keys, pair_cache[sv].keys) > vrt.var_distinct()) {
+              dup = true;
+              break;
+            }
+          if (dup) {
+            ++var_surv_dups;
+            continue;
+          }
+        }
         surv.push_back(pick);
+      }
+      if (var_sectors.size() < 600) {
+        var_sectors += " " + std::to_string(b) + ":" + std::to_string(bk.size()) + "/" +
+                       std::to_string(topm) + "/" + std::to_string(surv.size()) + "[";
+        for (const auto& [k, n] : why)
+          var_sectors += k + "=" + std::to_string(n) + ",";
+        var_sectors += "]";
       }
       if (surv.empty())
         continue;
@@ -1893,7 +2096,19 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       }
       std::stable_sort(surv.begin(), surv.end(),
                        [&](uint32_t a, uint32_t c) { return div_score[a] > div_score[c]; });
-      const uint32_t pick = surv[(seed + b) % static_cast<uint32_t>(surv.size())];
+      uint32_t pick;
+      if (vrt.var_pick_tol() > 0.0) {
+        // L3: the seed picks among the near-best survivors only (score within tol of
+        // the sector's best), hashed so consecutive seeds decorrelate.
+        const double best = div_score[surv.front()];
+        uint32_t n = 0;
+        while (n < surv.size() && div_score[surv[n]] >= (1.0 - vrt.var_pick_tol()) * best)
+          ++n;
+        n = std::max<uint32_t>(1, n);
+        pick = surv[mix(static_cast<uint64_t>(seed) * 1315423911ULL + b) % n];
+      } else {
+        pick = surv[(seed + b) % static_cast<uint32_t>(surv.size())];
+      }
       chosen.push_back(pick);
       pair_selected_keys.push_back(pair_cache[pick].keys);
       continue;
@@ -1936,6 +2151,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         }
         if (leg_shares(pe.keys, pair_selected_keys)) {
           ++pair_leg_share_rejects;
+          continue;
+        }
+        if (!served_keys.empty() && served_shares(pe.keys)) {
+          ++var_served_rejects;
           continue;
         }
         pair_selected_keys.push_back(pe.keys);
@@ -2443,6 +2662,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     scan_ms += ms_since(t_scan);
     const uint32_t base = static_cast<uint32_t>(cands.size());
     for (const auto& t : wide) {
+      if (!excluded_lls.empty() && apex_excluded(t.ll)) {
+        ++var_apex_dropped;
+        continue;
+      }
       if (!pairs) {
         if (queued.insert(t.node).second)
           cands.push_back(t);
@@ -3077,6 +3300,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         ++pair_leg_share_rejects; // proto/v4-p2.1: tested against the loops actually served
         continue;
       }
+      if (!served_keys.empty() && served_shares(pe.keys)) {
+        ++var_served_rejects;
+        continue;
+      }
     }
     ++attempts;
     if (rescue_pass)
@@ -3176,6 +3403,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       for (const auto& [t, len] : kl_twins)
         kl.emplace(t, len);
       built_keylens.push_back(std::move(kl));
+    }
+    if (!served_keys.empty()) {
+      // L4 post-build: the BUILT loop (a repaired or rescue-built return the pair never
+      // described) against the served loops; a hit costs this build and refills.
+      PairKeys bk;
+      std::unordered_map<uint64_t, double> kl_twins;
+      bk.total = loop_keylen(*built, bk.ridden, kl_twins);
+      if (served_shares(bk)) {
+        ++var_served_built_rejects;
+        continue;
+      }
     }
     built_lls.push_back(cands[serve_ci].ll);
     built_nodes.insert(cands[serve_ci].node);
@@ -3317,6 +3555,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       std::cerr << "[rt-debug] rescue pass: attempts=" << pair_rescue_attempts << " loops="
                 << pair_rescue_loops << " bank=" << loops.size() << "\n";
   }
+  LOG_INFO("roundtrip variety: buckets=" + std::to_string(buckets) +
+           " offset=" + std::to_string(static_cast<int>(sector_offset)) +
+           " apex_dropped=" + std::to_string(var_apex_dropped) +
+           " served=" + std::to_string(served_keys.size()) +
+           " served_rejects=" + std::to_string(var_served_rejects) +
+           " served_built_rejects=" + std::to_string(var_served_built_rejects) +
+           " surv_dups=" + std::to_string(var_surv_dups) +
+           " loops=" + std::to_string(loops.size()) + "/" + std::to_string(want) +
+           " seed=" + std::to_string(seed) + " sectors=" + var_sectors);
   if (fallback_count > 0)
     LOG_INFO("roundtrip: " + std::to_string(fallback_count) +
              " candidate(s) fell back to the soft leash (Fallback Loop)");
@@ -3532,6 +3779,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     prov->set_gated(lp.gated);
     prov->set_bridges(lp.pair_bridges);
     prov->set_full_repair(lp.pair_full_repair);
+    if (vrt.emit_identity()) {
+      std::unordered_map<uint64_t, double> kl, kl_twins;
+      loop_keylen(lp, kl, kl_twins);
+      std::vector<uint64_t> ids;
+      ids.reserve(kl.size());
+      for (const auto& kv : kl)
+        ids.push_back(kv.first);
+      std::sort(ids.begin(), ids.end());
+      for (uint64_t id : ids)
+        prov->add_identity(id);
+    }
     {
       valhalla::Location o = start, d = lp.turn;
       auto& leg = *route->mutable_legs()->Add();

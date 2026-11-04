@@ -406,6 +406,25 @@ message RoundTrip {
   oneof has_seed {
     uint32 seed = 3;             // Shuffle seed: rotates bearing-diversity buckets so the
   }                              // same (start,target,curviness) yields a different loop set
+
+  // research/shuffle-variety PROTOTYPE knobs (2026-11-04). Not a contract: every field
+  // defaults to today's v4 selection, so a request that sets none of them is unchanged.
+  repeated LatLng exclude_turnarounds = 4;   // L1: served turnarounds (apexes); candidates near one are dropped
+  double exclude_radius_m = 5;               // L1 radius, metres (0 = the min-separation guard, 0.1 x target/2)
+  bool var_sector_offset = 10;               // L2: rotate the bearing-sector origin by a seed-derived angle
+  uint32 var_shortlist = 11;                 // L3: per-sector top-M pairs evaluated (0 = config, 8)
+  double var_pick_tol = 12;                  // L3: seed picks among survivors scoring >= (1 - tol) x best (0 = off)
+  uint32 var_buckets = 13;                   // L5: bearing sectors independent of K (0 = K); K spread sectors build first
+  repeated VarietyLoop exclude_loops = 14;   // L4: served loops by road identity
+  double exclude_loop_frac = 15;             // L4: reject a candidate sharing more than this of its length (0 = 0.5)
+  bool emit_identity = 16;                   // L4: return each loop's road-identity ids in provenance
+  bool var_no_topup = 17;                    // L1/L4: do not top an under-filled excluded run up from the plain run
+  double var_guard = 19;                     // L1g: drop excluded-run loops that are rescue / fallback / gated or off by more than this distance error, then top up (0 = off)
+  double var_distinct = 18;                  // L3c: a sector survivor sharing more than this with an earlier one is skipped (0 = off)
+}
+
+message VarietyLoop {
+  repeated uint64 ids = 1;                   // canonical (undirected) edge ids ridden beyond the Start Exemption
 }
 
 message Options {

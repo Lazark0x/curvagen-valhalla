@@ -1316,6 +1316,50 @@ void from_json(rapidjson::Document& doc, Options::Action action, Api& api) {
       pb->set_num_candidates(std::min(16u, std::max(1u, *nc)));
     if (auto sd = rapidjson::get_optional<unsigned int>(*rt, "/seed"))
       pb->set_seed(*sd);
+    // research/shuffle-variety PROTOTYPE knobs (options.proto RoundTrip 4..17).
+    if (auto ex = rapidjson::get_child_optional(*rt, "/exclude_turnarounds"); ex && ex->IsArray()) {
+      for (const auto& pt : ex->GetArray()) {
+        if (pb->exclude_turnarounds_size() >= 64)
+          break;
+        auto lat = rapidjson::get_optional<double>(pt, "/lat");
+        auto lon = rapidjson::get_optional<double>(pt, "/lon");
+        if (!lat || !lon)
+          continue;
+        auto* ll = pb->add_exclude_turnarounds();
+        ll->set_lat(*lat);
+        ll->set_lng(*lon);
+      }
+    }
+    if (auto v = rapidjson::get_optional<double>(*rt, "/exclude_radius_m"))
+      pb->set_exclude_radius_m(*v);
+    if (auto v = rapidjson::get_optional<bool>(*rt, "/var_sector_offset"))
+      pb->set_var_sector_offset(*v);
+    if (auto v = rapidjson::get_optional<unsigned int>(*rt, "/var_shortlist"))
+      pb->set_var_shortlist(std::min(64u, *v));
+    if (auto v = rapidjson::get_optional<double>(*rt, "/var_pick_tol"))
+      pb->set_var_pick_tol(*v);
+    if (auto v = rapidjson::get_optional<unsigned int>(*rt, "/var_buckets"))
+      pb->set_var_buckets(std::min(36u, *v));
+    if (auto v = rapidjson::get_optional<double>(*rt, "/exclude_loop_frac"))
+      pb->set_exclude_loop_frac(*v);
+    if (auto v = rapidjson::get_optional<bool>(*rt, "/emit_identity"))
+      pb->set_emit_identity(*v);
+    if (auto v = rapidjson::get_optional<double>(*rt, "/var_guard"))
+      pb->set_var_guard(*v);
+    if (auto v = rapidjson::get_optional<double>(*rt, "/var_distinct"))
+      pb->set_var_distinct(*v);
+    if (auto v = rapidjson::get_optional<bool>(*rt, "/var_no_topup"))
+      pb->set_var_no_topup(*v);
+    if (auto el = rapidjson::get_child_optional(*rt, "/exclude_loops"); el && el->IsArray()) {
+      for (const auto& lp : el->GetArray()) {
+        if (pb->exclude_loops_size() >= 32 || !lp.IsArray())
+          break;
+        auto* vl = pb->add_exclude_loops();
+        for (const auto& id : lp.GetArray())
+          if (id.IsUint64())
+            vl->add_ids(id.GetUint64());
+      }
+    }
   }
 
   // whether to return guidance_views, default false

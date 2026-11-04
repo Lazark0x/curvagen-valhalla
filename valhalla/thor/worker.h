@@ -54,6 +54,8 @@ public:
   void route(Api& request);
   // ADR-0033: native round-trip loop action (branched from route() on options.roundtrip).
   void roundtrip_impl(Api& request, const std::string& costing);
+  // research/shuffle-variety PROTOTYPE: exclusions (L1/L4) with the plain-run top-up.
+  void roundtrip_variety(Api& request, const std::string& costing);
   std::string matrix(Api& request);
   void optimized_route(Api& request);
   std::string isochrones(Api& request);
