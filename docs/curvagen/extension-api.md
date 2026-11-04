@@ -32,7 +32,7 @@ Optional request fields inside `roundtrip`, for a Shuffle that must not serve th
 
 ### Per-candidate `provenance` (v4, additive)
 
-Each route's `trip` object carries a fork-local `provenance` object (`TripRoute.CurvagenProvenance`, proto tag 100; ADR-0041 §7, ADR-0042 §5):
+Each route's `trip` object carries a fork-local `provenance` object (`TripRoute.CurvagenProvenance`, proto tag 1100 (100 before 2026-11-04); ADR-0041 §7, ADR-0042 §5):
 
 ```json
 "provenance": {"builder": "pair", "rung": 0, "tier": 0, "relaxed": 2,
@@ -43,7 +43,22 @@ Each route's `trip` object carries a fork-local `provenance` object (`TripRoute.
 
 ### Costing option `prefer_curvature`
 
-Proto field **101** on costing options (relocated from 97 at the 3.8.2 rebase, commit `a2fd86343`). 0 = neutral; higher = curvier roads favored.
+Proto field **1101** on costing options (97 until the 3.8.2 rebase, commit `a2fd86343`; 101 until 2026-11-04). 0 = neutral; higher = curvier roads favored.
+
+### Proto field numbers
+
+Every fork field in an upstream message takes a fork-private number, old number + 1000, so upstream's dense growth from 1 never collides with it on a rebase (upstream took `Costing.Options` 99 for `steps_factor` in valhalla#6394). Fields of fork-owned messages (`RoundTrip`, `CurvagenProvenance`) keep their own numbering.
+
+| Message | Field | Number |
+|---|---|---|
+| `Costing.Options` | `reuse_penalty` | 1098 |
+| `Costing.Options` | `curviness_continuity` | 1099 |
+| `Costing.Options` | `prefer_elevation` | 1100 |
+| `Costing.Options` | `prefer_curvature` | 1101 |
+| `Options` | `roundtrip` | 1067 |
+| `TripRoute` | `curvagen_provenance` | 1100 |
+
+The numbers matter only to protobuf (`format=pbf`) clients; the JSON keys never changed, and the orchestrator speaks JSON.
 
 ### Cross-candidate distinctness (xcand) — config knobs
 
@@ -68,3 +83,4 @@ Latency ledger + why 0.2: ADR-0039. Selection-time alternative falsified: ADR-00
 - 2026-07-16 — document created at the repo split (curvagen-ios ADR-0042). Surface as shipped: v3 round-trip live since 2026-07-14, xcand at strength 0.2 since 2026-07-16, `prefer_curvature` = field 101 on Valhalla 3.8.2 base.
 - 2026-09-07 — **round-trip v4** (valhalla ADR-0042, judged by ADR-0041's Gate v2): loop construction changes, the request shape does not, the response gains the additive per-candidate `provenance`, and the measured configuration moves into `worker.cc` defaults. **v4 alters route output, so the FINGERPRINT rule fires: `FINGERPRINT_VERSION` 4 → 5** in curvagen-orchestrator, in the same commit as the cutover deploy (wayfinder curvagen-valhalla#18). Rollback target is the previous immutable image tag `ghcr.io/lazark0x/valhalla-curvature:amd64-<sha>` plus the previous orchestrator — v4 keys and v3 keys coexist inside the 30 d cache TTL.
 - 2026-11-04 — **`roundtrip.exclude_turnarounds` + `exclude_radius_m`** (curvagen-valhalla#28): optional, additive request fields; served turnarounds are dropped before selection, each sector then takes the best of its top 32 (deep pick), and a short excluded run is topped up from a plain run, so fills never drop below today's. Gate v2's T1 for these Shuffles is read against the engine's own best-16 distinct loops (ADR-0041, amendment 2026-11-04). **The FINGERPRINT rule does not fire:** a request without the field is byte-identical to `5b29936f0`, and the orchestrator never caches an excluded answer (no Memo for Shuffles, no Negative Cache, no Bank Fill). Consumer: curvagen-orchestrator's Shuffle memory, which replaces its interim distance rotation (curvagen-orchestrator#67). Deploy the engine first: an orchestrator that sends the field to an older engine is harmless (ignored) but loses the rotation's partial relief until the engine lands.
+- 2026-11-04 — **fork proto fields move to a private range** (old number + 1000, table above) ahead of the 3.9.1 rebase. JSON keys are unchanged, so JSON output is byte-identical (verified on the rig against `a3ea836af`). **The FINGERPRINT rule does not fire.** A `format=pbf` client built against the old numbers would no longer see these fields; there is none.
