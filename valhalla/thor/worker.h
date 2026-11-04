@@ -208,10 +208,21 @@ protected:
   // this ranks after every loop within it, however curvy (0 = off).
   double roundtrip_disterr_tier;
   // Under exclude_turnarounds (a Shuffle), a fresh loop whose distance error is above
-  // roundtrip_disterr_tier is never served: the build walk refuses it and keeps looking,
-  // and the plain run tops a short answer up (curvagen-valhalla#28 follow-up). Requests
-  // without exclusions are untouched. Off (false) = every fresh loop counts.
+  // roundtrip_disterr_tier is never served: wherever it is built (the walk, the twin last
+  // resort, the gated stash) it is refused and the search goes on, and a short answer is
+  // topped up (curvagen-valhalla#28 follow-up). Requests without exclusions are untouched.
+  // Off (false) = every fresh loop counts, roundtrip_exclude_pass_m included.
   bool roundtrip_exclude_disterr_guard;
+  // Under exclude_turnarounds, a fresh loop whose shape passes within this many metres of
+  // an excluded turnaround is refused like an off-target one: it rides through the far
+  // point of the loop served there, a near-twin the exclusion radius cannot see (its own
+  // turnaround sits just past the radius on the same road). 0 = off.
+  double roundtrip_exclude_pass_m;
+  // Under exclude_turnarounds, a run the exclusions leave short re-runs excluding only the
+  // most recent half of the list (it comes oldest first) and tops up from that before the
+  // plain run, so the loops that come back are the ones served longest ago. Off (false) =
+  // straight to the plain-run top-up.
+  bool roundtrip_exclude_recency_fallback;
   // proto/v4-p2 (curvagen-valhalla#11): the Suurballe-Tarjan whole-loop pair pass.
   // roundtrip_pair_pass swaps harvest->select->return-A* for one disjoint-pair pass
   // over the harvest forest (the return is the pair's second path, reversed);
