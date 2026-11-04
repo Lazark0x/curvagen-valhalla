@@ -204,6 +204,9 @@ protected:
   bool roundtrip_f09_budget;
   double roundtrip_rank_overlap_w;
   double roundtrip_rank_disterr_w;
+  // Distance-error tier: within a rung tier, a built loop whose distance error is above
+  // this ranks after every loop within it, however curvy (0 = off).
+  double roundtrip_disterr_tier;
   // proto/v4-p2 (curvagen-valhalla#11): the Suurballe-Tarjan whole-loop pair pass.
   // roundtrip_pair_pass swaps harvest->select->return-A* for one disjoint-pair pass
   // over the harvest forest (the return is the pair's second path, reversed);

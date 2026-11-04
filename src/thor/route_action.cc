@@ -3379,8 +3379,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   const bool built_rank = roundtrip_built_ranking;
   const bool relaxed_last = roundtrip_pair_relaxed_last;
   const bool rescue_last = pairs && roundtrip_pair_rescue_last;
+  const double disterr_tier = roundtrip_disterr_tier;
   std::stable_sort(loops.begin(), loops.end(),
-                   [built_rank, relaxed_last, rescue_last](const Loop& a, const Loop& b) {
+                   [built_rank, relaxed_last, rescue_last, disterr_tier](const Loop& a,
+                                                                         const Loop& b) {
                      if (!built_rank) {
                        if (a.fallback != b.fallback)
                          return !a.fallback;
@@ -3390,6 +3392,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                      // loop's score.
                      if (a.tier() != b.tier())
                        return a.tier() < b.tier();
+                     // Distance-error tier (feat/b2-curvature-rescale): within a tier, a loop
+                     // more than roundtrip_disterr_tier off the asked distance ranks after
+                     // every loop within it, however curvy. The built score divides by
+                     // (1 + dist_err) only, so a curvy loop at twice the asked distance
+                     // outranked a flatter one on target; the pair pass predicts the
+                     // return from tree arcs and a full repair can come back far longer.
+                     if (disterr_tier > 0.0 &&
+                         (a.dist_err > disterr_tier) != (b.dist_err > disterr_tier))
+                       return a.dist_err <= disterr_tier;
                      // proto/v4-p2.1 (d): within a tier, the rescue builder's loops — no pair
                      // certificate, the slow heavy-reuse ones — rank behind pair-built loops.
                      if (rescue_last && a.pair_built != b.pair_built)
