@@ -373,6 +373,15 @@ message Costing {
     oneof has_prefer_elevation {
       float prefer_elevation = 100;
     }
+    // PROTOTYPE (research/upstream-6449-use-curvature): which curvature objective / A*
+    // heuristic the motorcycle costing runs. 0 = the fork today; 1 = the fork's objective
+    // with an admissible A* factor; 2 = upstream PR #6449's use_curvature formula in place
+    // of prefer_curvature; 3 = 2 with an admissible A* factor; 4 = the fork's objective
+    // divided by its minimum factor (penalise-straight form, heuristic unchanged).
+    // Fork-private number.
+    oneof has_curvature_mode {
+      uint32 curvature_mode = 1199;
+    }
   }
 
   oneof has_options {

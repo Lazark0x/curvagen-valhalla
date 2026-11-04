@@ -7,6 +7,10 @@
 #include "sif/costconstants.h"
 #include "sif/osrm_car_duration.h"
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+
 #ifdef INLINE_TEST
 #include "test.h"
 #include "worker.h"
@@ -63,6 +67,39 @@ constexpr uint32_t kCurvyBucketThreshold = 9;   // curvature >= this counts as "
 constexpr float kContinuityBreakPenalty = 8.0f; // seconds added when leaving a curvy road
 constexpr ranged_default_t<float> kPreferElevationRange{0.f, 0.0f, 1.0f};
 constexpr float kGradeReward = 0.01f; // per |weighted_grade - 6| step
+// PROTOTYPE (research/upstream-6449-use-curvature): curvature_mode, see options.proto.
+constexpr ranged_default_t<uint32_t> kCurvatureModeRange{0, 0, 4};
+// Upstream PR #6449 (valhalla/valhalla, head ed4053607, 2026-11-03), valhalla/sif/dynamiccost.h,
+// copied verbatim apart from the names (upstream calls the table kCurvatureFactor, which
+// would collide with the fork's table below).
+constexpr uint32_t kUcSteps = 21;
+constexpr uint32_t kUcNeutralStep = kUcSteps / 2;
+constexpr uint32_t kUcRuralDensity = 3;
+constexpr uint32_t kUcUrbanDensity = 7;
+constexpr float kUcMaxStraightRoadFactor = 6.f;
+constexpr float kUcSuburbanCurvatureFactor = 0.1f;
+constexpr float kUcUrbanCurvatureFactor = 2.f;
+constexpr float uc_strength(uint32_t step) {
+  if (step <= kUcNeutralStep) {
+    return 0.f;
+  }
+  float t = static_cast<float>(step - kUcNeutralStep) / kUcNeutralStep;
+  return t * t;
+}
+constexpr std::array<std::array<float, baldr::kMaxCurvatureFactor + 1>, kUcSteps>
+populate_uc_factor() {
+  std::array<std::array<float, baldr::kMaxCurvatureFactor + 1>, kUcSteps> f{};
+  for (uint32_t s = 0; s < kUcSteps; s++) {
+    float strength = uc_strength(s);
+    for (uint32_t c = 0; c <= baldr::kMaxCurvatureFactor; c++) {
+      float straightness =
+          static_cast<float>(baldr::kMaxCurvatureFactor - c) / baldr::kMaxCurvatureFactor;
+      f[s][c] = 1.f + kUcMaxStraightRoadFactor * strength * straightness * straightness;
+    }
+  }
+  return f;
+}
+constexpr auto kUcCurvatureFactor = populate_uc_factor();
 constexpr ranged_default_t<uint32_t> kMotorcycleSpeedRange{10, baldr::kMaxAssumedSpeed,
                                                            baldr::kMaxSpeedKph};
 
@@ -289,7 +326,9 @@ public:
    * estimate is less than the least possible time along roads.
    */
   virtual float AStarCostFactor() const override {
-    return kSpeedFactor[top_speed_] * min_linear_cost_factor_;
+    // PROTOTYPE: astar_min_factor_ = 1 unless curvature_mode asks for an admissible
+    // heuristic (modes 1 and 3), when it is the smallest factor EdgeCost can emit.
+    return kSpeedFactor[top_speed_] * min_linear_cost_factor_ * astar_min_factor_;
   }
 
   /**
@@ -325,6 +364,13 @@ public:
   float curvature_factor_; // Curvature preference scaling (0 = off, 2 = max)
   float continuity_factor_ = 0.0f; // 0 = off; scales the leave-curvy penalty
   float elevation_factor_ = 0.0f;  // 0 = off; rewards graded (hilly) edges
+  // PROTOTYPE (research/upstream-6449-use-curvature)
+  uint32_t curvature_mode_ = 0;   // see options.proto curvature_mode
+  float astar_min_factor_ = 1.0f; // multiplies AStarCostFactor (1 = today)
+  uint32_t uc_step_ = 0;          // #6449 curvature_step_
+  float uc_suburban_ = 1.0f;      // #6449 suburban_curvature_factor_
+  float uc_urban_ = 1.0f;         // #6449 urban_curvature_factor_
+  float edge_scale_ = 1.0f;       // mode 4: every edge factor divided by the minimum factor
 };
 
 // Constructor
@@ -390,6 +436,39 @@ MotorcycleCost::MotorcycleCost(const Costing& costing)
 
   // ADR-0032 elevation: reward graded (hilly/scenic) edges (0 = off).
   elevation_factor_ = costing_options.prefer_elevation();
+
+  // PROTOTYPE (research/upstream-6449-use-curvature).
+  curvature_mode_ = costing_options.curvature_mode();
+  if (curvature_mode_ >= 2) {
+    // Upstream #6449 in place of prefer_curvature: the rider's 0..1 curviness maps onto
+    // use_curvature's live half, 0.5 (neutral) .. 1.0 (strongest).
+    const float use_curvature = 0.5f + 0.5f * prefer_curvature;
+    curvature_factor_ = 0.0f; // the fork's discount is off
+    uc_step_ = static_cast<uint32_t>(std::round(use_curvature * static_cast<float>(kUcSteps - 1)));
+    uc_suburban_ = 1.f + kUcSuburbanCurvatureFactor * uc_strength(uc_step_);
+    uc_urban_ = kUcUrbanCurvatureFactor * kUcCurvatureFactor[uc_step_][0];
+  }
+  if (curvature_mode_ == 1 || curvature_mode_ == 3 || curvature_mode_ == 4) {
+    // Admissible heuristic: the smallest factor EdgeCost can emit (F03's fix shape).
+    // Mode 4 instead divides every edge by it (#6449's "penalise straight" form of the
+    // fork's own objective): the cheapest edge costs its time again, the heuristic stays.
+    float hw_min = 0.f;
+    for (float k : kHighwayFactor)
+      hw_min = std::min(hw_min, highway_factor_ * k);
+    float surf_min = 0.f;
+    for (float k : kSurfaceFactor)
+      surf_min = std::min(surf_min, surface_factor_ * k);
+    float f = kDensityFactor[0] + hw_min + surf_min + curvature_factor_ * kCurvatureFactor[15] -
+              elevation_factor_ * 9.0f * kGradeReward + std::min(0.f, toll_factor_);
+    f *= std::min({1.f, track_factor_, living_street_factor_, service_factor_});
+    // #6449's multiplier is >= 1 everywhere (rural bucket 15 = 1), so it never lowers f.
+    f = std::min(f, ferry_factor_);
+    astar_min_factor_ = std::max(0.05f, std::min(1.f, f));
+    if (curvature_mode_ == 4) {
+      edge_scale_ = 1.0f / astar_min_factor_;
+      astar_min_factor_ = 1.0f;
+    }
+  }
 }
 
 // Destructor
@@ -499,6 +578,22 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
   }
 
   factor *= EdgeFactor(edgeid);
+
+  // PROTOTYPE: upstream #6449's MotorcycleCost::EdgeCost block, verbatim.
+  if (curvature_mode_ >= 2 && uc_step_ > kUcNeutralStep) {
+    uint32_t curvature =
+        (edge->use() != baldr::Use::kRoad || edge->link() || edge->roundabout() || edge->internal())
+            ? 0
+            : edge->curvature();
+    if (edge->density() < kUcRuralDensity) {
+      factor *= kUcCurvatureFactor[uc_step_][curvature];
+    } else if (edge->density() < kUcUrbanDensity) {
+      factor *= uc_suburban_ * kUcCurvatureFactor[uc_step_][curvature];
+    } else {
+      factor *= uc_urban_;
+    }
+  }
+  factor *= edge_scale_;
 
   return {sec * factor, sec};
 }
@@ -673,6 +768,8 @@ void ParseMotorcycleCostOptions(const rapidjson::Document& doc,
   JSON_PBF_RANGED_DEFAULT(co, kCurvinessContinuityRange, json, "/curviness_continuity",
                           curviness_continuity, warnings);
   JSON_PBF_RANGED_DEFAULT(co, kPreferElevationRange, json, "/prefer_elevation", prefer_elevation,
+                          warnings);
+  JSON_PBF_RANGED_DEFAULT(co, kCurvatureModeRange, json, "/curvature_mode", curvature_mode,
                           warnings);
 }
 
