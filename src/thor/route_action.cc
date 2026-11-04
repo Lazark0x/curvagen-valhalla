@@ -2363,6 +2363,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   std::vector<PointLL> built_lls;
   std::unordered_set<uint64_t> built_nodes; // the distance-correction node guard
   uint32_t correction_count = 0;
+  uint32_t disterr_gated = 0; // MEASUREMENT (b2-variants)
   auto built_separated = [&](const PointLL& ll) {
     for (const auto& b : built_lls)
       if (static_cast<double>(ll.Distance(b)) < min_separation_m)
@@ -3089,6 +3090,16 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       if (!served_sigs.insert(std::move(sig)).second)
         continue; // identical to an already-built loop — refill from the queue
     }
+    // (b2) distance gate: a loop the correction could not bring near the asked distance
+    // is stashed with the gated loops and its slot refilled from the queue; it reaches
+    // the bank only if the bank would otherwise under-fill, ranked behind every clean loop.
+    if (roundtrip_disterr_gate > 0.0 && built->dist_err > roundtrip_disterr_gate) {
+      ++disterr_gated;
+      built->gated = true;
+      if (dirty_loops.size() < want)
+        dirty_loops.push_back(std::move(*built));
+      continue;
+    }
     // Item 4 near-dup sharing filter (wayfinder #46): reject a loop that retreads more
     // than kSharingRejectFrac of its fresh-road length onto an already-kept loop, and
     // refill the slot from the queue — the byte-identical dedup above generalized from
@@ -3511,6 +3522,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " astar_labels=" + std::to_string(astar_labels) +
              " astar_fb_labels=" + std::to_string(astar_fb_labels) +
              " astar_calls=" + std::to_string(astar_calls) +
+             " disterr_gated=" + std::to_string(disterr_gated) +
              " seed=" + std::to_string(options.roundtrip().seed()) +
              " target=" + std::to_string(static_cast<int64_t>(options.roundtrip().target_distance())) +
              " nexcl=" + std::to_string(options.roundtrip().exclude_turnarounds_size()) +

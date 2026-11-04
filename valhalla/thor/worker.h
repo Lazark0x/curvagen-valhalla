@@ -207,6 +207,10 @@ protected:
   // (b2) distance-error tier: within a rung tier, a built loop whose distance error is
   // above this ranks after every loop within it (0 = off).
   double roundtrip_disterr_tier;
+  // (b2) distance gate: a built loop whose distance error is still above this after the
+  // distance correction is stashed like a gated loop, its slot refilled from the queue,
+  // and served only to top up an under-filled bank (0 = off).
+  double roundtrip_disterr_gate;
   // proto/v4-p2 (curvagen-valhalla#11): the Suurballe-Tarjan whole-loop pair pass.
   // roundtrip_pair_pass swaps harvest->select->return-A* for one disjoint-pair pass
   // over the harvest forest (the return is the pair's second path, reversed);
