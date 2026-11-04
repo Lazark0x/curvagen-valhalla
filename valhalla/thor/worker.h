@@ -54,6 +54,8 @@ public:
   void route(Api& request);
   // ADR-0033: native round-trip loop action (branched from route() on options.roundtrip).
   void roundtrip_impl(Api& request, const std::string& costing);
+  // curvagen-valhalla#28: roundtrip_impl under exclude_turnarounds, topped up when short.
+  void roundtrip_excluding(Api& request, const std::string& costing);
   std::string matrix(Api& request);
   void optimized_route(Api& request);
   std::string isochrones(Api& request);
