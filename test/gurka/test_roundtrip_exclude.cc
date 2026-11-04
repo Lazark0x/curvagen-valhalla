@@ -150,3 +150,41 @@ TEST_F(RoundTripExclude, DeepPickServesTheBestSurvivorWhateverTheSeed) {
   ASSERT_GE(a.trip().routes_size(), 1);
   EXPECT_EQ(gurka::detail::get_paths(a), gurka::detail::get_paths(b));
 }
+
+TEST_F(RoundTripExclude, OffTargetFreshLoopGivesWayToTheRepeat) {
+  // Under exclusions a fresh loop past thor.roundtrip_disterr_tier is never served: the
+  // plain run answers instead, a repeat the orchestrator reads as a spent cell. A tier of
+  // ~0 and an ask 1 m off the rectangles make every loop on this map off target.
+  gurka::map strict = map;
+  strict.config.put("thor.roundtrip_disterr_tier", 1e-9);
+  auto run = [](const gurka::map& m, const std::vector<midgard::PointLL>& exclude) {
+    std::unordered_map<std::string, std::string> options = {
+        {"/roundtrip/target_distance", "14001"},
+        {"/roundtrip/num_candidates", "1"},
+        {"/roundtrip/seed", "0"},
+    };
+    for (size_t i = 0; i < exclude.size(); ++i) {
+      options[at(std::to_string(i), "lat")] = std::to_string(exclude[i].lat());
+      options[at(std::to_string(i), "lon")] = std::to_string(exclude[i].lng());
+    }
+    return gurka::do_action(valhalla::Options::route, m, {"A", "A"}, "motorcycle", options);
+  };
+  const auto first = run(map, {});
+  ASSERT_EQ(first.trip().routes_size(), 1);
+  const auto t1 = turnaround(first, 0);
+
+  // No exclusions: the guard does not apply, the answer is the plain one.
+  EXPECT_EQ(gurka::detail::get_paths(run(strict, {})), gurka::detail::get_paths(first));
+
+  // Excluded: the other rectangle is off target, so the plain run is served.
+  const auto guarded = run(strict, {t1});
+  ASSERT_EQ(guarded.trip().routes_size(), 1);
+  EXPECT_EQ(gurka::detail::get_paths(guarded), gurka::detail::get_paths(first));
+
+  // Guard off: the fresh off-target loop is served as before.
+  gurka::map unguarded = strict;
+  unguarded.config.put("thor.roundtrip_exclude_disterr_guard", false);
+  const auto fresh = run(unguarded, {t1});
+  ASSERT_EQ(fresh.trip().routes_size(), 1);
+  EXPECT_GT(turnaround(fresh, 0).Distance(t1), 700.0);
+}
