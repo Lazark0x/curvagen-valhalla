@@ -406,6 +406,11 @@ message RoundTrip {
   oneof has_seed {
     uint32 seed = 3;             // Shuffle seed: rotates bearing-diversity buckets so the
   }                              // same (start,target,curviness) yields a different loop set
+  repeated LatLng exclude_turnarounds = 4; // Turnarounds a Shuffle already served: candidate
+                                           // turnarounds near any of them are dropped
+  oneof has_exclude_radius_m {
+    double exclude_radius_m = 5; // Exclusion radius in meters (default: the min-separation guard)
+  }
 }
 
 message Options {

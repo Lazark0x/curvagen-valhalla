@@ -1,4 +1,5 @@
 #include "baldr/attributes_controller.h"
+#include "midgard/encoded.h"
 #include "midgard/logging.h"
 #include "proto/common.pb.h"
 #include "thor/road_twin_index.h"
@@ -234,7 +235,10 @@ void thor_worker_t::route(Api& request) {
 
   // ADR-0033: native round-trip loop action. locations are [start, start].
   if (options.has_roundtrip()) {
-    roundtrip_impl(request, costing);
+    if (options.roundtrip().exclude_turnarounds_size() > 0)
+      roundtrip_excluding(request, costing);
+    else
+      roundtrip_impl(request, costing);
     return;
   }
 
@@ -1212,6 +1216,68 @@ double seam_stub_m(const std::vector<PathInfo>& fwd,
 
 } // namespace
 
+// curvagen-valhalla#28: exclusions never cost a Shuffle a loop the cell has. An excluded
+// run that comes back short of K is topped up from one run without the exclusions; the
+// top-up keeps the min-separation guard against the fresh loops and ranks after them.
+// If that would serve fewer loops than the plain run alone, the plain run is served.
+void thor_worker_t::roundtrip_excluding(Api& request, const std::string& costing) {
+  const auto& rt = request.options().roundtrip();
+  const uint32_t want = std::max<uint32_t>(1, rt.num_candidates());
+  const double min_separation_m = 0.1 * (rt.target_distance() / 2.0);
+  Api plain = request;
+  plain.mutable_options()->mutable_roundtrip()->clear_exclude_turnarounds();
+  plain.mutable_options()->mutable_roundtrip()->clear_has_exclude_radius_m();
+
+  try {
+    roundtrip_impl(request, costing);
+  } catch (const valhalla_exception_t& e) {
+    if (e.code != 442)
+      throw;
+    request.mutable_trip()->clear_routes();
+  }
+  auto& fresh = *request.mutable_trip()->mutable_routes();
+  if (static_cast<uint32_t>(fresh.size()) >= want)
+    return;
+
+  // The plain run is today's answer: with no fresh loop it is served whole, its 442
+  // included.
+  try {
+    roundtrip_impl(plain, parse_costing(plain));
+  } catch (const valhalla_exception_t& e) {
+    if (e.code != 442 || fresh.empty())
+      throw;
+    return; // the fresh loops are all the cell has
+  }
+  auto turnaround = [](const TripRoute& r) {
+    return midgard::decode<std::vector<PointLL>>(r.legs(0).shape()).back();
+  };
+  std::vector<PointLL> served;
+  for (const auto& r : fresh)
+    served.push_back(turnaround(r));
+  std::vector<int> top_up;
+  for (int i = 0; i < plain.trip().routes_size(); ++i) {
+    if (served.size() + top_up.size() >= want)
+      break;
+    const PointLL t = turnaround(plain.trip().routes(i));
+    if (std::all_of(served.begin(), served.end(), [&](const PointLL& s) {
+          return static_cast<double>(t.Distance(s)) >= min_separation_m;
+        }))
+      top_up.push_back(i);
+  }
+  const size_t fresh_count = served.size();
+  if (fresh_count + top_up.size() < static_cast<size_t>(plain.trip().routes_size())) {
+    request.mutable_trip()->Swap(plain.mutable_trip());
+    LOG_INFO("roundtrip exclude: under-filled " + std::to_string(fresh_count) + "/" +
+             std::to_string(want) + ", served the plain run");
+    return;
+  }
+  for (int i : top_up)
+    *fresh.Add() = plain.trip().routes(i);
+  LOG_INFO("roundtrip exclude: under-filled " + std::to_string(fresh_count) + "/" +
+           std::to_string(want) + ", topped up " + std::to_string(top_up.size()) +
+           " from the plain run");
+}
+
 // ADR-0033 native round-trip: one forward expansion grows the curvy frontier; turnarounds
 // are harvested near target/2, bearing-bucketed for diversity, and each is closed by a
 // leash-penalized return with a one-shot distance correction. The N loops serialize as
@@ -1367,6 +1433,32 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " dropped=" + std::to_string(pair_cands_dropped) +
              " merged=" + std::to_string(pair_cands_merged) +
              " rehung=" + std::to_string(pair_cands_rehung));
+  }
+
+  // curvagen-valhalla#28: turnarounds a Shuffle already served. A candidate within the
+  // radius of one is dropped here, before bucketing and pair selection, and from the
+  // Distance Flex re-scan below, so the served loops cannot come back. The default
+  // radius is the min-separation guard's: an excluded turnaround is treated like a
+  // loop already in this bank. No entries = no test, the v4 selection unchanged.
+  std::vector<PointLL> excluded_lls;
+  for (const auto& ll : options.roundtrip().exclude_turnarounds())
+    excluded_lls.emplace_back(ll.lng(), ll.lat());
+  const double exclude_radius_m = options.roundtrip().has_exclude_radius_m_case()
+                                      ? options.roundtrip().exclude_radius_m()
+                                      : 0.1 * (target / 2.0);
+  auto excluded = [&](const PointLL& ll) {
+    for (const auto& e : excluded_lls)
+      if (static_cast<double>(ll.Distance(e)) < exclude_radius_m)
+        return true;
+    return false;
+  };
+  uint32_t excluded_count = 0;
+  if (!excluded_lls.empty()) {
+    const size_t before = cands.size();
+    cands.erase(std::remove_if(cands.begin(), cands.end(),
+                               [&](const Turnaround& t) { return excluded(t.ll); }),
+                cands.end());
+    excluded_count = static_cast<uint32_t>(before - cands.size());
   }
 
   // 2) Dedup turnarounds by node (best curviness per node) so candidates are genuinely
@@ -2280,6 +2372,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     scan_ms += ms_since(t_scan);
     const uint32_t base = static_cast<uint32_t>(cands.size());
     for (const auto& t : wide) {
+      if (!excluded_lls.empty() && excluded(t.ll))
+        continue;
       if (!pairs) {
         if (queued.insert(t.node).second)
           cands.push_back(t);
@@ -3157,6 +3251,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (fallback_count > 0)
     LOG_INFO("roundtrip: " + std::to_string(fallback_count) +
              " candidate(s) fell back to the soft leash (Fallback Loop)");
+  if (!excluded_lls.empty())
+    LOG_INFO("roundtrip exclude: points=" + std::to_string(excluded_lls.size()) +
+             " radius_m=" + std::to_string(static_cast<int>(exclude_radius_m)) +
+             " harvest_dropped=" + std::to_string(excluded_count) +
+             " loops=" + std::to_string(loops.size()) + "/" + std::to_string(want));
   // proto/v4-p1 road-identity ledger.
   LOG_INFO("roundtrip identity: twins_excluded=" + std::to_string(twins_excluded) +
            " parallels_leashed=" + std::to_string(parallels_leashed) + " over " +

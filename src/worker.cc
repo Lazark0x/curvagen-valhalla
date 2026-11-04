@@ -17,6 +17,7 @@
 #include <boost/property_tree/ptree.hpp>
 #include <cpp-statsd-client/StatsdClient.hpp>
 
+#include <cmath>
 #include <sstream>
 
 using namespace valhalla;
@@ -1320,6 +1321,26 @@ void from_json(rapidjson::Document& doc, Options::Action action, Api& api) {
       pb->set_num_candidates(std::min(16u, std::max(1u, *nc)));
     if (auto sd = rapidjson::get_optional<unsigned int>(*rt, "/seed"))
       pb->set_seed(*sd);
+    // Turnarounds a Shuffle already served (curvagen-valhalla#28). Entries without a
+    // numeric lat/lon are skipped; the list is capped because every harvest candidate
+    // is tested against every entry.
+    auto ex = rapidjson::get_child_optional(*rt, "/exclude_turnarounds");
+    if (ex && ex->IsArray()) {
+      constexpr size_t kMaxExcludedTurnarounds = 64;
+      for (const auto& pt : ex->GetArray()) {
+        if (static_cast<size_t>(pb->exclude_turnarounds_size()) >= kMaxExcludedTurnarounds)
+          break;
+        auto lat = rapidjson::get_optional<double>(pt, "/lat");
+        auto lon = rapidjson::get_optional<double>(pt, "/lon");
+        if (!lat || !lon || std::abs(*lat) > 90.0 || std::abs(*lon) > 180.0)
+          continue;
+        auto* ll = pb->add_exclude_turnarounds();
+        ll->set_lat(*lat);
+        ll->set_lng(*lon);
+      }
+    }
+    if (auto er = rapidjson::get_optional<double>(*rt, "/exclude_radius_m"); er && *er >= 0.0)
+      pb->set_exclude_radius_m(*er);
   }
 
   // whether to return guidance_views, default false
