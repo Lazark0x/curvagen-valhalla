@@ -39,6 +39,12 @@ struct CandidateConnection {
  */
 class BidirectionalAStar : public PathAlgorithm {
 public:
+  // MEASUREMENT (research/b2-variants): labels created by the last search (forward +
+  // reverse), read before Clear() as the expansion meter.
+  size_t label_count() const {
+    return edgelabels_forward_.size() + edgelabels_reverse_.size();
+  }
+
   /**
    * Constructor.
    * @param config A config object of key, value pairs

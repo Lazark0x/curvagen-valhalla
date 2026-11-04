@@ -12,6 +12,7 @@ import concurrent.futures
 import datetime
 import hashlib
 import json
+import os
 import statistics as st
 import time
 import urllib.error
@@ -100,7 +101,7 @@ def costing(curviness: float, avoid_motorways: bool) -> dict:
     def r2(x):
         return float(f"{x:.2f}")
 
-    return {
+    m = {
         "motorcycle": {
             "use_highways": r2(use_highways),
             "use_trails": r2(use_trails),
@@ -113,6 +114,12 @@ def costing(curviness: float, avoid_motorways: bool) -> dict:
             "prefer_elevation": 0.3,
         }
     }
+    # MEASUREMENT (research/b2-variants): extra engine-side costing fields, e.g.
+    # {"curvature_rescale": 2}; unset = the prod contract verbatim.
+    extra = os.environ.get("LOOPQUAL_COSTING_EXTRA")
+    if extra:
+        m["motorcycle"].update(json.loads(extra))
+    return m
 
 
 def build_request(job, serving: bool):

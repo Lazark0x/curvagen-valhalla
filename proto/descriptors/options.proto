@@ -379,6 +379,13 @@ message Costing {
     oneof has_prefer_elevation {
       float prefer_elevation = 1100;
     }
+    // MEASUREMENT (research/b2-variants): which (b2) curvature rescale the motorcycle
+    // costing runs. 0 off; 1 edges divided by the smallest factor; 2 transitions times
+    // the smallest factor; 3 transitions times the smallest factor over the smallest
+    // factor without the fork's discounts. Not for merging.
+    oneof has_curvature_rescale {
+      uint32 curvature_rescale = 1199;
+    }
   }
 
   oneof has_options {

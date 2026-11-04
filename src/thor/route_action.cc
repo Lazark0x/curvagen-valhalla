@@ -1300,6 +1300,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   auto ms_since = [](ledger_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(ledger_clock::now() - t0).count();
   };
+  size_t astar_labels = 0, astar_fb_labels = 0, astar_calls = 0; // MEASUREMENT (b2-variants)
   double harvest_ms = 0, scan_ms = 0, walkback_ms = 0, rejoin_ms = 0, astar_ms = 0,
          astar_fb_ms = 0, seam_ms = 0, build_ms = 0;
   // proto/v4-p1.1: the geometry Defect Gate's own budget (score + return-leg decode).
@@ -2113,6 +2114,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       paths.clear();
     }
     astar_ms += ms_since(t_astar);
+    astar_labels += bidir_astar.label_count();
+    ++astar_calls;
     rung = 0;
 
     // One rung of the ladder: re-arm the leash/grade/bar tiers and search again.
@@ -2135,6 +2138,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         paths.clear();
       }
       astar_fb_ms += ms_since(t_fb);
+      astar_fb_labels += bidir_astar.label_count();
     };
 
     // Ticket-literal rung: parallels released, twins still barred.  Default off — see
@@ -2163,6 +2167,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       const auto t_fb = ledger_clock::now();
       paths = bidir_astar.GetBestPath(from, to, *reader, mode_costing, mode, options);
       astar_fb_ms += ms_since(t_fb);
+      astar_fb_labels += bidir_astar.label_count();
     }
     if (paths.empty())
       rung = 3; // no route on any rung — the candidate fails
@@ -3379,8 +3384,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   const bool built_rank = roundtrip_built_ranking;
   const bool relaxed_last = roundtrip_pair_relaxed_last;
   const bool rescue_last = pairs && roundtrip_pair_rescue_last;
+  const double disterr_tier = roundtrip_disterr_tier;
   std::stable_sort(loops.begin(), loops.end(),
-                   [built_rank, relaxed_last, rescue_last](const Loop& a, const Loop& b) {
+                   [built_rank, relaxed_last, rescue_last, disterr_tier](const Loop& a,
+                                                                         const Loop& b) {
                      if (!built_rank) {
                        if (a.fallback != b.fallback)
                          return !a.fallback;
@@ -3390,6 +3397,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                      // loop's score.
                      if (a.tier() != b.tier())
                        return a.tier() < b.tier();
+                     // (b2): within a tier, a loop far off the asked distance ranks after
+                     // every loop near it, however curvy.
+                     if (disterr_tier > 0.0 &&
+                         (a.dist_err > disterr_tier) != (b.dist_err > disterr_tier))
+                       return a.dist_err <= disterr_tier;
                      // proto/v4-p2.1 (d): within a tier, the rescue builder's loops — no pair
                      // certificate, the slow heavy-reuse ones — rank behind pair-built loops.
                      if (rescue_last && a.pair_built != b.pair_built)
@@ -3496,6 +3508,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " seam=" + ms(seam_ms) + " gate=" + ms(gate_ms) + " build=" + ms(build_ms) +
              " f01_key=" + ms(expander.f01_key_ms()) + " f01_dfs=" + ms(expander.f01_dfs_ms()) +
              " f01_labels=" + std::to_string(expander.f01_labels_scanned()) +
+             " astar_labels=" + std::to_string(astar_labels) +
+             " astar_fb_labels=" + std::to_string(astar_fb_labels) +
+             " astar_calls=" + std::to_string(astar_calls) +
+             " seed=" + std::to_string(options.roundtrip().seed()) +
+             " target=" + std::to_string(static_cast<int64_t>(options.roundtrip().target_distance())) +
+             " nexcl=" + std::to_string(options.roundtrip().exclude_turnarounds_size()) +
              " (ms) attempts=" + std::to_string(attempts) +
              " corrections=" + std::to_string(correction_count) +
              " fallbacks=" + std::to_string(fallback_count) +
