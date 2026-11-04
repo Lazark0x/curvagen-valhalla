@@ -92,7 +92,9 @@ constexpr float kSurfaceFactor[] = {
 // Maps DirectedEdge::curvature() (0-15) to a cost factor.
 // New metric (mjolnir compute_curvature): 0 = straight, 15 = maximally twisty.
 // Negative values reward twistiness (make the edge cheaper). Calibrated in Task 5.
-constexpr float kCurvatureFactor[] = {
+// Not named kCurvatureFactor: upstream PR #6449 adds valhalla::sif::kCurvatureFactor to
+// dynamiccost.h, and the two names would collide on the next rebase.
+constexpr float kForkCurvatureDiscount[] = {
     0.00f,  // 0 straight
     -0.02f, // 1
     -0.04f, // 2
@@ -481,7 +483,7 @@ Cost MotorcycleCost::EdgeCost(const baldr::DirectedEdge* edge,
   float factor = kDensityFactor[edge->density()] +
                  highway_factor_ * kHighwayFactor[static_cast<uint32_t>(edge->classification())] +
                  surface_factor_ * kSurfaceFactor[static_cast<uint32_t>(edge->surface())] +
-                 curvature_factor_ * kCurvatureFactor[edge->curvature()];
+                 curvature_factor_ * kForkCurvatureDiscount[edge->curvature()];
   // ADR-0032 elevation: reward grade (hilly/scenic). weighted_grade 0..15, 6 = flat.
   // The small grade discount cannot drive factor negative for realistic grades.
   if (elevation_factor_ != 0.0f) {
