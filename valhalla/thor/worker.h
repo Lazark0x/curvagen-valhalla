@@ -207,6 +207,11 @@ protected:
   // Distance-error tier: within a rung tier, a built loop whose distance error is above
   // this ranks after every loop within it, however curvy (0 = off).
   double roundtrip_disterr_tier;
+  // Under exclude_turnarounds (a Shuffle), a fresh loop whose distance error is above
+  // roundtrip_disterr_tier is never served: the build walk refuses it and keeps looking,
+  // and the plain run tops a short answer up (curvagen-valhalla#28 follow-up). Requests
+  // without exclusions are untouched. Off (false) = every fresh loop counts.
+  bool roundtrip_exclude_disterr_guard;
   // proto/v4-p2 (curvagen-valhalla#11): the Suurballe-Tarjan whole-loop pair pass.
   // roundtrip_pair_pass swaps harvest->select->return-A* for one disjoint-pair pass
   // over the harvest forest (the return is the pair's second path, reversed);

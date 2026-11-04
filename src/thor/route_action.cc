@@ -2970,6 +2970,15 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // leash Fallback Loop, gated and ranked last — never a 442 where P1.1 has a loop.
   uint32_t pair_rescue_attempts = 0, pair_rescue_loops = 0;
   bool rescue_pass = false;
+  // A Shuffle's off-target guard (thor.roundtrip_exclude_disterr_guard): exclusions empty the
+  // cell's on-target pairs first, and what the walk then builds (the deep queue, the twin
+  // last resort, the rescue pass) closes on full-repair returns that can run 2-3x the asked
+  // distance. With K loops built the tier cannot rank them away, so under exclusions a fresh
+  // loop past the tier is refused here and the walk keeps looking; a short answer is topped
+  // up from the plain run, a repeat the orchestrator reads as a spent cell.
+  const bool exclude_guard =
+      roundtrip_exclude_disterr_guard && !excluded_lls.empty() && roundtrip_disterr_tier > 0.0;
+  uint32_t exclude_offtarget_refused = 0, exclude_offtarget_dropped = 0;
   auto build_loop = [&]() {
   while (true) {
     if (loops.size() >= want)
@@ -3074,6 +3083,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       // Correction failed or was worse: the original loop stands (one shot, no loop).
     }
 
+    if (exclude_guard && built->dist_err > roundtrip_disterr_tier) {
+      ++exclude_offtarget_refused;
+      continue; // an off-target fresh loop: keep looking, else the plain run tops up
+    }
     {
       std::vector<uint64_t> sig;
       sig.reserve(built->fwd.size() + built->ret.size());
@@ -3365,6 +3378,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
           loops.push_back(std::move(d));
     LOG_INFO("roundtrip: topped the bank up with " + std::to_string(loops.size() - before) +
              " gated loop(s) as a last resort (had " + std::to_string(before) + ")");
+  }
+  if (exclude_guard) {
+    // the builds outside the walk (twin last resort, gated top-up) answer to it too
+    const size_t before = loops.size();
+    loops.erase(std::remove_if(loops.begin(), loops.end(),
+                               [&](const Loop& L) { return L.dist_err > roundtrip_disterr_tier; }),
+                loops.end());
+    exclude_offtarget_dropped = static_cast<uint32_t>(before - loops.size());
+    LOG_INFO("roundtrip exclude: off-target refused=" + std::to_string(exclude_offtarget_refused) +
+             " dropped=" + std::to_string(exclude_offtarget_dropped) +
+             " loops=" + std::to_string(loops.size()));
   }
   if (loops.empty())
     throw valhalla_exception_t{442};
