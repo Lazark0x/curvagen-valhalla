@@ -1,6 +1,6 @@
 # 0041 — Round-trip v4 loop-quality gate (Gate v2): rider-calibrated, three tiers, judged on the served surface
 
-- **Status:** Accepted (2026-09-07); **amended 2026-09-07** — T2's comparison set, T3 for the v4 cutover, T5's surface (see *Amendment* below; ticket [#16](https://github.com/Lazark0x/curvagen-valhalla/issues/16))
+- **Status:** Accepted (2026-09-07); **amended 2026-09-07** — T2's comparison set, T3 for the v4 cutover, T5's surface (see *Amendment* below; ticket [#16](https://github.com/Lazark0x/curvagen-valhalla/issues/16)); **amended 2026-11-04** — T1's reference for Shuffles (see *Amendment 2026-11-04*; ticket [#28](https://github.com/Lazark0x/curvagen-valhalla/issues/28))
 - **Context:** Wayfinder map [curvagen-valhalla#4](https://github.com/Lazark0x/curvagen-valhalla/issues/4) (round-trip v4), ticket [#7](https://github.com/Lazark0x/curvagen-valhalla/issues/7). Gate v1.2/v1.3 (ADR-0037) passed every absolute at every curviness on a corpus built from real demand while 64 % of demand-cell loops carried ≥ 500 m of retrace no gate input could see (defect atlas v2, #5). The 180-loop Rider-Verdict Calibration Set (#6, labeled blind by Andrey) then measured the detector bank against the rider: any detector at its pinned threshold catches 64 of the 65 loops he rejects and fires on 54 of the 115 he accepts (precision 0.54). Rings are not a rider defect (20/20 OK); the exempt stem is not (19/20); the parallel-carriageway near-mirror — the census's headline residual — is rider-visible 44 % of the time; same-pavement and reuse retraces are (89 % / 100 %). Same-pavement runs and reuse outside the exemption agree with the rider at F1 0.73–0.75; nothing else exceeds 0.6.
 
 ## Decision
@@ -71,6 +71,12 @@ Neither candidate passes today. The P1.1 knee fails T3 (1.227×, measured twice 
 7. **Everything else stands** — the reject tier, T1, T4, T6, the canaries, the Start Exemption, provenance leaving the engine, the home of metrics v2 / `gate_v2.py` (the v4 build task, [#15](https://github.com/Lazark0x/curvagen-valhalla/issues/15), whose spec is this amended table).
 
 **What this does to the ladder.** P2.1 d passes the amended Gate v2 on every tier; the v4 build task is unblocked with this table as its acceptance; cutover remains fog on the map (tile rebuild if the twin map goes `TaggedValue`, GitHub Actions re-enabled on the fork, the orchestrator `FINGERPRINT_VERSION` bump, deploy on Andrey's go with warm rollback).
+
+## Amendment 2026-11-04 — T1 for Shuffles (ticket #28)
+
+**Context.** Before `exclude_turnarounds`, a K = 3 Shuffle served the same three or four loops again and again: 92 % of the loops in Shuffles 2–6 repeated an earlier one. T1 read against that served set measures the curviest few loops of a cell, counted many times over. A Shuffle that serves ~17 distinct loops in six serves cannot match it: today's set reads **326 / 320** (c0.5 / c1.0), while the engine's own best 16 distinct loops for the same cells (one K = 16 request per cell, the `oracle16` reference) read **292 / 299** (`docs/curvagen/research/2026-11-04-shuffle-variety-levers.md`, branch `research/shuffle-variety` @ `8701b9304`, §2 and TL;DR).
+
+**Decision (Andrey, 2026-11-04).** For Shuffle variants (requests carrying `exclude_turnarounds`), **T1's reference is the `oracle16` read, not today's repeat-inflated served set.** The threshold stays ≥ 0.95×. Apex exclusion at 0.08 × distance with the deep pick reads 288 / 298, which is 0.99× / 1.00× of that reference (research doc §4.1). Against today's set it would read 0.88× / 0.93×. The distance budget for Shuffles is p90 |served − requested| / requested < 30 %. T1 for the first serve of a request, and for every request without the field, is unchanged: that answer is byte-identical to the engine without the field.
 
 ## References
 
