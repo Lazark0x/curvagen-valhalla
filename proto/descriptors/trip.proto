@@ -434,8 +434,9 @@ message TripRoute {
   // built THIS candidate. Additive and fork-local — the app contract does not
   // carry it (the orchestrator drops unknown fields), the loop-quality harness
   // reads it so D4 ("was this a Fallback Loop") and the served-tier check stop
-  // being geometric guesses. Tag 100 keeps clear of upstream's growth.
-  CurvagenProvenance curvagen_provenance = 100;
+  // being geometric guesses. Fork-private tag 1100 (was 100) keeps clear of
+  // upstream's growth.
+  CurvagenProvenance curvagen_provenance = 1100;
 }
 
 message Trip {

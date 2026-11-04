@@ -358,20 +358,26 @@ message Costing {
     oneof has_multimodal_start_end_max_distance {
       uint32 multimodal_start_end_max_distance = 96;
     }
+
     oneof has_low_class_factor {
       float low_class_factor = 97;
     }
+
+    // curvagen fork: private field numbers (old number + 1000). Upstream grows this
+    // message densely from 1 (it took 99 for steps_factor), so fork fields live at
+    // >= 1000 and never collide on a rebase. Was 98/99/100/101 before; JSON keys are
+    // unchanged. Next free fork number here: 1102.
     oneof has_prefer_curvature {
-      float prefer_curvature = 101;
+      float prefer_curvature = 1101;
     }
     oneof has_reuse_penalty {
-      float reuse_penalty = 98;
+      float reuse_penalty = 1098;
     }
     oneof has_curviness_continuity {
-      float curviness_continuity = 99;
+      float curviness_continuity = 1099;
     }
     oneof has_prefer_elevation {
-      float prefer_elevation = 100;
+      float prefer_elevation = 1100;
     }
   }
 
@@ -580,7 +586,8 @@ message Options {
   TileOptions tile_options = 64;                                   // additional /tile specific options
   repeated Levels exclude_levels = 65;                             // Levels to exclude within the exclude_polygon at the same index
   uint32 expansion_max_distance = 66;                              // Maximum path distance in meters for expansion. 0 = disabled.
+  // curvagen fork: private field number (was 67, upstream's next free number).
   oneof has_roundtrip {
-    RoundTrip roundtrip = 67;  // Present => route() runs the native round-trip loop action (ADR-0033)
+    RoundTrip roundtrip = 1067;  // Present => route() runs the native round-trip loop action (ADR-0033)
   }
 }
