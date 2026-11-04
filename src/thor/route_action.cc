@@ -1615,6 +1615,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         return true;
     return false;
   };
+  // A Shuffle with exclusions gets its variety from them, so each pair-mode sector serves
+  // the best survivor of a deeper shortlist instead of a seed-rotated one ("deep pick",
+  // docs/curvagen/research/2026-11-04-shuffle-variety-levers.md §3.2).
+  const bool deep_pick = !excluded_lls.empty();
+  constexpr uint32_t kDeepPickShortlist = 32;
   uint32_t excluded_count = 0;
   if (!excluded_lls.empty()) {
     const size_t before = cands.size();
@@ -1948,9 +1953,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       // — no pair, off band, twin ride, near-dup of a chosen loop are all selection-time
       // rejects that never buy a build; the survivors are ranked by pair score and the
       // seed rotates among them.
+      const uint32_t shortlist = deep_pick ? kDeepPickShortlist : roundtrip_pair_shortlist;
       const uint32_t topm =
-          std::min<uint32_t>(std::max<uint32_t>(1, roundtrip_pair_shortlist),
-                             static_cast<uint32_t>(bk.size()));
+          std::min<uint32_t>(std::max<uint32_t>(1, shortlist), static_cast<uint32_t>(bk.size()));
       std::vector<uint32_t> surv;
       for (uint32_t off = 0; off < topm; ++off) {
         const uint32_t pick = bk[off];
@@ -1985,7 +1990,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       }
       std::stable_sort(surv.begin(), surv.end(),
                        [&](uint32_t a, uint32_t c) { return div_score[a] > div_score[c]; });
-      const uint32_t pick = surv[(seed + b) % static_cast<uint32_t>(surv.size())];
+      const uint32_t pick =
+          deep_pick ? surv.front() : surv[(seed + b) % static_cast<uint32_t>(surv.size())];
       chosen.push_back(pick);
       pair_selected_keys.push_back(pair_cache[pick].keys);
       continue;

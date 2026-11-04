@@ -85,8 +85,7 @@ TEST_F(RoundTripExclude, ExcludedTurnaroundIsNotServedAgain) {
 TEST_F(RoundTripExclude, ExhaustedCellStillFills) {
   // On this map a rectangle can turn at either of its far corners, 2 km apart, so the
   // radius covers both: one excluded turnaround then excludes the whole rectangle.
-  const std::unordered_map<std::string, std::string> wide = {
-      {"/roundtrip/exclude_radius_m", "2500"}};
+  const std::unordered_map<std::string, std::string> wide = {{"/roundtrip/exclude_radius_m", "2500"}};
   const auto first = shuffle({});
   const auto second = shuffle({turnaround(first, 0)}, wide);
   ASSERT_EQ(second.trip().routes_size(), 1);
@@ -104,8 +103,8 @@ TEST_F(RoundTripExclude, ShortFreshRunIsToppedUpRankedLast) {
 
   // K=2 excluding the first rectangle (both its far corners, as above): one fresh loop,
   // topped up with the excluded rectangle from the plain run.
-  const auto both = shuffle({t1}, {{"/roundtrip/num_candidates", "2"},
-                                   {"/roundtrip/exclude_radius_m", "2500"}});
+  const auto both =
+      shuffle({t1}, {{"/roundtrip/num_candidates", "2"}, {"/roundtrip/exclude_radius_m", "2500"}});
   ASSERT_EQ(both.trip().routes_size(), 2);
   EXPECT_GT(turnaround(both, 0).Distance(t1), 2500.0) << "a fresh loop ranks first";
   EXPECT_LT(turnaround(both, 1).Distance(t1), 2500.0) << "the repeat ranks last";
@@ -140,4 +139,14 @@ TEST_F(RoundTripExclude, NoExclusionsLeavesTheAnswerUnchanged) {
   EXPECT_EQ(gurka::detail::get_paths(radius_only), gurka::detail::get_paths(plain));
   for (int i = 0; i < plain.trip().routes_size(); ++i)
     EXPECT_EQ(radius_only.trip().routes(i).legs(0).shape(), plain.trip().routes(i).legs(0).shape());
+}
+
+TEST_F(RoundTripExclude, DeepPickServesTheBestSurvivorWhateverTheSeed) {
+  // With exclusions present each sector serves its best survivor, so the seed no longer
+  // chooses: two seeds excluding the same far-off point get the same loops.
+  const midgard::PointLL far(0.0, 0.0);
+  const auto a = shuffle({far}, {{"/roundtrip/num_candidates", "2"}, {"/roundtrip/seed", "1"}});
+  const auto b = shuffle({far}, {{"/roundtrip/num_candidates", "2"}, {"/roundtrip/seed", "2"}});
+  ASSERT_GE(a.trip().routes_size(), 1);
+  EXPECT_EQ(gurka::detail::get_paths(a), gurka::detail::get_paths(b));
 }
