@@ -22,6 +22,7 @@
 
 #include <boost/property_tree/ptree_fwd.hpp>
 
+#include <chrono>
 #include <tuple>
 #include <vector>
 
@@ -223,6 +224,25 @@ protected:
   // plain run, so the loops that come back are the ones served longest ago. Off (false) =
   // straight to the plain-run top-up.
   bool roundtrip_exclude_recency_fallback;
+  // The Shuffle build budget: every refusal above costs a full build,
+  // and a deep Shuffle refused up to 30 per request. Once a request under
+  // exclude_turnarounds has refused roundtrip_exclude_max_refused loops (0 = no cap), or has
+  // run roundtrip_exclude_budget_ms of wall time when it refuses one (0 = no clock), its
+  // runs stop at their next refusal and fill from what is in hand: the in-budget loops the
+  // ride-through test refused (riding through the oldest excluded turnaround first), then
+  // the recency fallback and the plain run. Off-target loops stay refused.
+  uint32_t roundtrip_exclude_max_refused;
+  uint32_t roundtrip_exclude_budget_ms;
+  // The excluded run's wider search: deep-pick shortlist per sector, pair-evaluation budget
+  // multiplier, extra build attempts (64 / 2 / 8; the plain-run values are
+  // roundtrip_pair_shortlist / 1 / 0).
+  uint32_t roundtrip_exclude_shortlist;
+  uint32_t roundtrip_exclude_eval_scale;
+  uint32_t roundtrip_exclude_attempt_bonus;
+  // Per request (roundtrip_excluding): refusals so far, shared by the excluded run and the
+  // recency fallback, and the request's start.
+  uint32_t exclude_refused_ = 0;
+  std::chrono::steady_clock::time_point exclude_t0_;
   // proto/v4-p2 (curvagen-valhalla#11): the Suurballe-Tarjan whole-loop pair pass.
   // roundtrip_pair_pass swaps harvest->select->return-A* for one disjoint-pair pass
   // over the harvest forest (the return is the pair's second path, reversed);
