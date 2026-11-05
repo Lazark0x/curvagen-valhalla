@@ -1230,6 +1230,8 @@ void thor_worker_t::roundtrip_excluding(Api& request, const std::string& costing
   const double min_separation_m = 0.1 * (rt.target_distance() / 2.0);
   const int excluded_n = rt.exclude_turnarounds_size();
   const bool recency_fallback = roundtrip_exclude_recency_fallback && excluded_n >= 2;
+  exclude_refused_ = 0; // the build budget is per request (roundtrip_exclude_max_refused)
+  exclude_t0_ = std::chrono::steady_clock::now();
   Api plain = request;
   plain.mutable_options()->mutable_roundtrip()->clear_exclude_turnarounds();
   plain.mutable_options()->mutable_roundtrip()->clear_has_exclude_radius_m();
@@ -1495,10 +1497,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // docs/curvagen/research/2026-11-04-shuffle-variety-levers.md §3.2). The exclusions
   // empty the cell's best pairs first, so an excluded run also searches wider: a
   // shortlist of 64 (32 before the off-target guard), twice the pair-evaluation budget
-  // and kAttemptSlack more builds.
+  // and 8 more builds (thor.roundtrip_exclude_shortlist / _eval_scale / _attempt_bonus).
   const bool deep_pick = !excluded_lls.empty();
-  constexpr uint32_t kDeepPickShortlist = 64;
-  const uint32_t eval_scale = excluded_lls.empty() ? 1 : 2;
+  const uint32_t eval_scale =
+      excluded_lls.empty() ? 1 : std::max<uint32_t>(1, roundtrip_exclude_eval_scale);
   // A Shuffle's off-target guard (thor.roundtrip_exclude_disterr_guard): exclusions empty the
   // cell's on-target pairs first, and what the walk then builds (the deep queue, the twin
   // last resort, the rescue pass) closes on full-repair returns that can run 2-3x the asked
@@ -1512,12 +1514,31 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // near-twin whose own turnaround sits just past the radius on the same road.
   const double pass_m = exclude_guard ? roundtrip_exclude_pass_m : 0.0;
   const double pass_dlat = pass_m / 110000.0; // a cheap latitude prefilter, degrees
+  // the newest (highest-index: the list comes oldest first) excluded turnaround within
+  // pass_m of p, -1 for none
   auto near_excluded = [&](const PointLL& p) {
-    for (const auto& e : excluded_lls)
+    for (int i = static_cast<int>(excluded_lls.size()) - 1; i >= 0; --i) {
+      const auto& e = excluded_lls[i];
       if (std::fabs(p.lat() - e.lat()) < pass_dlat && static_cast<double>(p.Distance(e)) < pass_m)
-        return true;
-    return false;
+        return i;
+    }
+    return -1;
   };
+  // The build budget (thor.roundtrip_exclude_max_refused / _budget_ms): spent once the
+  // request has refused that many loops, or has run that long when it refuses one. A
+  // spent budget stops this run at its refusal; it fills from what is in hand.
+  const bool exclude_budget =
+      exclude_guard && (roundtrip_exclude_max_refused > 0 || roundtrip_exclude_budget_ms > 0);
+  auto exclude_budget_spent = [&]() {
+    if (!exclude_budget)
+      return false;
+    if (roundtrip_exclude_max_refused > 0 && exclude_refused_ >= roundtrip_exclude_max_refused)
+      return true;
+    return roundtrip_exclude_budget_ms > 0 &&
+           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - exclude_t0_)
+                   .count() >= roundtrip_exclude_budget_ms;
+  };
+  bool exclude_stop = false;
   uint32_t excluded_count = 0;
   if (!excluded_lls.empty()) {
     const size_t before = cands.size();
@@ -1851,7 +1872,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       // — no pair, off band, twin ride, near-dup of a chosen loop are all selection-time
       // rejects that never buy a build; the survivors are ranked by pair score and the
       // seed rotates among them.
-      const uint32_t shortlist = deep_pick ? kDeepPickShortlist : roundtrip_pair_shortlist;
+      const uint32_t shortlist = deep_pick ? roundtrip_exclude_shortlist : roundtrip_pair_shortlist;
       const uint32_t topm =
           std::min<uint32_t>(std::max<uint32_t>(1, shortlist), static_cast<uint32_t>(bk.size()));
       std::vector<uint32_t> surv;
@@ -2267,6 +2288,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // rather than inferred from !pair_built, because the provenance field on the
     // response (ADR-0041 §7) has to name the builder, not guess it.
     bool rescue = false;
+    // A near-twin of an excluded loop, served because the Shuffle build budget was spent
+    // (roundtrip_exclude_max_refused): it ranks after the fresh loops of its tier.
+    bool near_twin = false;
     // Rank tier, absolute: clean hard-exclude < twins released < soft leash < gated.
     uint8_t tier() const {
       return gated ? 3 : rung;
@@ -2465,9 +2489,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // Under exclusions (see exclude_guard): a loop the walk must refuse, off target or riding
   // through an excluded turnaround.
   uint32_t exclude_offtarget_refused = 0, exclude_pass_refused = 0;
-  auto rides_through_excluded = [&](const Loop& L) {
+  // the newest excluded turnaround L rides within pass_m of, -1 for none; `first` returns
+  // on the first one found
+  auto rides_through_excluded = [&](const Loop& L, bool first) {
+    int newest = -1;
     if (pass_m <= 0.0)
-      return false;
+      return newest;
     graph_tile_ptr tile;
     for (const auto* leg : {&L.fwd, &L.ret})
       for (const auto& pi : *leg) {
@@ -2475,24 +2502,37 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
           continue;
         const DirectedEdge* de = tile->directededge(pi.edgeid);
         const auto shape = tile->edgeinfo(de).shape(); // a copy: EdgeInfo is a temporary
-        for (const auto& p : shape)
-          if (near_excluded(p))
-            return true;
+        for (const auto& p : shape) {
+          newest = std::max(newest, near_excluded(p));
+          if (newest >= 0 && first)
+            return newest;
+        }
       }
-    return false;
+    return newest;
   };
-  auto refused_under_exclusion = [&](const Loop& L) {
+  // What a spent budget fills from: the in-budget loops the ride-through test refused (a
+  // near-twin of a served loop, so a repeat), with the newest excluded turnaround each
+  // rides through.
+  std::vector<std::pair<int, Loop>> pass_stash;
+  // `keep`: a clean build the budget may serve later (not one bound for the dirty stash)
+  auto refused_under_exclusion = [&](const Loop& L, bool keep) {
     if (!exclude_guard)
       return false;
+    bool refused = false;
     if (L.dist_err > roundtrip_disterr_tier) {
       ++exclude_offtarget_refused;
-      return true;
-    }
-    if (rides_through_excluded(L)) {
+      refused = true;
+    } else if (const int newest = rides_through_excluded(L, !(exclude_budget && keep)); newest >= 0) {
       ++exclude_pass_refused;
-      return true;
+      if (exclude_budget && keep && pass_stash.size() < 4 * want)
+        pass_stash.emplace_back(newest, L);
+      refused = true;
     }
-    return false;
+    if (refused) {
+      ++exclude_refused_;
+      exclude_stop = exclude_stop || exclude_budget_spent();
+    }
+    return refused;
   };
   auto finish_build = [&](Loop L) -> std::optional<Loop> {
     // Build-time Defect Gate (ADR-0037): a loop whose seam carries an exact-mirror
@@ -2563,13 +2603,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       L.seam_reject = seam_reject;
       if (seam_reject) {
         ++gate_seam_refills;
-        if (dirty_loops.size() < want && !refused_under_exclusion(L))
+        if (dirty_loops.size() < want && !refused_under_exclusion(L, false))
           dirty_loops.push_back(std::move(L));
         return std::nullopt;
       }
       if (gate_refills < gate_refill_budget) {
         ++gate_refills;
-        if (dirty_loops.size() < want && !refused_under_exclusion(L))
+        if (dirty_loops.size() < want && !refused_under_exclusion(L, false))
           dirty_loops.push_back(std::move(L));
         return std::nullopt;
       }
@@ -3065,12 +3105,16 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   bool rescue_pass = false;
   uint32_t exclude_offtarget_dropped = 0;
   if (exclude_guard)
-    attempt_cap += kAttemptSlack; // refused builds spend attempts; an excluded run gets more
+    attempt_cap += roundtrip_exclude_attempt_bonus; // refused builds spend attempts
 
   auto build_loop = [&]() {
   while (true) {
     if (loops.size() >= want)
       break;
+    if (exclude_stop) {
+      underfill_cause = "budget"; // the Shuffle build budget is spent
+      break;
+    }
     if (qi >= queue.size() || attempts >= attempt_cap) {
       if (roundtrip_f09_budget ? !stall_granted : !widened) {
         stall_granted = true;
@@ -3171,7 +3215,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       // Correction failed or was worse: the original loop stands (one shot, no loop).
     }
 
-    if (refused_under_exclusion(*built))
+    if (refused_under_exclusion(*built, true))
       continue; // keep looking; a short answer is topped up (roundtrip_excluding)
     {
       std::vector<uint64_t> sig;
@@ -3296,7 +3340,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   if (pairs && leg_mode && roundtrip_pair_leg_relax && loops.size() < want) {
     attempt_cap = std::max(attempt_cap,
                            attempts + (want - static_cast<uint32_t>(loops.size())) + kAttemptSlack);
-    for (uint8_t rung = 1; rung <= 3 && loops.size() < want; ++rung) {
+    for (uint8_t rung = 1; rung <= 3 && loops.size() < want && !exclude_stop; ++rung) {
       leg_relax_rung = rung;
       rung_evals = 0;
       leg_test_off = rung == 3;
@@ -3326,7 +3370,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // left, so the geometry gate can stash them for the per-slot last resort below.
     pair_allow_twin = true;
     for (uint32_t ci : pair_twin_candidates) {
-      if (loops.size() + dirty_loops.size() >= want)
+      if (loops.size() + dirty_loops.size() >= want || exclude_stop)
         break;
       auto& pe = pair_cache[ci];
       pe.checked = false; // re-evaluate with the twin verdict lifted
@@ -3340,7 +3384,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                   << " noret=" << rev_fail_access << " gap=" << rev_fail_gap << "\n";
       // the gate has judged the BUILT loop (a repaired return may be clean); under
       // exclusions a refused one leaves its slot to the next twin candidate
-      if (built && !refused_under_exclusion(*built))
+      if (built && !refused_under_exclusion(*built, true))
         loops.push_back(std::move(*built));
     }
     pair_allow_twin = false;
@@ -3467,6 +3511,30 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     LOG_INFO("roundtrip: topped the bank up with " + std::to_string(loops.size() - before) +
              " gated loop(s) as a last resort (had " + std::to_string(before) + ")");
   }
+  uint32_t exclude_stash_served = 0;
+  if (exclude_stop && loops.size() < want && !pass_stash.empty()) {
+    // The budget is spent: the slots left go to the near-twins in hand, those riding through
+    // the oldest excluded turnaround first, kept apart from the loops already served.
+    std::stable_sort(pass_stash.begin(), pass_stash.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (auto& [newest, L] : pass_stash) {
+      if (loops.size() >= want)
+        break;
+      if (L.cand != baldr::kInvalidLabel && !built_separated(cands[L.cand].ll))
+        continue;
+      std::vector<uint64_t> sig;
+      for (const auto* leg : {&L.fwd, &L.ret})
+        for (const auto& pi : *leg)
+          sig.push_back(pi.edgeid.value);
+      if (!served_sigs.insert(std::move(sig)).second)
+        continue;
+      if (L.cand != baldr::kInvalidLabel)
+        built_lls.push_back(cands[L.cand].ll);
+      L.near_twin = true;
+      loops.push_back(std::move(L));
+      ++exclude_stash_served;
+    }
+  }
   if (exclude_guard) {
     // the builds outside the walk (twin last resort, gated top-up) answer to it too
     const size_t before = loops.size();
@@ -3476,7 +3544,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     exclude_offtarget_dropped = static_cast<uint32_t>(before - loops.size());
     LOG_INFO("roundtrip exclude: pass refused=" + std::to_string(exclude_pass_refused) +
              " off-target refused=" + std::to_string(exclude_offtarget_refused) + " dropped=" +
-             std::to_string(exclude_offtarget_dropped) + " loops=" + std::to_string(loops.size()));
+             std::to_string(exclude_offtarget_dropped) + " loops=" + std::to_string(loops.size()) +
+             (exclude_budget ? " budget_stop=" + std::to_string(exclude_stop ? 1 : 0) +
+                                   " request_refused=" + std::to_string(exclude_refused_) +
+                                   " near_twins_served=" + std::to_string(exclude_stash_served)
+                             : std::string()));
   }
   if (loops.empty())
     throw valhalla_exception_t{442};
@@ -3513,6 +3585,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                      if (disterr_tier > 0.0 &&
                          (a.dist_err > disterr_tier) != (b.dist_err > disterr_tier))
                        return a.dist_err <= disterr_tier;
+                     if (a.near_twin != b.near_twin)
+                       return !a.near_twin;
                      // proto/v4-p2.1 (d): within a tier, the rescue builder's loops — no pair
                      // certificate, the slow heavy-reuse ones — rank behind pair-built loops.
                      if (rescue_last && a.pair_built != b.pair_built)

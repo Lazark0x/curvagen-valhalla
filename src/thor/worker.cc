@@ -112,6 +112,12 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_exclude_pass_m(config.get<double>("thor.roundtrip_exclude_pass_m", 50.0)),
       roundtrip_exclude_recency_fallback(
           config.get<bool>("thor.roundtrip_exclude_recency_fallback", true)),
+      roundtrip_exclude_max_refused(config.get<uint32_t>("thor.roundtrip_exclude_max_refused", 0)),
+      roundtrip_exclude_budget_ms(config.get<uint32_t>("thor.roundtrip_exclude_budget_ms", 0)),
+      roundtrip_exclude_shortlist(config.get<uint32_t>("thor.roundtrip_exclude_shortlist", 64)),
+      roundtrip_exclude_eval_scale(config.get<uint32_t>("thor.roundtrip_exclude_eval_scale", 2)),
+      roundtrip_exclude_attempt_bonus(
+          config.get<uint32_t>("thor.roundtrip_exclude_attempt_bonus", 8)),
       roundtrip_pair_pass(config.get<bool>("thor.roundtrip_pair_pass", true)),
       roundtrip_pair_bridge(config.get<bool>("thor.roundtrip_pair_bridge", false)),
       roundtrip_pair_sharing(config.get<bool>("thor.roundtrip_pair_sharing", true)),

@@ -292,3 +292,50 @@ TEST_F(RoundTripExcludeRing, NearTwinRidingThroughAnExcludedTurnaroundIsRefused)
   ASSERT_EQ(guarded.trip().routes_size(), 1);
   EXPECT_EQ(gurka::detail::get_paths(guarded), gurka::detail::get_paths(first));
 }
+
+TEST_F(RoundTripExcludeRing, SpentBuildBudgetServesTheNearTwinInHand) {
+  const auto first = shuffle(map, {});
+  ASSERT_EQ(first.trip().routes_size(), 1);
+  const auto t1 = turnaround(first, 0);
+  gurka::map no_pass = map;
+  no_pass.config.put("thor.roundtrip_exclude_pass_m", 0.0);
+  const auto twin = shuffle(no_pass, {t1});
+  ASSERT_EQ(twin.trip().routes_size(), 1);
+
+  // A budget of one refusal: the near-twin refused there is what the request has in hand,
+  // so it is served instead of a further search and the plain run.
+  gurka::map capped = map;
+  capped.config.put("thor.roundtrip_exclude_max_refused", 1);
+  const auto spent = shuffle(capped, {t1});
+  ASSERT_EQ(spent.trip().routes_size(), 1);
+  EXPECT_EQ(gurka::detail::get_paths(spent), gurka::detail::get_paths(twin));
+
+  // A budget the request never reaches changes nothing.
+  gurka::map roomy = map;
+  roomy.config.put("thor.roundtrip_exclude_max_refused", 1000);
+  roomy.config.put("thor.roundtrip_exclude_budget_ms", 600000);
+  EXPECT_EQ(gurka::detail::get_paths(shuffle(roomy, {t1})), gurka::detail::get_paths(first));
+}
+
+TEST_F(RoundTripExclude, SpentBuildBudgetStillRefusesOffTargetLoops) {
+  // Every loop on this map is off target under a tier of ~0: a spent budget serves none of
+  // them fresh, so the plain run answers, as without a budget.
+  gurka::map strict = map;
+  strict.config.put("thor.roundtrip_disterr_tier", 1e-9);
+  strict.config.put("thor.roundtrip_exclude_max_refused", 1);
+  std::unordered_map<std::string, std::string> options = {
+      {"/roundtrip/target_distance", "14001"},
+      {"/roundtrip/num_candidates", "1"},
+      {"/roundtrip/seed", "0"},
+  };
+  const auto first =
+      gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle", options);
+  ASSERT_EQ(first.trip().routes_size(), 1);
+  const auto t1 = turnaround(first, 0);
+  options[at("0", "lat")] = std::to_string(t1.lat());
+  options[at("0", "lon")] = std::to_string(t1.lng());
+  const auto guarded =
+      gurka::do_action(valhalla::Options::route, strict, {"A", "A"}, "motorcycle", options);
+  ASSERT_EQ(guarded.trip().routes_size(), 1);
+  EXPECT_EQ(gurka::detail::get_paths(guarded), gurka::detail::get_paths(first));
+}
