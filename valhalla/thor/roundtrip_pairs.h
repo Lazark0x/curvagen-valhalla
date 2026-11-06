@@ -1,9 +1,7 @@
 #ifndef VALHALLA_THOR_ROUNDTRIP_PAIRS_H_
 #define VALHALLA_THOR_ROUNDTRIP_PAIRS_H_
 
-// PROTOTYPE — proto/v4-p2 (curvagen-valhalla#11, P2 of the round-trip v4 ladder).
-// Throwaway code: no error handling beyond runnable, no abstraction beyond what the
-// measurement needs.  Do not merge into a serving branch as-is.
+// The round-trip v4 pair pass (ADR-0042), served by default.
 //
 // Suurballe & Tarjan, "A Quick Method for Finding Shortest Pairs of Disjoint Paths",
 // Networks 14 (1984) 325-336: for a directed graph with a source s and non-negative

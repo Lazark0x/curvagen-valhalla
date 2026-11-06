@@ -1,4 +1,4 @@
-// PROTOTYPE — proto/v4-p1 (curvagen-valhalla#10).  See valhalla/thor/road_twin_index.h.
+// See valhalla/thor/road_twin_index.h.
 #include "thor/road_twin_index.h"
 
 #include "baldr/graphconstants.h"

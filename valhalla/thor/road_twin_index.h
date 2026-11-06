@@ -1,9 +1,7 @@
 #ifndef VALHALLA_THOR_ROAD_TWIN_INDEX_H_
 #define VALHALLA_THOR_ROAD_TWIN_INDEX_H_
 
-// PROTOTYPE — proto/v4-p1 (curvagen-valhalla#10, P1 of the round-trip v4 ladder).
-// Throwaway code: no error handling beyond runnable, no abstraction beyond what the
-// measurement needs.  Do not merge into a serving branch as-is.
+// The round-trip v4 road-identity sidecar (ADR-0042), served by default.
 //
 // The census (docs/curvagen/research/2026-09-06-defect-atlas-v2.md §3) named one
 // mechanism as the whole rider-visible residual: F02, "the return rides the other

@@ -1796,7 +1796,7 @@ TEST_F(RtP11BuiltRanking, P11b_BuiltLoopScoreReordersTheBank) {
 //   M==N           a clean second lobe 1.5 km south: A-M-N, home over N-A
 //
 // The corridor's second edge E-B sits beyond the Start Exemption, so it and its twin
-// C-F are barred; the return falls to rung 1 and rides C-F home anyway — 1 500 m of
+// C-F are barred; the return falls back to the soft leash and rides C-F home — 1 500 m of
 // twin outside the exemption, the exact shape P1 left in slots 9-11.  With K = 1 the
 // gate must reject that loop and refill the slot with the clean lobe.
 // ---------------------------------------------------------------------------------
@@ -2515,16 +2515,16 @@ TEST_F(RtP2ReturnVsReturn, P2b_TwinRideInsideTheReturnIsRejectedAtSelection) {
 
 // ---------------------------------------------------------------------------------
 // P2c — the ONE-WAY REPAIR: the pair's second path rides a one-way in the start->T
-// direction, so the return cannot simply reverse it; the non-reversible stretch is
-// bridged by a local hard-excluded A* around it, the rest of the return is kept.
+// direction, so the return cannot simply reverse it; the whole return is rebuilt by the
+// hard-excluded return-leg router, which finds the C-E-D bypass.
 //
 //   S-------------A------------>T        SA, AT: the curvy forward road (curvature 12),
 //   |                            /       AT ONE-WAY east; DT joins D to T
 //   C------------>D             /        CD is ONE-WAY east; SC and DT two-way
-//   E-----------/                        C-E-D: the two-way bypass the bridge must find
+//   E-----------/                        C-E-D: the two-way bypass the repair must find
 //
-// The bridged T loop (S-A-T + T-D-E-C-S, 6 755 m) sits inside the band at 6 000 m; the
-// same edges ridden the other way round (sink D, no bridge) tie on score, and seed 0
+// The repaired T loop (S-A-T + T-D-E-C-S, 6 755 m) sits inside the band at 6 000 m; the
+// same edges ridden the other way round (sink D, no repair) tie on score, and seed 0
 // keeps the curvier harvest chain first.
 // ---------------------------------------------------------------------------------
 class RtP2OneWayRepair : public ::testing::Test {
@@ -2573,7 +2573,7 @@ protected:
 };
 gurka::map RtP2OneWayRepair::map = {};
 
-TEST_F(RtP2OneWayRepair, P2c_NonReversibleStretchIsBridged) {
+TEST_F(RtP2OneWayRepair, P2c_NonReversibleStretchIsRepaired) {
   map.config.put("thor.roundtrip_pair_pass", true);
   auto result = gurka::do_action(valhalla::Options::route, map, {"S", "S"}, "motorcycle",
                                  {{"/roundtrip/target_distance", "6000"},
@@ -2591,7 +2591,7 @@ TEST_F(RtP2OneWayRepair, P2c_NonReversibleStretchIsBridged) {
   EXPECT_EQ(count_name(ret, "DT"), 1) << "the reversible part of the second path was not kept";
   EXPECT_EQ(count_name(ret, "SC"), 1) << "the reversible part of the second path was not kept";
   EXPECT_EQ(count_name(ret, "ED") + count_name(ret, "CE"), 2)
-      << "the one-way stretch was not bridged through the C-E-D bypass; legs[1] = "
+      << "the one-way stretch was not repaired through the C-E-D bypass; legs[1] = "
       << dump_path(ret);
   EXPECT_EQ(count_name(ret, "AT") + count_name(ret, "SA"), 0)
       << "the repair rode the forward corridor home";
