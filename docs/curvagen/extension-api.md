@@ -21,7 +21,7 @@ Each route's `trip` object carries a fork-local `provenance` object (`TripRoute.
                "gated": false, "bridges": 0, "full_repair": true}
 ```
 
-`builder` is `pair` / `rescue` / `route_leg`. **Additive and consumer-optional**: no other action sets it, the orchestrator drops unknown fields, and no app-contract change follows from it. It exists so the loop-quality harness can *read* a candidate's origin instead of guessing it geometrically.
+`builder` is `pair` / `rescue` / `route_leg`. `rung` is 0 (clean hard-exclude) or 2 (soft-leash Fallback Loop); `bridges` is always 0, since the engine rebuilds a non-reversible pair return whole. Both stay on the wire unchanged. **Additive and consumer-optional**: no other action sets it, the orchestrator drops unknown fields, and no app-contract change follows from it. It exists so the loop-quality harness can *read* a candidate's origin instead of guessing it geometrically.
 
 ### Costing option `prefer_curvature`
 
@@ -65,6 +65,19 @@ Non-zero exit fails the deploy. The `!= null` matters: against a stock engine im
 
 `/status`'s `version` is `<valhalla version>-<git sha>` on images from `build-amd64`, the same sha as the `:amd64-<sha>` tag. An image built without the `VERSION_MODIFIER` build arg reports the bare version. Tile headers truncate this string to 15 characters; only `/status` carries the full id.
 
+## Before an engine image ships
+
+Run the round-trip test suites on the exact commit `build-amd64` will build, and do not dispatch the workflow until they pass:
+
+```sh
+git submodule update --init --recursive
+scripts/curvagen-roundtrip-tests.sh
+```
+
+The script builds Dockerfile.local's `deps` stage (once per `install-linux-deps.sh`), configures a Release build with tests on in `build-roundtrip-tests/`, builds the round-trip unit suites (`roundtrip_gates`, `roundtrip_score`, `curvature_metric`) and gurka suites (`gurka_motorcycle_roundtrip`, `gurka_roundtrip_audit`, `gurka_roundtrip_distinctness`, `gurka_roundtrip_request_faults`, `gurka_loops`, `gurka_motorcycle_curvature`, `gurka_curvature_metric_stamp`), runs them, and exits non-zero on any failure. Its last line, `roundtrip tests @ <sha>: ...`, goes into the release note beside the image tag. `DEPS_IMAGE` reuses an existing deps image; a rerun of the same build directory is incremental. The images themselves build with `ENABLE_TESTS=Off`, so this run is the only place the suites execute.
+
+A change that is meant to leave route output alone also needs the output proof: the same fixed requests served by the old and the new `valhalla_service` against one tileset, byte-compared (the procedure is in the ticket that made the change, e.g. curvagen-valhalla#26).
+
 ## FINGERPRINT rule
 
 **An image from `build-amd64` needs no `FINGERPRINT_VERSION` bump.** Cache keys in curvagen-orchestrator (`crates/cache` keying) carry the build id from `/status` `version`, so a new image rotates every key on its own, within the api's engine watch of 15 s and with no api restart. Any change in this fork that alters route output (geometry, candidate selection, scoring, gates, knob defaults) therefore ships as a new image. An image built without the `VERSION_MODIFIER` build arg reports the bare version, so it rotates nothing and does need a bump, or stale cached banks serve old-engine routes. The same rule is documented in the orchestrator's `CLAUDE.md`. Coordinate a bump via a cross-linked issue pair (driving repo ↔ consumer repo).
@@ -75,3 +88,4 @@ Non-zero exit fails the deploy. The `!= null` matters: against a stock engine im
 - 2026-09-07 — **round-trip v4** (valhalla ADR-0042, judged by ADR-0041's Gate v2): loop construction changes, the request shape does not, the response gains the additive per-candidate `provenance`, and the measured configuration moves into `worker.cc` defaults. **v4 alters route output, so the FINGERPRINT rule fires: `FINGERPRINT_VERSION` 4 → 5** in curvagen-orchestrator, in the same commit as the cutover deploy (wayfinder curvagen-valhalla#18). Rollback target is the previous immutable image tag `ghcr.io/lazark0x/valhalla-curvature:amd64-<sha>` plus the previous orchestrator — v4 keys and v3 keys coexist inside the 30 d cache TTL.
 - 2026-10-31 — **curvature metric stamp**: `kCurvatureMetricVersion` 1 written to every new tile header, `engine_curvature_metric` and `tileset_curvature_metric` added to `/status` on every call, `version` gains the git sha on `build-amd64` images. Additive; no tile layout change, no route output change, so no `FINGERPRINT_VERSION` bump. Existing tiles read `unknown` until rebuilt.
 - 2026-10-31 — **round-trip request faults**: `target_distance` is bounded to 0..300000 m at parse on JSON and protobuf bodies, the same ceiling the API contract serves, so every value the orchestrator can send arrives unchanged and anything outside it serves as the bound; 0 or less finds no loop (442). A loop whose legs TripLegBuilder refuses is dropped at serialization and its slot stays empty, so a bank shrinks by exactly the loops that cannot build, with 442 only when none can. The expansion, chain pass, pair pass, pair evaluation and every build now poll the interrupt; budgets stay count-based. Every bank that served before is byte-identical, so no `FINGERPRINT_VERSION` bump.
+- 2026-11-06 — **round-trip default-off paths deleted** (curvagen-valhalla#26): pair-return bridging (`thor.roundtrip_pair_bridge`, `roundtrip_pair_max_bridges`), fallback rung 1 (`roundtrip_fallback_rungs`), the parallel rung (`roundtrip_fallback_parallel_rung`), the built-loop sharing filter (`roundtrip_sharing_filter`), the share-relax ladder (`roundtrip_pair_share_relax`) and the diversity term (`roundtrip_pair_diversity_w`). The keys are no longer read; a config that sets them is ignored on them. `provenance.rung` is 0 or 2 and `provenance.bridges` is always 0, both still on the wire. Gates and loop measures moved to `thor/roundtrip_gates` and `thor/roundtrip_score`. Fixed requests under the default, P1.1, v3-style and box configurations serve byte-identical responses, so no `FINGERPRINT_VERSION` bump.

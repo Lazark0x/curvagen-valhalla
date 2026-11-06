@@ -3,7 +3,9 @@
 #include "proto/common.pb.h"
 #include "thor/road_twin_index.h"
 #include "thor/roundtrip_expansion.h"
+#include "thor/roundtrip_gates.h"
 #include "thor/roundtrip_pairs.h"
+#include "thor/roundtrip_score.h"
 #include "thor/route_matcher.h"
 #include "thor/triplegbuilder.h"
 #include "thor/worker.h"
@@ -1115,13 +1117,9 @@ void for_each_junction_edge(const baldr::GraphId& node, baldr::GraphReader& read
 // added explicitly as an end-node PathEdge: a one-way arrival's opposing edge fails the
 // access filter, leaving the forward leg's destination edge missing and TripLegBuilder
 // throwing 499 for the WHOLE request — the #53 bank-fill death class.
-// proto/v4-p2: `departure_edge` is the edge the ride LEAVES this node on afterwards (a
-// bridge's destination); arriving on its opposite would be a U-turn into it, so that
-// inbound edge is dropped from the correlation.
 valhalla::Location correlate_node(const baldr::GraphId& node,
                                   baldr::GraphReader& reader,
-                                  const baldr::GraphId& arrival_edge,
-                                  const baldr::GraphId& departure_edge = {}) {
+                                  const baldr::GraphId& arrival_edge) {
   valhalla::Location loc;
   graph_tile_ptr tile = reader.GetGraphTile(node);
   if (!tile)
@@ -1153,13 +1151,10 @@ valhalla::Location correlate_node(const baldr::GraphId& node,
     if (uturn_door.is_valid() && eid == uturn_door)
       return; // no U-turn opening for the return leg
     add_edge(eid, true); // outbound edge leaving the node
-    if (departure_edge.is_valid() && eid == departure_edge)
-      return; // its opposite is the U-turn door into the departure
     graph_tile_ptr otile;
     const baldr::GraphId opp = reader.GetOpposingEdgeId(eid, otile);
-    // proto/v4-p2: the opposite of a one-way outbound edge cannot be ridden INTO the
-    // node; seeding it as a destination let a bridge arrive on it (a search ends on a
-    // destination edge without an access test).
+    // The opposite of a one-way outbound edge cannot be ridden INTO the node, and a
+    // search ends on a destination edge without an access test.
     if (opp.is_valid() && otile && (otile->directededge(opp)->forwardaccess() & kAutoAccess))
       add_edge(opp, false); // opposing inbound edge arriving at the node
   });
@@ -1237,144 +1232,6 @@ std::vector<PathInfo> walk_back_trapped_tip(std::vector<PathInfo> fwd,
   return fwd;
 }
 
-// Decode a leg's edges onto the 1e-5 grid (consecutive duplicates dropped) — the same
-// snap the Defect Gate and the loopqual harness use. Returns false on an unresolvable
-// tile (caller treats the check as inconclusive-clean, like the gate does).
-bool decode_leg_grid(const std::vector<PathInfo>& leg,
-                     baldr::GraphReader& reader,
-                     std::vector<std::pair<int64_t, int64_t>>& pts) {
-  for (const auto& pi : leg) {
-    graph_tile_ptr tile = reader.GetGraphTile(pi.edgeid);
-    if (!tile)
-      return false;
-    const DirectedEdge* de = tile->directededge(pi.edgeid);
-    auto shape = tile->edgeinfo(de).shape();
-    if (!de->forward())
-      std::reverse(shape.begin(), shape.end());
-    for (const auto& p : shape) {
-      std::pair<int64_t, int64_t> k{std::llround(p.lat() * 1e5), std::llround(p.lng() * 1e5)};
-      if (pts.empty() || pts.back() != k)
-        pts.push_back(k);
-    }
-  }
-  return true;
-}
-
-// proto/v4-p1.1: append a leg's shape onto the 1e-5 grid with a running along-path
-// distance (consecutive duplicates dropped).  Shared by the seam detector and the
-// mid-leg mirror detector below.  false = unresolvable tile (caller treats the check as
-// inconclusive-clean, exactly as the seam gate always has).
-bool append_leg_pts(const std::vector<PathInfo>& leg,
-                    size_t from,
-                    size_t to,
-                    baldr::GraphReader& reader,
-                    std::vector<std::pair<int64_t, int64_t>>& pts,
-                    std::vector<double>& cum) {
-  for (size_t li = from; li < to; ++li) {
-    graph_tile_ptr tile = reader.GetGraphTile(leg[li].edgeid);
-    if (!tile)
-      return false;
-    const DirectedEdge* de = tile->directededge(leg[li].edgeid);
-    auto shape = tile->edgeinfo(de).shape();
-    if (!de->forward())
-      std::reverse(shape.begin(), shape.end());
-    for (const auto& p : shape) {
-      std::pair<int64_t, int64_t> k{std::llround(p.lat() * 1e5), std::llround(p.lng() * 1e5)};
-      if (pts.empty() || pts.back() != k) {
-        if (!pts.empty())
-          cum.push_back(cum.back() +
-                        midgard::PointLL(pts.back().second / 1e5, pts.back().first / 1e5)
-                            .Distance(midgard::PointLL(k.second / 1e5, k.first / 1e5)));
-        pts.push_back(k);
-      }
-    }
-  }
-  return true;
-}
-
-// proto/v4-p1.1 GEOMETRY DEFECT GATE, half two (F08 / gurka G6b).  The longest exact-
-// mirror stub ANYWHERE in one leg.  seam_stub_m only counts palindromes whose interval
-// covers the seam, so a mid-return bounce — the return overshoots into a spur that ends
-// on its own path and U-turns back — is invisible to it, and the audit's G6b serves a
-// 999.99 m mid-return mirror with the gate reading clean (F08, F13 leak 3).  The price
-// is decoding the whole return leg on every candidate, not a 1500 m window; budgeted in
-// the stage ledger as `gate=`.
-double leg_mirror_stub_m(const std::vector<PathInfo>& leg, baldr::GraphReader& reader) {
-  std::vector<std::pair<int64_t, int64_t>> pts;
-  std::vector<double> cum{0.0};
-  if (!append_leg_pts(leg, 0, leg.size(), reader, pts, cum) || pts.size() < 3)
-    return 0.0;
-  double worst = 0.0;
-  for (size_t i = 1; i + 1 < pts.size(); ++i) {
-    if (pts[i - 1] == pts[i + 1]) {
-      size_t w = 1;
-      while (i >= 1 + w && i + 1 + w < pts.size() && pts[i - 1 - w] == pts[i + 1 + w])
-        ++w;
-      const double stub = cum[i] - cum[i - w];
-      if (stub > worst)
-        worst = stub;
-      i += w;
-    }
-  }
-  return worst;
-}
-
-// ADR-0037 Defect Gate detector: decode both legs onto the 1e-5 grid and measure the
-// longest exact-mirror stub whose interval covers the seam — the cross-leg retrace that
-// survives every forward-side guard (a fallback return riding back down a dead-end
-// stub). window_m > 0 decodes only the last/first ~window_m of each leg around the
-// seam; window_m == 0 decodes both legs whole.
-double seam_stub_m(const std::vector<PathInfo>& fwd,
-                   const std::vector<PathInfo>& ret,
-                   baldr::GraphReader& reader,
-                   double window_m) {
-  auto ddist = [](const std::vector<PathInfo>& leg, size_t i) {
-    return static_cast<double>(leg[i].path_distance - (i ? leg[i - 1].path_distance : 0.f));
-  };
-  size_t fwd_begin = 0;
-  size_t ret_end = ret.size();
-  if (window_m > 0.0) {
-    fwd_begin = fwd.size();
-    double acc = 0.0;
-    while (fwd_begin > 0 && acc < window_m) {
-      --fwd_begin;
-      acc += ddist(fwd, fwd_begin);
-    }
-    ret_end = 0;
-    acc = 0.0;
-    while (ret_end < ret.size() && acc < window_m) {
-      acc += ddist(ret, ret_end);
-      ++ret_end;
-    }
-  }
-  std::vector<std::pair<int64_t, int64_t>> pts;
-  std::vector<double> cum{0.0};
-  size_t seam_idx = 0;
-  if (!append_leg_pts(fwd, fwd_begin, fwd.size(), reader, pts, cum))
-    return 0.0;
-  seam_idx = pts.empty() ? 0 : pts.size() - 1;
-  if (!append_leg_pts(ret, 0, ret_end, reader, pts, cum))
-    return 0.0;
-  if (pts.size() < 3)
-    return 0.0;
-  double worst = 0.0;
-  for (size_t i = 1; i + 1 < pts.size(); ++i) {
-    if (pts[i - 1] == pts[i + 1]) {
-      size_t w = 1;
-      while (i >= 1 + w && i + 1 + w < pts.size() && pts[i - 1 - w] == pts[i + 1 + w])
-        ++w;
-      // only stubs whose interval covers the seam (the defect site); slack 2 like the meter
-      if (i - w <= seam_idx + 2 && i + w + 2 >= seam_idx) {
-        const double stub = cum[i] - cum[i - w];
-        if (stub > worst)
-          worst = stub;
-      }
-      i += w; // skip past this palindrome
-    }
-  }
-  return worst;
-}
-
 } // namespace
 
 // ADR-0033 native round-trip: one forward expansion grows the curvy frontier; turnarounds
@@ -1434,6 +1291,11 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                                                     roundtrip_switchback_test)
                               : nullptr;
   const bool parallel_tier = roundtrip_parallel_tier;
+  roundtrip::TwinsFn twins_fn;
+  if (twin_index)
+    twins_fn = [twin_index](uint64_t canon, std::vector<uint64_t>& out) {
+      twin_index->append_twins(canon, out);
+    };
 
   RoundTripExpansion expander;
   expander.set_chain_simplicity(roundtrip_simple_chains, twin_index);
@@ -1454,7 +1316,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // twins — is known here, before any A* runs, so selection rejects at harvest time.
   // ---------------------------------------------------------------------------------
   std::unique_ptr<RoundTripPairPass> pairs;
-  double pair_pass_ms = 0, bridge_ms = 0, pair_eval_ms = 0;
+  double pair_pass_ms = 0, pair_eval_ms = 0;
   // prototype debugging: ROUNDTRIP_DEBUG=1 mirrors the pair ledger to stderr (gurka
   // silences the logger inside do_action)
   const bool rt_debug = std::getenv("ROUNDTRIP_DEBUG") != nullptr;
@@ -1587,44 +1449,24 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // proto/v4-p2: lazy, cached evaluation of a candidate's PAIR — constructed from the
   // pass, judged on band, twin ride and near-dup BEFORE it can be chosen.  A rejected
   // sink costs a path walk, never a search.
-  struct PairKeys {
-    std::unordered_map<uint64_t, double> ridden; // canonical id -> metres, beyond the exemption
-    std::unordered_set<uint64_t> twins;          // sidecar twins of the ridden edges
-    double total = 0;                            // loop metres
-    // proto/v4-p2.1: the FORWARD leg alone — the tree path, which IS the served forward
-    // leg (the 2.5 % orientation swaps ride the other path out; ignored) — canonical id
-    // -> metres beyond the exemption, and the leg's whole length.  What the per-leg
-    // sharing threshold reads.  Empty on a built-loop bank entry (never read there).
-    std::unordered_map<uint64_t, double> fwd_ridden;
-    double fwd_total = 0;
-  };
   struct PairEval {
     RoundTripPairPass::Pair pair;
     bool checked = false, ok = false;
     const char* reject = "";
     double total_len = 0, dist_err = 0, self_overlap_m = 0, score = 0;
     float curviness = 0; // both legs
-    PairKeys keys;
+    roundtrip::LoopKeys keys;
   };
   std::unordered_map<uint32_t, PairEval> pair_cache;
   uint32_t pair_sinks_considered = 0, pair_none = 0, pair_band_rejects = 0,
            pair_twin_rejects = 0, pair_share_rejects = 0;
-  std::vector<PairKeys> pair_selected_keys; // chosen at selection, for the K x K filter
-  std::vector<PairKeys> pair_built_keys;    // committed loops, for the K x K filter
+  std::vector<roundtrip::LoopKeys> pair_selected_keys; // chosen at selection, for the K x K filter
+  std::vector<roundtrip::LoopKeys> pair_built_keys;    // committed loops, for the K x K filter
   // Twin-rejected pairs are remembered: when the queue runs dry with the bank short,
   // they are built anyway and land in the geometry gate's dirty tier — a ranked-last
   // dirty loop, never a silent clean tier and never a 442 where a loop exists.
   std::vector<uint32_t> pair_twin_candidates;
   bool pair_allow_twin = false;
-  auto shared_fraction = [&](const PairKeys& a, const PairKeys& b) -> double {
-    if (a.total <= 0.0)
-      return 0.0;
-    double shared = 0.0;
-    for (const auto& [k, len] : a.ridden)
-      if (b.ridden.count(k) || b.twins.count(k))
-        shared += len;
-    return shared / a.total;
-  };
   // proto/v4-p2.1 (curvagen-valhalla#14): distinctness at selection.
   const bool leg_mode = roundtrip_pair_leg_sharing;
   double leg_frac_active = roundtrip_pair_leg_sharing_frac; // raised by the relaxation ladder
@@ -1650,20 +1492,17 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     return leg_mode && (rung_evals >= cap || (roundtrip_pair_eval_total > 0 &&
                                               pair_sinks_considered >= roundtrip_pair_eval_total));
   };
-  // The whole-pair threshold, laddered with the leg when roundtrip_pair_share_relax is on
-  // (a0: the whole-pair 0.6 test keyed on built loops fired 1 773 times per request
-  // against the leg test's 224, and it was not relaxed — rung after rung re-rejected on it).
-  double share_frac_active = roundtrip_sharing_frac;
-  bool share_test_off = false;
-  auto pair_shares = [&](const PairKeys& k, const std::vector<PairKeys>& bank) -> bool {
-    if (!roundtrip_pair_sharing || share_test_off)
+  // The whole-pair threshold stays at roundtrip_sharing_frac on every relaxation rung.
+  auto pair_shares = [&](const roundtrip::LoopKeys& k,
+                         const std::vector<roundtrip::LoopKeys>& bank) -> bool {
+    if (!roundtrip_pair_sharing)
       return false;
     // P2: best effort — past the evaluation cap the near-dup filter is dropped.  P2.1 leg
     // mode: the cap bounds the WALK (per rung), never the test.
     if (!leg_mode && pair_sinks_considered > roundtrip_pair_eval_cap)
       return false;
     for (const auto& prev : bank)
-      if (shared_fraction(k, prev) > share_frac_active)
+      if (roundtrip::shared_fraction(k, prev) > roundtrip_sharing_frac)
         return true;
     return false;
   };
@@ -1671,20 +1510,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // roads and their twins, as a fraction of the FORWARD leg.  A shared trunk out of the
   // start is ~30 % of a loop (invisible to the whole-pair 0.6 cliff) and 50-80 % of the
   // leg the rider rides out.
-  auto fwd_shared_fraction = [&](const PairKeys& cand, const PairKeys& prev) -> double {
-    if (cand.fwd_total <= 0.0)
-      return 0.0;
-    double shared = 0.0;
-    for (const auto& [k, len] : cand.fwd_ridden)
-      if (prev.ridden.count(k) || prev.twins.count(k))
-        shared += len;
-    return shared / cand.fwd_total;
-  };
-  auto leg_shares = [&](const PairKeys& k, const std::vector<PairKeys>& bank) -> bool {
+  auto leg_shares = [&](const roundtrip::LoopKeys& k,
+                        const std::vector<roundtrip::LoopKeys>& bank) -> bool {
     if (!leg_mode || leg_test_off)
       return false;
     for (const auto& prev : bank)
-      if (fwd_shared_fraction(k, prev) > leg_frac_active)
+      if (roundtrip::fwd_shared_fraction(k, prev) > leg_frac_active)
         return true;
     return false;
   };
@@ -1695,7 +1526,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   auto release_eval = [](PairEval& pe) {
     std::vector<uint32_t>().swap(pe.pair.tree);
     std::vector<uint32_t>().swap(pe.pair.other);
-    pe.keys = PairKeys{};
+    pe.keys = roundtrip::LoopKeys{};
   };
   auto eval_pair = [&](uint32_t ci) -> PairEval& {
     PairEval& pe = pair_cache[ci];
@@ -1723,7 +1554,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       return pe;
     }
     pe.total_len = pe.pair.tree_len + pe.pair.other_len;
-    pe.dist_err = target > 0.0 ? std::fabs(pe.total_len - target) / target : 0.0;
+    pe.dist_err = roundtrip::distance_error(pe.total_len, target);
     if (pe.dist_err > roundtrip_pair_band) {
       ++pair_band_rejects;
       pe.reject = "band";
@@ -1750,78 +1581,33 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     }
     // Curviness over BOTH legs, the twins-aware self-overlap (forward vs return AND
     // return vs return — the H3 shape of the same-road study), and the key set for the
-    // K x K sharing filter, all from the arc sequences: ~one tile lookup per arc.
+    // K x K sharing filter, all from the arc sequences: ~one tile lookup per arc.  An
+    // arc stands for its forward label's edge, else the edge the return rides; both
+    // paths run from the start, so an arc's distance from the start is its distance
+    // along its own path.
     const auto& labels = expander.labels();
-    graph_tile_ptr tile, opp_tile;
-    std::vector<uint64_t> tw;
-    std::unordered_set<uint64_t> fwd_ids, ret_ids;
-    double curv = 0.0, len = 0.0, overlap = 0.0;
-    // the road an arc stands for: its forward label's edge, else the edge the return rides
-    auto arc_edge = [&](const RoundTripPairPass::HArc& h) -> GraphId {
-      return h.fwd_label != RoundTripPairPass::kNone ? labels[h.fwd_label].edgeid()
-                                                     : GraphId(h.ret_edge);
-    };
-    auto canon_of = [&](const GraphId& e, const DirectedEdge* de) {
-      opp_tile = tile;
-      const GraphId opp = reader->GetOpposingEdgeId(e, opp_tile);
-      return RoadTwinIndex::canonical_id(de, e, opp);
-    };
-    double cum = 0.0;
-    for (uint32_t h : pe.pair.tree) {
-      const auto& a = pairs->arc(h);
-      const GraphId e = arc_edge(a);
-      const double elen = a.len;
-      cum += elen;
-      len += elen;
-      if (!e.is_valid() || !reader->GetGraphTile(e, tile))
-        continue;
-      const DirectedEdge* de = tile->directededge(e);
-      curv += static_cast<double>(de->curvature()) * elen;
-      if (cum <= kStartExemptionMeters)
-        continue;
-      const uint64_t canon = canon_of(e, de);
-      fwd_ids.insert(canon);
-      pe.keys.ridden[canon] += elen;
-      pe.keys.fwd_ridden[canon] += elen; // proto/v4-p2.1: the forward leg's own record
-      if (twin_index) {
-        tw.clear();
-        twin_index->append_twins(canon, tw);
-        fwd_ids.insert(tw.begin(), tw.end());
-        pe.keys.twins.insert(tw.begin(), tw.end());
+    auto path_edges = [&](const std::vector<uint32_t>& arcs) {
+      std::vector<roundtrip::LoopEdge> out;
+      out.reserve(arcs.size());
+      graph_tile_ptr tile;
+      double cum = 0.0;
+      for (uint32_t h : arcs) {
+        const auto& a = pairs->arc(h);
+        const GraphId e = a.fwd_label != RoundTripPairPass::kNone ? labels[a.fwd_label].edgeid()
+                                                                  : GraphId(a.ret_edge);
+        const double elen = a.len;
+        cum += elen;
+        out.push_back(roundtrip::resolve_edge(e, elen, cum, *reader, tile));
       }
-    }
-    pe.keys.fwd_total = len; // proto/v4-p2.1: the tree path's whole length, exempt stem included
-    // The second path is ridden home backwards, so its distance from the start IS the
-    // return's distance from the ride end: the exemption test reads the same number.
-    cum = 0.0;
-    for (uint32_t h : pe.pair.other) {
-      const auto& a = pairs->arc(h);
-      const GraphId e = arc_edge(a);
-      const double elen = a.len;
-      cum += elen;
-      len += elen;
-      if (!e.is_valid() || !reader->GetGraphTile(e, tile))
-        continue;
-      const DirectedEdge* de = tile->directededge(e);
-      curv += static_cast<double>(de->curvature()) * elen;
-      if (cum <= kStartExemptionMeters)
-        continue;
-      const uint64_t canon = canon_of(e, de);
-      bool hit = fwd_ids.count(canon) > 0 || !ret_ids.insert(canon).second;
-      if (twin_index) {
-        tw.clear();
-        twin_index->append_twins(canon, tw);
-        for (uint64_t t : tw)
-          hit = hit || ret_ids.count(t) > 0;
-        pe.keys.twins.insert(tw.begin(), tw.end());
-      }
-      if (hit)
-        overlap += elen;
-      pe.keys.ridden[canon] += elen;
-    }
-    pe.keys.total = len;
-    pe.curviness = len > 0.0 ? static_cast<float>(curv / len / 15.0) : 0.f;
-    pe.self_overlap_m = overlap;
+      return out;
+    };
+    roundtrip::PairMeasure measured =
+        roundtrip::measure_pair(path_edges(pe.pair.tree), path_edges(pe.pair.other), twins_fn,
+                                kStartExemptionMeters);
+    pe.keys = std::move(measured.keys);
+    pe.curviness = measured.curviness;
+    pe.self_overlap_m = measured.overlap_m;
+    const double overlap = measured.overlap_m;
     {
       // at least one of the two paths must be ridable OUT (every arc a settled forward
       // edge); the other is ridden home backwards — repaired where it cannot be.
@@ -1851,7 +1637,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // Selection score: the pair's whole-loop curviness discounted by its distance error
     // (the built-loop score of P1.1 §3 with overlap == 0 by construction).  The pair
     // COST is what the construction minimised; it is surfaced in the ledger.
-    pe.score = static_cast<double>(pe.curviness) / (1.0 + roundtrip_rank_disterr_w * pe.dist_err);
+    pe.score = roundtrip::pair_score(pe.curviness, pe.dist_err, roundtrip_rank_disterr_w);
     pe.ok = true;
     return pe;
   };
@@ -1894,20 +1680,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       }
       if (surv.empty())
         continue;
-      // proto/v4-p2.1: the diversity term — a survivor's score is discounted by its
-      // whole-pair sharing with the chosen set, score / (1 + w * s), BEFORE the seed
-      // rotation; the rotation is unchanged and bounds what the term can do (it orders
-      // the survivors, the seed still picks among them).  w = 0 is P2's order exactly.
-      std::unordered_map<uint32_t, double> div_score;
-      for (uint32_t c : surv) {
-        double s = 0.0;
-        if (roundtrip_pair_diversity_w > 0.0)
-          for (const auto& prev : pair_selected_keys)
-            s = std::max(s, shared_fraction(pair_cache[c].keys, prev));
-        div_score[c] = pair_cache[c].score / (1.0 + roundtrip_pair_diversity_w * s);
-      }
-      std::stable_sort(surv.begin(), surv.end(),
-                       [&](uint32_t a, uint32_t c) { return div_score[a] > div_score[c]; });
+      std::stable_sort(surv.begin(), surv.end(), [&](uint32_t a, uint32_t c) {
+        return pair_cache[a].score > pair_cache[c].score;
+      });
       const uint32_t pick = surv[(seed + b) % static_cast<uint32_t>(surv.size())];
       chosen.push_back(pick);
       pair_selected_keys.push_back(pair_cache[pick].keys);
@@ -1986,7 +1761,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // (the leash is what bites on the exempted stretch). If no route home exists under
   // exclusion, one retry under the soft leash alone serves a Fallback Loop — tagged on
   // the Loop and counted, so the build-time Defect Gate (T3) can give fallbacks the
-  // full-leg decode and the harness can gate-count them.
+  // full-leg decode and the harness can gate-count them. Rung 0 is the hard-excluded
+  // search, rung 2 the soft-leash Fallback Loop, rung 3 no route at all.
   bidir_astar.set_interrupt(interrupt);
   cost->set_allow_destination_only(true);
   cost->set_pass(0);
@@ -1997,30 +1773,14 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   uint32_t twins_excluded = 0, parallels_leashed = 0, identity_legs = 0;
   // proto/v4-p1.1 fallback-rung ledger (item 5): how many legs finished on each rung.
   uint32_t rung_hits[4] = {0, 0, 0, 0};
-  uint32_t parallel_rung_tried = 0, parallel_rung_converted = 0;
   // Cross-candidate corridor memory (wayfinder #46): directed-edge value -> number of
   // already-committed loops that rode it (both directions, outside the Start Exemption
   // disk). Grows as the bank fills; read by route_leg to surcharge shared corridors.
   std::unordered_map<uint64_t, uint32_t> bank_edge_count;
   // Generalized corridor-aware leg router (ADR-0037): routes from -> to with the given
-  // corridor hard-excluded beyond the Start Exemption, soft-leashed everywhere, and its
-  // junction edges progress-grade-penalized. The round-trip return is corridor=forward
-  // leg, to=start; the Second Via sub-legs reuse it with wider corridors.
-  //
-  // proto/v4-p1.1 FALLBACK RUNGS (item 5).  v3 had one step: "hard exclusion, or drop
-  // every hard exclusion".  The ladder is now
-  //    rung 0  corridor + twins barred beyond the Start Exemption; corridor, twins and
-  //            parallels leashed; parallels carry the progress grade.
-  //    rung 1  TWINS RELEASED from the bar (still leashed) and parallels released from
-  //            the leash and the grade — the corridor's own pavement is still barred, so
-  //            a rung-1 loop still never retraces it.
-  //    rung 2  full soft leash: no hard exclusion at all (the v3 Fallback Loop).
-  // The ticket's rung 1 was "release parallels, keep twins barred".  That cannot work:
-  // mark_edges_used / mark_rejoin_edges are multiplicative cost factors read by
-  // EdgeFactor (dynamiccost.h:1292-1308) and never block, so a rung that only relaxes
-  // soft costs cannot turn "no route home" into a route — it can only pay for a second
-  // exhaustive A*.  It is kept behind thor.roundtrip_fallback_parallel_rung (default
-  // off) so the claim can be measured rather than argued.
+  // corridor and its twins hard-excluded beyond the Start Exemption, the corridor, its
+  // twins and its parallels soft-leashed everywhere, and its junction edges and parallels
+  // progress-grade-penalized. The round-trip return is corridor=forward leg, to=start.
   auto route_leg = [&](const std::vector<PathInfo>& corridor, valhalla::Location& from,
                        valhalla::Location& to, uint8_t& rung) -> std::vector<PathInfo> {
     const auto t_rejoin = ledger_clock::now();
@@ -2028,7 +1788,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     const double total_dist = std::max(1.0f, corridor.back().path_distance);
     std::vector<uint64_t> vals;
     std::vector<sif::AvoidEdge> hard;      // the corridor's own pavement
-    std::vector<sif::AvoidEdge> twin_hard; // proto/v4-p1.1: the twin tier, rung-1 releasable
+    std::vector<sif::AvoidEdge> twin_hard; // its twins
     struct NodeAt {
       GraphId node;
       double dist;
@@ -2094,8 +1854,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       for (uint64_t cv : par) {
         const GraphId t(cv);
         const GraphId topp = reader->GetOpposingEdgeId(t);
-        // proto/v4-p1.1: parallels live in their own tier (parallel_at) so rung 1 can
-        // release them; P1 pushed them straight into `vals`.
         parallel_at.emplace_back(t.value, at);
         if (topp.is_valid())
           parallel_at.emplace_back(topp.value, at);
@@ -2104,25 +1862,23 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     }
     if (twin_index)
       ++identity_legs;
-    // proto/v4-p1.1: the leash set is re-assembled per rung, so keep the tiers apart.
     // `vals` = corridor + opposites + twins (+ their opposites); parallel_vals = the
-    // parallel tier, dropped from rung 1 up.
+    // parallel tier.
     std::vector<uint64_t> parallel_vals;
     parallel_vals.reserve(parallel_at.size());
     for (const auto& [ev, _] : parallel_at)
       parallel_vals.push_back(ev);
-    auto apply_leash = [&](bool with_parallels) {
+    auto apply_leash = [&]() {
       cost->clear_used_edges();
       cost->mark_edges_used(vals);
-      if (with_parallels)
-        cost->mark_edges_used(parallel_vals);
+      cost->mark_edges_used(parallel_vals);
     };
-    apply_leash(true);
+    apply_leash();
 
     // Progress-graded rejoin (ADR-0037): junction edges hanging off forward-path nodes
     // get a penalty graded by how far along the forward leg the node sits. Edges on the
     // forward path itself are skipped — the leash and the hard exclusion own those.
-    auto build_rejoin = [&](bool with_parallels) {
+    auto build_rejoin = [&]() {
     std::unordered_map<uint64_t, float> rejoin;
     const float leash_surcharge = cost->reuse_factor() - 1.0f;
     if (leash_surcharge > 0.f) {
@@ -2154,11 +1910,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
             bump(opp.value, grade);
         });
       }
-      // proto/v4-p1: the parallel tier — a road 30-80 m from the corridor carries the
-      // same progress grade as the corridor stretch it shadows.  Released at rung 1.
-      if (with_parallels)
-        for (const auto& [ev, dist] : parallel_at)
-          bump(ev, grade_at(dist));
+      // The parallel tier: a road 30-80 m from the corridor carries the same progress
+      // grade as the corridor stretch it shadows.
+      for (const auto& [ev, dist] : parallel_at)
+        bump(ev, grade_at(dist));
     }
     // Cross-candidate corridor penalty (wayfinder #46): every edge earlier loops in this
     // bank already rode carries a soft surcharge on THIS return leg, graded by the
@@ -2175,7 +1930,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (!rejoin.empty())
       cost->mark_rejoin_edges(std::move(rejoin));
     };
-    build_rejoin(true);
+    build_rejoin();
     cost->set_user_avoid_edges(avoid_baseline);
     std::vector<sif::AvoidEdge> bars = hard;
     bars.insert(bars.end(), twin_hard.begin(), twin_hard.end());
@@ -2195,49 +1950,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     astar_ms += ms_since(t_astar);
     rung = 0;
 
-    // One rung of the ladder: re-arm the leash/grade/bar tiers and search again.
-    auto retry = [&](bool with_parallels, bool bar_twins) {
-      if (interrupt)
-        (*interrupt)(); // rethrow a swallowed client disconnect before paying an A*
-      apply_leash(with_parallels);
-      build_rejoin(with_parallels);
-      cost->set_user_avoid_edges(avoid_baseline);
-      std::vector<sif::AvoidEdge> b = hard;
-      if (bar_twins)
-        b.insert(b.end(), twin_hard.begin(), twin_hard.end());
-      if (!b.empty())
-        cost->AddUserAvoidEdges(b);
-      bidir_astar.Clear();
-      const auto t_fb = ledger_clock::now();
-      try {
-        paths = bidir_astar.GetBestPath(from, to, *reader, mode_costing, mode, options);
-      } catch (const std::exception&) {
-        paths.clear();
-      }
-      astar_fb_ms += ms_since(t_fb);
-    };
-
-    // Ticket-literal rung: parallels released, twins still barred.  Default off — see
-    // the reachability note above; the knob exists to measure the zero.
-    if (paths.empty() && !bars.empty() && roundtrip_fallback_parallel_rung && parallel_tier &&
-        !parallel_at.empty()) {
-      ++parallel_rung_tried;
-      retry(false, true);
-      if (!paths.empty())
-        ++parallel_rung_converted;
-    }
-    // rung 1: twins released to the leash, parallels released; the corridor stays barred.
-    if (paths.empty() && !bars.empty() && roundtrip_fallback_rungs && !twin_hard.empty()) {
-      retry(false, false);
-      if (!paths.empty())
-        rung = 1;
-    }
     // rung 2: the v3 Fallback Loop — every hard exclusion dropped.
     if (paths.empty() && !bars.empty()) {
       rung = 2;
       ++fallback_count;
-      apply_leash(true);
-      build_rejoin(true);
+      apply_leash();
+      build_rejoin();
       cost->set_user_avoid_edges(avoid_baseline);
       bidir_astar.Clear();
       const auto t_fb = ledger_clock::now();
@@ -2258,6 +1976,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   //    the fill. Built turnarounds keep the T9 min-separation among themselves.
   struct Loop {
     std::vector<PathInfo> fwd, ret;
+    std::vector<roundtrip::LoopEdge> fwd_edges, ret_edges; // the legs as the measures read them
     valhalla::Location turn;
     float curviness; // the HARVEST CHAIN's score — v3/P1's whole ranking key
     // Fallback Loop tag (ADR-0037): the return leg came from the soft-leash retry, so
@@ -2265,7 +1984,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // loop a full-leg decode (a seam-window verdict provably leaks wrapped bounces).
     bool fallback;
     // proto/v4-p1.1 (item 3, F20's full fix): the BUILT loop's own score.
-    uint8_t rung = 0;           // 0 clean hard-exclude / 1 twins released / 2 soft leash
+    uint8_t rung = 0;           // 0 clean hard-exclude / 2 soft leash
     float loop_curviness = 0.f; // curvature-weighted mean over BOTH legs, 0..1 per km
     double self_overlap_m = 0;  // twins-aware D1-style metres, outside the exemption
     double dist_err = 0;        // |built - target| / target
@@ -2276,7 +1995,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // proto/v4-p2: provenance of a pair-built loop.
     uint32_t cand = baldr::kInvalidLabel; // the candidate it was built from
     bool pair_built = false;              // forward = the tree path, return = the other path reversed
-    uint8_t pair_bridges = 0;             // non-reversible return stretches repaired with a local A*
     bool pair_full_repair = false;        // the whole return was rebuilt with route_leg (P1.1)
     double pair_cost = 0, pair_surplus = 0, pair_fwd_len = 0, pair_ret_len = 0;
     // proto/v4-p2.1: admitted under relaxation rung 1-3 of the per-leg threshold (0 = the
@@ -2286,7 +2004,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // rather than inferred from !pair_built, because the provenance field on the
     // response (ADR-0041 §7) has to name the builder, not guess it.
     bool rescue = false;
-    // Rank tier, absolute: clean hard-exclude < twins released < soft leash < gated.
+    // Rank tier, absolute: clean hard-exclude < soft leash < gated.
     uint8_t tier() const {
       return gated ? 3 : rung;
     }
@@ -2298,47 +2016,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // detour loop. Skipping the duplicate here lets the queue refill the slot with a
   // genuinely distinct loop instead of silently shrinking the fill at serialization.
   std::set<std::vector<uint64_t>> served_sigs;
-  // Item 4 sharing filter (wayfinder #46): each kept loop's undirected fresh-road edge
-  // keys -> length, for the K×K near-dup overlap test. Filled only when the filter is on.
-  std::vector<std::unordered_map<uint64_t, double>> built_keylens;
-  uint32_t sharing_filter_rejects = 0; // proto/v4-p2 ledger
-  // A loop's undirected fresh-road edge-key -> length (Start-Exemption edges dropped so
-  // the forced start stem never reads as shared); returns the loop's total length.
-  auto loop_keylen = [&](const Loop& L, std::unordered_map<uint64_t, double>& kl,
-                         std::unordered_map<uint64_t, double>& kl_twins) -> double {
-    std::vector<uint64_t> tw;
-    const double fwd_total = static_cast<double>(L.fwd.back().path_distance);
-    const double ret_total = static_cast<double>(L.ret.back().path_distance);
-    auto add = [&](const std::vector<PathInfo>& leg, bool is_ret, double total) {
-      double p = 0.0;
-      for (const auto& pi : leg) {
-        const double cum = static_cast<double>(pi.path_distance);
-        const double seglen = cum - p;
-        p = cum;
-        const double from_start = is_ret ? (total - cum) : cum;
-        if (from_start <= kStartExemptionMeters)
-          continue;
-        const GraphId e = pi.edgeid;
-        const GraphId opp = reader->GetOpposingEdgeId(e);
-        const uint64_t key = (opp.is_valid() && opp.value < e.value) ? opp.value : e.value;
-        kl[key] += seglen;
-        // proto/v4-p2: TWINS-AWARE keys — a later loop riding the other carriageway of
-        // a road this loop rode is riding the same road (the ticket's post-pass K x K
-        // filter).  The twin entries carry the road's metres so the overlap test reads
-        // them like the road itself; they are never counted in this loop's own total.
-        if (pairs && twin_index) {
-          tw.clear();
-          twin_index->append_twins(key, tw);
-          for (uint64_t t : tw)
-            kl_twins[t] += seglen;
-        }
-      }
-    };
-    add(L.fwd, false, fwd_total);
-    add(L.ret, true, ret_total);
-    return fwd_total + ret_total;
-  };
-
   // proto/v4-p1.1 BUILT-LOOP SCORE (item 3 — F20's full fix).  v3 and P1 ranked on
   // `cands[ci].curviness_per_km`: the harvest label chain's curviness, computed before
   // the walk-back pops the tip, blind to the return leg, to distance error and to
@@ -2358,82 +2035,23 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   //                          makes a 20 %-off loop lose ~17 %, which is about what a
   //                          rider trades a fifth of the distance for.
   //
-  // Tiers come first and are absolute: rung 0 (clean hard-exclude) before rung 1 (twins
-  // released) before rung 2 (soft-leash Fallback); the gate's dirty stash is served only
-  // if nothing else is.  Within a tier the sort is stable, so equal scores keep queue
-  // order and the seed still owns the tie-break.
+  // Tiers come first and are absolute: rung 0 (clean hard-exclude) before rung 2
+  // (soft-leash Fallback); the gate's dirty stash is served only if nothing else is.
+  // Within a tier the sort is stable, so equal scores keep queue order and the seed
+  // still owns the tie-break.
+  // The return-vs-return term (the return riding its own pavement or its own twin)
+  // counts in pair mode only, so the P1.1 control keeps its measured meter.
   auto score_built = [&](Loop& L) {
-    graph_tile_ptr tile, opp_tile;
-    double curv = 0.0, len = 0.0;
-    std::unordered_set<uint64_t> fwd_ids;
-    std::vector<uint64_t> tw;
-    for (const auto& pi : L.fwd) {
-      const GraphId e = pi.edgeid;
-      if (!reader->GetGraphTile(e, tile))
-        continue;
-      const DirectedEdge* de = tile->directededge(e);
-      curv += static_cast<double>(de->curvature()) * de->length();
-      len += de->length();
-      if (static_cast<double>(pi.path_distance) <= kStartExemptionMeters)
-        continue;
-      opp_tile = tile;
-      const GraphId opp = reader->GetOpposingEdgeId(e, opp_tile);
-      const uint64_t canon = RoadTwinIndex::canonical_id(de, e, opp);
-      fwd_ids.insert(canon);
-      if (twin_index) {
-        tw.clear();
-        twin_index->append_twins(canon, tw);
-        fwd_ids.insert(tw.begin(), tw.end());
-      }
-    }
-    const double fwd_total = static_cast<double>(L.fwd.back().path_distance);
-    const double ret_total = static_cast<double>(L.ret.back().path_distance);
-    double overlap = 0.0, prev = 0.0;
-    std::unordered_set<uint64_t> ret_ids; // proto/v4-p2: the return's own pavement/twins
-    for (const auto& pi : L.ret) {
-      const GraphId e = pi.edgeid;
-      const double cum = static_cast<double>(pi.path_distance);
-      const double seglen = cum - prev;
-      prev = cum;
-      if (!reader->GetGraphTile(e, tile))
-        continue;
-      const DirectedEdge* de = tile->directededge(e);
-      curv += static_cast<double>(de->curvature()) * de->length();
-      len += de->length();
-      if (ret_total - cum <= kStartExemptionMeters)
-        continue;
-      opp_tile = tile;
-      const GraphId opp = reader->GetOpposingEdgeId(e, opp_tile);
-      const uint64_t canon = RoadTwinIndex::canonical_id(de, e, opp);
-      bool hit = fwd_ids.count(canon) > 0;
-      if (pairs) {
-        // proto/v4-p2: the RETURN-VS-RETURN term the same-road study asked for (H3):
-        // the return riding its own pavement or its own twin — the M11 excursion on
-        // the opposite carriageway — counts as self-overlap too.  Pair mode only, so
-        // the P1.1 control on this binary keeps its measured meter.
-        if (!ret_ids.insert(canon).second)
-          hit = true;
-        if (!hit && twin_index) {
-          tw.clear();
-          twin_index->append_twins(canon, tw);
-          for (uint64_t t : tw)
-            if (ret_ids.count(t)) {
-              hit = true;
-              break;
-            }
-        }
-      }
-      if (hit)
-        overlap += seglen;
-    }
-    const double total = fwd_total + ret_total;
-    L.loop_curviness = len > 0.0 ? static_cast<float>(curv / len / 15.0) : 0.0f;
-    L.self_overlap_m = overlap;
-    L.dist_err = target > 0.0 ? std::fabs(total - target) / target : 0.0;
-    const double ov_frac = total > 0.0 ? overlap / total : 0.0;
-    L.score = static_cast<double>(L.loop_curviness) /
-              ((1.0 + roundtrip_rank_overlap_w * ov_frac) *
-               (1.0 + roundtrip_rank_disterr_w * L.dist_err));
+    const roundtrip::BuiltMeasure m =
+        roundtrip::measure_built(L.fwd_edges, L.ret_edges, twins_fn, pairs != nullptr,
+                                 kStartExemptionMeters);
+    const double total = static_cast<double>(L.fwd.back().path_distance) +
+                         static_cast<double>(L.ret.back().path_distance);
+    L.loop_curviness = m.curviness;
+    L.self_overlap_m = m.overlap_m;
+    L.dist_err = roundtrip::distance_error(total, target);
+    L.score = roundtrip::built_score(L.loop_curviness, L.self_overlap_m, total, L.dist_err,
+                                     roundtrip_rank_overlap_w, roundtrip_rank_disterr_w);
   };
   std::vector<PointLL> built_lls;
   std::unordered_set<uint64_t> built_nodes; // the distance-correction node guard
@@ -2476,9 +2094,16 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     queue.insert(queue.end(), widx.begin(), widx.end());
   };
 
+  // The Defect Gate's dirty stash: rejected loops kept for the per-slot last resort,
+  // at most `want` of them, in rejection order.
+  auto stash_dirty = [&](Loop&& L) {
+    if (dirty_loops.size() < want)
+      dirty_loops.push_back(std::move(L));
+  };
+
   // Shared tail of every build — the seam gate, the geometry gate and its budget, the
-  // built-loop score.  proto/v4-p2 lifted it out of attempt_build so the pair builder
-  // runs the identical gate.
+  // built-loop score — so the pair builder and the route_leg builder run the identical
+  // gate.
   auto finish_build = [&](Loop L) -> std::optional<Loop> {
     // Build-time Defect Gate (ADR-0037): a loop whose seam carries an exact-mirror
     // stub >= 30 m is not bank-worthy — stash it and refill the slot from the queue;
@@ -2491,8 +2116,8 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // decode.
     const bool fell_back = L.rung >= 2;
     const auto t_seam = ledger_clock::now();
-    const double stub = fell_back ? seam_stub_m(L.fwd, L.ret, *reader, 0.0)
-                                  : seam_stub_m(L.fwd, L.ret, *reader, kSeamWindowM);
+    const double stub = roundtrip::seam_stub_m(L.fwd, L.ret, *reader,
+                                               fell_back ? 0.0 : kSeamWindowM);
     seam_ms += ms_since(t_seam);
     L.fallback = fell_back;
 
@@ -2501,27 +2126,30 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     //   (a) a return that rides the forward corridor's TWINS beyond the Start Exemption
     //       (the F02 residue: not the same edge, so no seam palindrome, but the same
     //       physical road ridden the other way).  A rung-0 loop cannot do this (the
-    //       twins were barred from its search); a rung-1 or rung-2 loop can, and that is
+    //       twins were barred from its search); a rung-2 loop can, and that is
     //       exactly the deep-bank residue P1 pushed into slots 9-11 rather than removed;
     //   (b) a mid-return exact-mirror bounce, whose apex sits far off-seam (F08 / G6b).
     // Both are now treated like a seam mirror: rejected, slot refilled from the queue,
     // served only if the cell would otherwise return nothing.
     const auto t_gate = ledger_clock::now();
+    L.fwd_edges = roundtrip::leg_edges(L.fwd, false, *reader);
+    L.ret_edges = roundtrip::leg_edges(L.ret, true, *reader);
     score_built(L);
-    bool gate_twin = false, gate_bounce = false;
+    roundtrip::GateVerdict verdict;
+    verdict.seam = stub >= kSeamStubRejectM;
     if (roundtrip_geometry_gate) {
-      gate_twin = L.self_overlap_m >= roundtrip_gate_twin_ride_m;
-      if (!gate_twin) {
-        L.bounce_m = leg_mirror_stub_m(L.ret, *reader);
-        gate_bounce = L.bounce_m >= roundtrip_gate_return_bounce_m;
+      verdict.twin = L.self_overlap_m >= roundtrip_gate_twin_ride_m;
+      if (!verdict.twin) {
+        L.bounce_m = roundtrip::leg_mirror_stub_m(L.ret, *reader);
+        verdict.bounce = L.bounce_m >= roundtrip_gate_return_bounce_m;
       }
     }
     gate_ms += ms_since(t_gate);
-    if (stub >= kSeamStubRejectM)
+    if (verdict.seam)
       ++gate_seam;
-    if (gate_twin)
+    if (verdict.twin)
       ++gate_twinride;
-    if (gate_bounce)
+    if (verdict.bounce)
       ++gate_bouncehits;
     // WHO PAYS FOR THE REFILL.  Rejecting a loop and refilling its slot costs a whole
     // extra build — a return A*, its fallback rungs and the gate's own decode.  The
@@ -2542,29 +2170,30 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // keeps its unconditional refill — and the budget bounds only the two shapes this
     // iteration added, the twin ride and the mid-return bounce.  A loop that trips
     // both gates counts as a seam reject: the spike is the more expensive defect.
-    const bool seam_reject = stub >= kSeamStubRejectM;
-    if (seam_reject || gate_twin || gate_bounce) {
-      L.gated = true;
-      L.seam_reject = seam_reject;
-      if (seam_reject) {
+    switch (roundtrip::gate_action(verdict, gate_refills, gate_refill_budget)) {
+      case roundtrip::GateAction::kServe:
+        return L;
+      case roundtrip::GateAction::kStashSeam:
+        L.gated = true;
+        L.seam_reject = true;
         ++gate_seam_refills;
-        if (dirty_loops.size() < want)
-          dirty_loops.push_back(std::move(L));
+        stash_dirty(std::move(L));
         return std::nullopt;
-      }
-      if (gate_refills < gate_refill_budget) {
+      case roundtrip::GateAction::kStashGeometry:
+        L.gated = true;
         ++gate_refills;
-        if (dirty_loops.size() < want)
-          dirty_loops.push_back(std::move(L));
+        stash_dirty(std::move(L));
         return std::nullopt;
-      }
-      ++gate_kept;
-      // Per-kind denial, so the ledger can say which shape the budget actually held
-      // back.  Both increment when a loop trips both geometry halves.
-      if (gate_twin)
-        ++gate_denied_twinride;
-      if (gate_bounce)
-        ++gate_denied_bounce;
+      case roundtrip::GateAction::kKeepGated:
+        L.gated = true;
+        ++gate_kept;
+        // Per-kind denial, so the ledger can say which shape the budget actually held
+        // back.  Both increment when a loop trips both geometry halves.
+        if (verdict.twin)
+          ++gate_denied_twinride;
+        if (verdict.bounce)
+          ++gate_denied_bounce;
+        return L;
     }
     return L;
   };
@@ -2726,17 +2355,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   };
 
   // proto/v4-p2 ledger
-  uint32_t pair_loops_built = 0, pair_loops_reversible = 0, pair_loops_bridged = 0,
-           pair_bridge_runs = 0, pair_loops_full_repair = 0, pair_repair_failed = 0,
-           pair_fwd_recost = 0, pair_fwd_recost_fail = 0;
+  uint32_t pair_loops_built = 0, pair_loops_reversible = 0, pair_loops_full_repair = 0,
+           pair_repair_failed = 0, pair_fwd_recost = 0, pair_fwd_recost_fail = 0;
 
-  // proto/v4-p2: build the loop a junction's PAIR describes.  Forward leg = the tree
-  // path; return leg = the second path ridden backwards, which is exact where every
-  // edge has a legal opposite and every turn is allowed the other way, and REPAIRED
-  // where it does not: each non-reversible stretch (a one-way, a turn the costing
-  // forbids) is bridged by a local hard-excluded A* between the junctions either side
-  // of it, with the rest of the loop and its twins barred from that search.  Only when
-  // bridging fails does the whole return fall back to P1.1's route_leg.
+  // Build the loop a junction's PAIR describes.  Forward leg = the tree path; return
+  // leg = the second path ridden backwards, which is exact where every edge has a legal
+  // opposite and every turn is allowed the other way.  Where it is not (a one-way, a
+  // turn the costing forbids), the whole return is rebuilt with P1.1's route_leg.
   auto attempt_pair_build = [&](uint32_t ci) -> std::optional<Loop> {
     poke();
     pair_cheap_reject = false;
@@ -2824,16 +2449,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       return std::nullopt;
 
     // RETURN LEG = the other path, ridden backwards: the arcs' return edges in reverse.
+    // Served as is when every arc has a rideable return edge and the sequence costs out
+    // (turns allowed, carriageways connected); otherwise the whole return is rebuilt
+    // with route_leg.
     const size_t m = ret_arcs->size();
-    struct RItem {
-      GraphId id; // the edge the return rides (invalid when the arc has none)
-      float len;
-      bool ok;
-      int32_t harc; // provenance: the H arc, -1 for a bridge edge
-    };
-    std::vector<RItem> items;
-    items.reserve(m);
-    std::vector<uint8_t> rev_ok_count(m, 1);
+    std::vector<GraphId> ids;
+    ids.reserve(m);
+    uint32_t nbad = 0;
     for (size_t i = 0; i < m; ++i) {
       const uint32_t h = (*ret_arcs)[m - 1 - i];
       const auto& a = pairs->arc(h);
@@ -2865,117 +2487,16 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
                    " from=" + std::to_string(a.from) + " to=" + std::to_string(a.to) +
                    " len=" + std::to_string(static_cast<int>(a.len)));
       }
-      items.push_back({GraphId(a.ret_edge), a.len, ok, static_cast<int32_t>(h)});
-      rev_ok_count[i] = ok ? 1 : 0;
+      ids.push_back(GraphId(a.ret_edge));
+      nbad += ok ? 0 : 1;
     }
-    // the node an edge starts at (the end node of its opposite) / ends at
-    auto edge_start_node = [&](const GraphId& e) -> GraphId {
-      graph_tile_ptr t;
-      const GraphId opp = reader->GetOpposingEdgeId(e, t);
-      return (opp.is_valid() && t) ? t->directededge(opp)->endnode() : GraphId{};
-    };
-    auto edge_end_node = [&](const GraphId& e) -> GraphId {
-      graph_tile_ptr t = reader->GetGraphTile(e);
-      return t ? t->directededge(e)->endnode() : GraphId{};
-    };
-    uint8_t rung = 0, bridges = 0;
-    bool full = false;
+    uint8_t rung = 0;
     std::vector<PathInfo> ret;
-    for (int iter = 0; iter < 24; ++iter) {
-      uint32_t bad = kInvalidLabel;
-      for (size_t i = 0; i < items.size(); ++i)
-        if (!items[i].ok) {
-          bad = static_cast<uint32_t>(i);
-          break;
-        }
-      if (bad == kInvalidLabel) {
-        std::vector<GraphId> ids;
-        ids.reserve(items.size());
-        for (const auto& it : items)
-          ids.push_back(it.id);
-        bad = cost_path(ids, 1.0, edge_frac(ids.back(), false), ret);
-        if (bad == kInvalidLabel)
-          break; // the return costs out — done
-        items[bad].ok = false; // a turn the costing forbids, or a gap between carriageways
-      }
-      size_t a = bad, b = bad;
-      while (b + 1 < items.size() && !items[b + 1].ok)
-        ++b;
-      if (!roundtrip_pair_bridge || bridges >= roundtrip_pair_max_bridges) {
-        full = true;
-        break;
-      }
-      // BRIDGE a..b: from the node the previous item reaches to the node the next item
-      // leaves, the rest of the loop barred.
-      const bool from_turn = a == 0;
-      const bool to_start = b + 1 == items.size();
-      const GraphId from_node = from_turn ? GraphId{} : edge_end_node(items[a - 1].id);
-      const GraphId to_node = to_start ? GraphId{} : edge_start_node(items[b + 1].id);
-      if ((!from_turn && !from_node.is_valid()) || (!to_start && !to_node.is_valid())) {
-        full = true;
-        break;
-      }
-      valhalla::Location from_loc =
-          from_turn ? turn : correlate_node(from_node, *reader, items[a - 1].id);
-      valhalla::Location to_loc =
-          to_start ? start : correlate_node(to_node, *reader, GraphId{}, items[b + 1].id);
-      uint32_t from_out = 0;
-      for (const auto& pedge : from_loc.correlation().edges())
-        from_out += pedge.begin_node() ? 1 : 0;
-      if (from_out == 0 || to_loc.correlation().edges().empty()) {
-        full = true;
-        break;
-      }
-      // the synthetic corridor route_leg bars and leashes: the reversible return items
-      // outside the stretch, carrying "metres to the ride end" as their path distance
-      // (so the exemption test reads the return the way it reads the forward leg),
-      // then the forward leg (whose last entry is the total route_leg grades against).
-      std::vector<PathInfo> corridor;
-      {
-        double total = 0.0;
-        for (const auto& it : items)
-          total += it.len;
-        double cum = 0.0;
-        for (size_t i = 0; i < items.size(); ++i) {
-          cum += items[i].len;
-          if ((i >= a && i <= b) || !items[i].ok)
-            continue;
-          corridor.emplace_back(mode, Cost{}, items[i].id, 0,
-                                static_cast<float>(std::max(0.0, total - cum)),
-                                kInvalidRestriction, Cost{});
-        }
-      }
-      corridor.insert(corridor.end(), fwd.begin(), fwd.end());
-      uint8_t brung = 0;
-      std::vector<PathInfo> bridge;
-      const auto t_b = ledger_clock::now();
-      try {
-        bridge = route_leg(corridor, from_loc, to_loc, brung);
-      } catch (const std::exception&) {
-        bridge.clear();
-      }
-      bridge_ms += ms_since(t_b);
-      if (bridge.empty()) {
-        full = true;
-        break;
-      }
-      ++bridges;
-      rung = std::max(rung, brung);
-      std::vector<RItem> next(items.begin(), items.begin() + a);
-      float prev_pd = 0.f;
-      for (const auto& pi : bridge) {
-        next.push_back({pi.edgeid, pi.path_distance - prev_pd, true, -1});
-        prev_pd = pi.path_distance;
-      }
-      next.insert(next.end(), items.begin() + b + 1, items.end());
-      items.swap(next);
-      ret.clear();
-    }
-    if (ret.empty() && !full)
-      full = true; // the iteration cap: repair the whole return instead
+    const bool full = nbad > 0 || ids.empty() ||
+                      cost_path(ids, 1.0, edge_frac(ids.back(), false), ret) != kInvalidLabel ||
+                      ret.empty();
     if (full) {
       ret.clear();
-      rung = 0;
       try {
         ret = route_leg(fwd, turn, start, rung);
       } catch (const std::exception& e) {
@@ -2996,7 +2517,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     L.rung = rung;
     L.cand = ci;
     L.pair_built = true;
-    L.pair_bridges = bridges;
     L.pair_full_repair = full;
     L.pair_cost = pe.pair.pair_cost;
     L.pair_surplus = pe.pair.reduced_cost;
@@ -3004,22 +2524,16 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     L.pair_ret_len = pe.pair.other_len;
     ++pair_loops_built;
     {
-      uint32_t nbad = 0;
-      for (size_t i = 0; i < m; ++i)
-        nbad += rev_ok_count[i] ? 0 : 1;
       LOG_INFO("roundtrip pair-loop: cand=" + std::to_string(ci) + " ret_arcs=" +
                std::to_string(m) + " no_return_edge=" + std::to_string(nbad) +
-               " bridges=" + std::to_string(bridges) + " full=" + std::to_string(full) +
+               " full=" + std::to_string(full) +
                " fwd_m=" + std::to_string(static_cast<int>(pe.pair.tree_len)) + " ret_m=" +
                std::to_string(static_cast<int>(pe.pair.other_len)) + " surplus=" +
                std::to_string(static_cast<int>(pe.pair.reduced_cost)));
     }
     if (full)
       ++pair_loops_full_repair;
-    else if (bridges > 0) {
-      ++pair_loops_bridged;
-      pair_bridge_runs += bridges;
-    } else
+    else
       ++pair_loops_reversible;
     return finish_build(std::move(L));
   };
@@ -3164,36 +2678,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       if (!served_sigs.insert(std::move(sig)).second)
         continue; // identical to an already-built loop — refill from the queue
     }
-    // Item 4 near-dup sharing filter (wayfinder #46): reject a loop that retreads more
-    // than kSharingRejectFrac of its fresh-road length onto an already-kept loop, and
-    // refill the slot from the queue — the byte-identical dedup above generalized from
-    // "identical" to "near-identical". Where the network offers fewer than K distinct
-    // corridors the bank honestly under-fills rather than serving twins.
-    if (roundtrip_sharing_filter) {
-      std::unordered_map<uint64_t, double> kl, kl_twins;
-      const double total = loop_keylen(*built, kl, kl_twins);
-      bool near_dup = false;
-      if (total > 0.0) {
-        for (const auto& prev : built_keylens) {
-          double shared = 0.0;
-          for (const auto& [k, len] : kl)
-            if (prev.count(k))
-              shared += len;
-          if (shared / total > roundtrip_sharing_frac) {
-            near_dup = true;
-            break;
-          }
-        }
-      }
-      if (near_dup) {
-        ++sharing_filter_rejects;
-        continue; // refill from the queue
-      }
-      // the kept loop's roads AND their twins are what later loops are tested against
-      for (const auto& [t, len] : kl_twins)
-        kl.emplace(t, len);
-      built_keylens.push_back(std::move(kl));
-    }
     built_lls.push_back(cands[serve_ci].ll);
     built_nodes.insert(cands[serve_ci].node);
     // Register this loop's fresh-road edges in the cross-candidate memory (wayfinder
@@ -3202,25 +2686,19 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // (= start), so both exemption tests mean "outside the shared start disk" and the
     // network-forced start stem is never remembered.
     if (roundtrip_xcand_penalty) {
-      const double ret_total = static_cast<double>(built->ret.back().path_distance);
       std::unordered_set<uint64_t> loop_edges;
       std::vector<uint64_t> tws;
-      // proto/v4-p1: the cross-candidate surcharge set keys on TWINS too — a later
-      // candidate that rides the opposite carriageway of a committed loop is riding
-      // the same physical road and must pay the same surcharge.
-      auto note = [&](const GraphId& e) {
-        loop_edges.insert(e.value);
-        const GraphId opp = reader->GetOpposingEdgeId(e);
-        if (opp.is_valid())
-          loop_edges.insert(opp.value);
-        if (!twin_index)
-          return;
-        graph_tile_ptr tile = reader->GetGraphTile(e);
-        if (!tile)
+      // The cross-candidate surcharge set keys on TWINS too — a later candidate that
+      // rides the opposite carriageway of a committed loop is riding the same physical
+      // road and must pay the same surcharge.
+      auto note = [&](const roundtrip::LoopEdge& le) {
+        loop_edges.insert(le.edge.value);
+        if (le.opp.is_valid())
+          loop_edges.insert(le.opp.value);
+        if (!twin_index || !le.resolved)
           return;
         tws.clear();
-        twin_index->append_twins(RoadTwinIndex::canonical_id(tile->directededge(e), e, opp),
-                                 tws);
+        twin_index->append_twins(le.canon, tws);
         for (uint64_t cv : tws) {
           const GraphId t(cv);
           loop_edges.insert(t.value);
@@ -3229,12 +2707,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
             loop_edges.insert(topp.value);
         }
       };
-      for (const auto& pi : built->fwd)
-        if (static_cast<double>(pi.path_distance) > kStartExemptionMeters)
-          note(pi.edgeid);
-      for (const auto& pi : built->ret)
-        if (ret_total - static_cast<double>(pi.path_distance) > kStartExemptionMeters)
-          note(pi.edgeid);
+      for (const auto* leg : {&built->fwd_edges, &built->ret_edges})
+        for (const auto& le : *leg)
+          if (le.from_start_m > kStartExemptionMeters)
+            note(le);
       for (uint64_t ev : loop_edges)
         ++bank_edge_count[ev];
     }
@@ -3242,9 +2718,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       // proto/v4-p2.1: key the bank on the BUILT loop — both legs as served (92 % of P2's
       // returns are repairs the pair never described) — for every loop, rescue-built too,
       // so later candidates are tested against the returns the rider actually gets.
-      PairKeys bk;
+      roundtrip::LoopKeys bk;
       std::unordered_map<uint64_t, double> kl_twins;
-      bk.total = loop_keylen(*built, bk.ridden, kl_twins);
+      bk.total = roundtrip::built_keys(built->fwd_edges, built->ret_edges,
+                                       static_cast<double>(built->fwd.back().path_distance),
+                                       static_cast<double>(built->ret.back().path_distance),
+                                       twins_fn, kStartExemptionMeters, bk.ridden, kl_twins);
       for (const auto& [t, len] : kl_twins)
         bk.twins.insert(t);
       pair_built_keys.push_back(std::move(bk));
@@ -3282,10 +2761,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       rung_evals = 0;
       leg_test_off = rung == 3;
       leg_frac_active = roundtrip_pair_leg_sharing_frac + 0.15 * rung;
-      if (roundtrip_pair_share_relax) {
-        share_test_off = rung == 3;
-        share_frac_active = roundtrip_sharing_frac + 0.15 * rung;
-      }
       qi = 0;
       build_loop();
     }
@@ -3367,18 +2842,14 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         " twin=" + std::to_string(pair_twin_rejects) +
         " share=" + std::to_string(pair_share_rejects) + " chosen=" + std::to_string(chosen.size()) +
         "; built=" + std::to_string(pair_loops_built) + " reversible=" +
-        std::to_string(pair_loops_reversible) + " bridged=" + std::to_string(pair_loops_bridged) +
-        " (runs=" + std::to_string(pair_bridge_runs) +
-        ") full_repair=" + std::to_string(pair_loops_full_repair) + " repair_failed=" +
+        std::to_string(pair_loops_reversible) + " full_repair=" + std::to_string(pair_loops_full_repair) + " repair_failed=" +
         std::to_string(pair_repair_failed) + " fwd_recost=" + std::to_string(pair_fwd_recost) + "/" +
         std::to_string(pair_fwd_recost_fail) +
         " twin_last_resort=" + std::to_string(pair_twin_last_resort) +
         " rescue=" + std::to_string(pair_rescue_loops) + "/" + std::to_string(pair_rescue_attempts) +
-        " built_share_rejects=" + std::to_string(sharing_filter_rejects) +
         " gate_fires=" + std::to_string(gate_seam + gate_twinride + gate_bouncehits) +
         " pair_ms=" + std::to_string(static_cast<int>(pair_pass_ms)) +
         " eval_ms=" + std::to_string(static_cast<int>(pair_eval_ms)) +
-        " bridge_ms=" + std::to_string(static_cast<int>(bridge_ms)) +
         " rev_fail(tile/noopp/noret/turn/gap)=" + std::to_string(rev_fail_tile) + "/" +
         std::to_string(rev_fail_noopp) + "/" + std::to_string(rev_fail_access) + "/" +
         std::to_string(rev_fail_turn) + "/" + std::to_string(rev_fail_gap) + " fwd_illegal=" +
@@ -3388,12 +2859,10 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         " leg_share=" + std::to_string(pair_leg_share_rejects) +
         " leg_relaxed=" + std::to_string(pair_leg_relaxed) +
         " leg_relax_rung=" + std::to_string(pair_leg_relax_rung_used) +
-        " div_w=" + std::to_string(roundtrip_pair_diversity_w) +
         " built_keys=" + (roundtrip_pair_built_keys ? "1" : "0") + " rung_evals=" +
         std::to_string(rung_eval_count[0]) + "/" + std::to_string(rung_eval_count[1]) + "/" +
         std::to_string(rung_eval_count[2]) + "/" + std::to_string(rung_eval_count[3]) +
         // the coarse memory guard: evaluations cached, entries still holding keys
-        " share_relax=" + (roundtrip_pair_share_relax ? "1" : "0") +
         " relax_cap=" + std::to_string(roundtrip_pair_relax_eval_cap) +
         " eval_total=" + std::to_string(roundtrip_pair_eval_total) +
         " rescue_last=" + (roundtrip_pair_rescue_last ? "1" : "0") +
@@ -3401,12 +2870,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         std::to_string(std::count_if(pair_cache.begin(), pair_cache.end(),
                                      [](const auto& kv) { return !kv.second.keys.ridden.empty(); })));
   LOG_INFO("roundtrip rungs: r0=" + std::to_string(rung_hits[0]) +
-           " r1=" + std::to_string(rung_hits[1]) + " r2=" + std::to_string(rung_hits[2]) +
-           " none=" + std::to_string(rung_hits[3]) +
-           (parallel_rung_tried
-                ? " parallel_rung=" + std::to_string(parallel_rung_converted) + "/" +
-                      std::to_string(parallel_rung_tried)
-                : std::string()));
+           " r2=" + std::to_string(rung_hits[2]) + " none=" + std::to_string(rung_hits[3]));
   if (loops.size() < want && !dirty_loops.empty()) {
     // Dirty-last-resort, per SLOT rather than per request (proto/v4-p1.1).  ADR-0037
     // promoted the stash only when the bank was completely empty, so a cell that built
@@ -3493,7 +2957,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              (built_rank ? "rung tier then built-loop score" : "clean-first then curviness") +
              " — " + order);
     if (pairs) {
-      // proto/v4-p2: slot:paircost/surplus/fwd-m/ret-m/bridges/full  (a P1.1-built
+      // proto/v4-p2: slot:paircost/surplus/fwd-m/ret-m/full  (a P1.1-built
       // loop — the full repair — prints its pair cost too; `-` marks a non-pair loop)
       std::string pr;
       for (size_t li = 0; li < loops.size(); ++li) {
@@ -3507,7 +2971,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
               std::to_string(static_cast<int>(L.pair_surplus)) + "/" +
               std::to_string(static_cast<int>(L.pair_fwd_len)) + "/" +
               std::to_string(static_cast<int>(L.pair_ret_len)) + "/" +
-              std::to_string(L.pair_bridges) + "/" + (L.pair_full_repair ? "1" : "0");
+              (L.pair_full_repair ? "1" : "0");
       }
       LOG_INFO("roundtrip pair-ranks: " + pr);
       // proto/v4-p2.1: slot:relax-rung/pair-built/tier, keyed by request (start, target,
@@ -3550,7 +3014,6 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     prov->set_tier(lp.tier());
     prov->set_relaxed(lp.relaxed);
     prov->set_gated(lp.gated);
-    prov->set_bridges(lp.pair_bridges);
     prov->set_full_repair(lp.pair_full_repair);
     // A pair loop's own edges can hold a leg TripLegBuilder refuses: that loop's slot stays empty.
     try {
@@ -3589,7 +3052,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
              " loops=" + std::to_string(loops.size()) +
              " dirty=" + std::to_string(dirty_loops.size()) + (widened ? " widened" : "") +
              " underfill=" + underfill_cause +
-             (pairs ? " pairs=" + ms(pair_pass_ms) + " bridge=" + ms(bridge_ms) : std::string()) +
+             (pairs ? " pairs=" + ms(pair_pass_ms) : std::string()) +
              " unbuilt=" + std::to_string(loops_unbuilt));
   }
 }

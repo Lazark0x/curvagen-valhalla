@@ -56,7 +56,7 @@ public:
     return es.set() == EdgeSet::kUnreachedOrReset ? baldr::kInvalidLabel : es.index();
   }
 
-  // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10) — F01 harvest hygiene.  With this on,
+  // F01 harvest hygiene.  With this on,
   // ScanBand rejects a candidate whose label chain is not SIMPLE: an undirected edge
   // (or, when the sidecar is supplied, its twin) revisited anywhere in the chain.  That
   // is the ring-reversal class: ride out, turn round on a roundabout/triangle/village
