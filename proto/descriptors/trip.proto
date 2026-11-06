@@ -368,8 +368,8 @@ message CurvagenProvenance {
   // possibly repaired), "rescue" (the P1.1 builder after the pair pass came up
   // short), "route_leg" (no pair pass — the v3 path).
   string builder = 1;
-  // Fallback rung of the return build: 0 clean hard-exclude, 1 twins released,
-  // 2 soft leash (the v3 Fallback Loop).
+  // Fallback rung of the return build: 0 clean hard-exclude, 2 soft leash (the v3
+  // Fallback Loop). 1 (twins released) is no longer built.
   uint32 rung = 2;
   // Rank tier, absolute: 0..2 == rung, 3 == the Defect Gate's dirty tier.
   uint32 tier = 3;
@@ -378,7 +378,7 @@ message CurvagenProvenance {
   uint32 relaxed = 4;
   // The Defect Gate rejected this loop and it was served from the dirty stash.
   bool gated = 5;
-  // Non-reversible return stretches repaired with a local A*.
+  // Always 0: the engine no longer repairs a return stretch by stretch.
   uint32 bridges = 6;
   // The whole return was rebuilt with route_leg after the pair was selected.
   bool full_repair = 7;

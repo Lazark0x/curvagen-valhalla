@@ -85,10 +85,9 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       //   built-loop bank keys · whole-pair test at 0.6 (roundtrip_sharing_frac) ·
       //   one evaluation budget of 1 200 per request, 150 fresh per relaxation rung ·
       //   relaxed-last and rescue-last ranking · xcand penalty 0.2 cap 4 ·
-      //   geometry-gate refill budget 2, fallback rungs off (the P1.1 knee).
+      //   geometry-gate refill budget 2.
       roundtrip_stage_timing(config.get<bool>("thor.roundtrip_stage_timing", false)),
       roundtrip_xcand_penalty(config.get<bool>("thor.roundtrip_xcand_penalty", true)),
-      roundtrip_sharing_filter(config.get<bool>("thor.roundtrip_sharing_filter", false)),
       roundtrip_xcand_strength(config.get<double>("thor.roundtrip_xcand_strength", 0.2)),
       roundtrip_xcand_cap(config.get<uint32_t>("thor.roundtrip_xcand_cap", 4)),
       roundtrip_sharing_frac(config.get<double>("thor.roundtrip_sharing_frac", 0.6)),
@@ -102,20 +101,15 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_geometry_gate(config.get<bool>("thor.roundtrip_geometry_gate", true)),
       roundtrip_gate_twin_ride_m(config.get<double>("thor.roundtrip_gate_twin_ride_m", 500.0)),
       roundtrip_gate_return_bounce_m(config.get<double>("thor.roundtrip_gate_return_bounce_m", 30.0)),
-      roundtrip_fallback_rungs(config.get<bool>("thor.roundtrip_fallback_rungs", false)),
       roundtrip_gate_refill_budget(config.get<uint32_t>("thor.roundtrip_gate_refill_budget", 2)),
-      roundtrip_fallback_parallel_rung(
-          config.get<bool>("thor.roundtrip_fallback_parallel_rung", false)),
       roundtrip_f09_budget(config.get<bool>("thor.roundtrip_f09_budget", true)),
       roundtrip_rank_overlap_w(config.get<double>("thor.roundtrip_rank_overlap_w", 4.0)),
       roundtrip_rank_disterr_w(config.get<double>("thor.roundtrip_rank_disterr_w", 1.0)),
       roundtrip_pair_pass(config.get<bool>("thor.roundtrip_pair_pass", true)),
-      roundtrip_pair_bridge(config.get<bool>("thor.roundtrip_pair_bridge", false)),
       roundtrip_pair_sharing(config.get<bool>("thor.roundtrip_pair_sharing", true)),
       roundtrip_pair_band(config.get<double>("thor.roundtrip_pair_band", 0.20)),
       roundtrip_pair_shortlist(config.get<uint32_t>("thor.roundtrip_pair_shortlist", 8)),
       roundtrip_pair_twin_join_m(config.get<double>("thor.roundtrip_pair_twin_join_m", 0.0)),
-      roundtrip_pair_max_bridges(config.get<uint32_t>("thor.roundtrip_pair_max_bridges", 12)),
       roundtrip_pair_return_legal(config.get<bool>("thor.roundtrip_pair_return_legal", true)),
       roundtrip_pair_eval_cap(config.get<uint32_t>("thor.roundtrip_pair_eval_cap", 1200)),
       roundtrip_pair_two_way_tree(config.get<bool>("thor.roundtrip_pair_two_way_tree", true)),
@@ -124,16 +118,13 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_pair_leg_sharing_frac(
           config.get<double>("thor.roundtrip_pair_leg_sharing_frac", 0.35)),
       roundtrip_pair_built_keys(config.get<bool>("thor.roundtrip_pair_built_keys", true)),
-      roundtrip_pair_diversity_w(config.get<double>("thor.roundtrip_pair_diversity_w", 0.0)),
       roundtrip_pair_leg_relax(config.get<bool>("thor.roundtrip_pair_leg_relax", true)),
       roundtrip_pair_relaxed_last(config.get<bool>("thor.roundtrip_pair_relaxed_last", true)),
       roundtrip_pair_eval_total(config.get<uint32_t>("thor.roundtrip_pair_eval_total", 1200)),
       roundtrip_pair_relax_eval_cap(config.get<uint32_t>("thor.roundtrip_pair_relax_eval_cap", 150)),
-      roundtrip_pair_share_relax(config.get<bool>("thor.roundtrip_pair_share_relax", false)),
       roundtrip_pair_rescue_last(config.get<bool>("thor.roundtrip_pair_rescue_last", true)) {
 
-  // PROTOTYPE proto/v4-p1 (curvagen-valhalla#10): build the road-identity sidecar at
-  // engine start (first thor worker; later workers hit the cached instance) so the
+  // Build the road-identity sidecar at engine start (first thor worker; later workers hit the cached instance) so the
   // per-request path never pays for it.  Logs size + build time at INFO.
   if (roundtrip_road_identity)
     RoadTwinIndex::get(*reader, roundtrip_twin_radius_m, roundtrip_parallel_radius_m,

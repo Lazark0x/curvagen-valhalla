@@ -19,7 +19,6 @@ void pin_pre_pair_pass(gurka::map& m) {
   m.config.put("thor.roundtrip_pair_pass", false);
   m.config.put("thor.roundtrip_xcand_penalty", false);
   m.config.put("thor.roundtrip_gate_refill_budget", 0);
-  m.config.put("thor.roundtrip_fallback_rungs", true);
 }
 } // namespace
 

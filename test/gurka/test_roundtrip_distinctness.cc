@@ -12,10 +12,7 @@
 
 using namespace valhalla;
 
-// Coverage for the wayfinder #46 cross-candidate distinctness work: the soft
-// cross-candidate corridor penalty (thor.roundtrip_xcand_penalty) and the item 4
-// near-duplicate sharing filter (thor.roundtrip_sharing_filter). Both are config-gated
-// and default off, so the existing round-trip suite already pins the flags-off behavior.
+// Coverage for the cross-candidate corridor penalty (thor.roundtrip_xcand_penalty).
 
 namespace {
 
@@ -134,54 +131,4 @@ TEST_F(RoundTripXCandExemption, PenaltyLeavesTheForcedStemRoutable) {
       ++count[edge];
     EXPECT_EQ(count["AB"], 2) << "the exempt access road was surcharged out of the loop";
   }
-}
-
-// A tight ladder of near-identical loops (mirrors MotorcycleRoundTripCluster): the cells
-// are packed so K candidates converge onto near-duplicate geometry. With the sharing
-// filter on, no two SERVED loops may overlap beyond the threshold — the filter refills
-// past near-dups, and where the network can't offer K distinct loops the bank honestly
-// under-fills rather than serving twins.
-class RoundTripSharingFilter : public ::testing::Test {
-protected:
-  static gurka::map map;
-  static void SetUpTestSuite() {
-    const std::string ascii_map = R"(
-      A------------B-C
-                   | |
-                   D-E
-                   | |
-                   F-G
-    )";
-    const gurka::ways ways = {
-        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
-        {"BD", {{"highway", "secondary"}}}, {"CE", {{"highway", "secondary"}}},
-        {"DE", {{"highway", "secondary"}}}, {"DF", {{"highway", "secondary"}}},
-        {"EG", {{"highway", "secondary"}}}, {"FG", {{"highway", "secondary"}}},
-    };
-    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 500);
-    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/roundtrip_sharing_filter");
-  }
-};
-gurka::map RoundTripSharingFilter::map = {};
-
-TEST_F(RoundTripSharingFilter, ServedLoopsStayUnderTheSharingThreshold) {
-  map.config.put("thor.roundtrip_sharing_filter", true);
-  map.config.put("thor.roundtrip_sharing_frac", 0.6);
-  auto result =
-      gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
-                       {{"/roundtrip/target_distance", "14000"}, {"/roundtrip/num_candidates", "8"}});
-  const auto paths = gurka::detail::get_paths(result);
-  ASSERT_GE(paths.size(), 1u);
-  // No pair of served loops shares more than the threshold of the smaller loop's ways.
-  for (size_t i = 0; i < paths.size(); ++i)
-    for (size_t j = i + 1; j < paths.size(); ++j) {
-      const std::set<std::string> a(paths[i].begin(), paths[i].end());
-      const std::set<std::string> b(paths[j].begin(), paths[j].end());
-      std::vector<std::string> shared;
-      std::set_intersection(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(shared));
-      const double frac =
-          static_cast<double>(shared.size()) / static_cast<double>(std::min(a.size(), b.size()));
-      EXPECT_LE(frac, 0.6) << "served loops " << i << " and " << j << " are near-duplicates (overlap "
-                           << frac << ")";
-    }
 }
