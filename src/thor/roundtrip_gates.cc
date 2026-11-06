@@ -111,6 +111,25 @@ GateAction gate_action(const GateVerdict& verdict, uint32_t refills_used, uint32
   return GateAction::kKeepGated;
 }
 
+bool stash_before(const StashRank& a, const StashRank& b) {
+  if (a.seam != b.seam)
+    return !a.seam;
+  return a.score > b.score;
+}
+
+size_t
+stash_slot(const StashRank& loop, const std::vector<StashRank>& stash, size_t cap, size_t dup) {
+  if (dup != kNoSlot)
+    return stash_before(loop, stash[dup]) ? dup : kNoSlot;
+  if (stash.size() < cap)
+    return stash.size();
+  size_t last = kNoSlot;
+  for (size_t i = 0; i < stash.size(); ++i)
+    if (last == kNoSlot || !stash_before(stash[i], stash[last]))
+      last = i;
+  return last != kNoSlot && stash_before(loop, stash[last]) ? last : kNoSlot;
+}
+
 } // namespace roundtrip
 } // namespace thor
 } // namespace valhalla

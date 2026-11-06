@@ -132,3 +132,68 @@ TEST_F(RoundTripXCandExemption, PenaltyLeavesTheForcedStemRoutable) {
     EXPECT_EQ(count["AB"], 2) << "the exempt access road was surcharged out of the loop";
   }
 }
+
+namespace {
+
+// The largest share of one served loop's ways that another served loop also rides (shared
+// ways / the smaller loop's ways). 1.0 means a served loop rides nothing another does not.
+double max_pair_containment(const std::vector<std::vector<std::string>>& paths) {
+  double worst = 0.0;
+  for (size_t i = 0; i < paths.size(); ++i)
+    for (size_t j = i + 1; j < paths.size(); ++j) {
+      const std::set<std::string> a(paths[i].begin(), paths[i].end());
+      const std::set<std::string> b(paths[j].begin(), paths[j].end());
+      std::vector<std::string> shared;
+      std::set_intersection(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(shared));
+      const size_t denom = std::min(a.size(), b.size());
+      if (denom)
+        worst = std::max(worst, static_cast<double>(shared.size()) / static_cast<double>(denom));
+    }
+  return worst;
+}
+
+std::string dump(const std::vector<std::vector<std::string>>& paths) {
+  std::string out;
+  for (const auto& p : paths) {
+    out += "\n  ";
+    for (const auto& e : p)
+      out += e + " ";
+  }
+  return out;
+}
+
+} // namespace
+
+// A sparse cell in the shipped configuration: one road out of A with dead-end spurs. No
+// disjoint pair exists, so every loop comes from the rescue builder, and every one is an
+// out-and-back the Defect Gate rejects: the cell serves from the dirty stash. The stash
+// keeps one out-and-back per road, not one per spur.
+class RoundTripSparseSpurs : public ::testing::Test {
+protected:
+  static gurka::map map;
+  static void SetUpTestSuite() {
+    const std::string ascii_map = R"(
+      A--------B--C--D--E
+               |  |  |  |
+               P  Q  R  S
+    )";
+    const gurka::ways ways = {
+        {"AB", {{"highway", "secondary"}}}, {"BC", {{"highway", "secondary"}}},
+        {"CD", {{"highway", "secondary"}}}, {"DE", {{"highway", "secondary"}}},
+        {"BP", {{"highway", "secondary"}}}, {"CQ", {{"highway", "secondary"}}},
+        {"DR", {{"highway", "secondary"}}}, {"ES", {{"highway", "secondary"}}},
+    };
+    const auto layout = gurka::detail::map_to_coordinates(ascii_map, 1000);
+    map = gurka::buildtiles(layout, ways, {}, {}, "test/data/roundtrip_sparse_spurs");
+  }
+};
+gurka::map RoundTripSparseSpurs::map = {};
+
+TEST_F(RoundTripSparseSpurs, TheStashServesOneOutAndBackPerRoad) {
+  auto result =
+      gurka::do_action(valhalla::Options::route, map, {"A", "A"}, "motorcycle",
+                       {{"/roundtrip/target_distance", "24000"}, {"/roundtrip/num_candidates", "3"}});
+  const auto paths = gurka::detail::get_paths(result);
+  ASSERT_GE(paths.size(), 1u) << "a cell with only defective loops must not 442";
+  EXPECT_LT(max_pair_containment(paths), 1.0) << "near-copies served from the stash:" << dump(paths);
+}

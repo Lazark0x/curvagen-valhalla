@@ -87,3 +87,35 @@ TEST(RoundTripGates, SeamRejectsAlwaysRefillGeometryRejectsOnlyWithinBudget) {
   EXPECT_EQ(gate_action({false, false, true}, 2, 2), GateAction::kKeepGated);
   EXPECT_EQ(gate_action({false, false, true}, 0, 0), GateAction::kKeepGated);
 }
+
+TEST(RoundTripGates, TheTopUpTakesGeometryRejectsBeforeSeamRejectsThenTheHigherScore) {
+  EXPECT_TRUE(stash_before({false, 0.1}, {true, 0.9}));
+  EXPECT_FALSE(stash_before({true, 0.9}, {false, 0.1}));
+  EXPECT_TRUE(stash_before({true, 0.5}, {true, 0.4}));
+  EXPECT_FALSE(stash_before({false, 0.4}, {false, 0.4}));
+}
+
+TEST(RoundTripGates, AStashWithRoomAppendsADistinctReject) {
+  const std::vector<StashRank> stash = {{false, 0.5}};
+  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, kNoSlot), 1u);
+  EXPECT_EQ(stash_slot({true, 0.1}, {}, 3, kNoSlot), 0u);
+}
+
+TEST(RoundTripGates, ADuplicateReplacesItsTwinOnlyWhenTheTopUpWouldTakeItFirst) {
+  const std::vector<StashRank> stash = {{false, 0.5}, {true, 0.9}};
+  EXPECT_EQ(stash_slot({false, 0.4}, stash, 3, 0), kNoSlot);
+  EXPECT_EQ(stash_slot({false, 0.6}, stash, 3, 0), 0u);
+  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, 1), 1u);
+  EXPECT_EQ(stash_slot({true, 0.95}, stash, 3, 0), kNoSlot);
+}
+
+TEST(RoundTripGates, AFullStashGivesUpItsLastEntryForABetterReject) {
+  const std::vector<StashRank> stash = {{true, 0.9}, {false, 0.2}, {false, 0.5}};
+  // The last entry the top-up would take is the seam reject at index 0.
+  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, kNoSlot), 0u);
+  EXPECT_EQ(stash_slot({true, 0.95}, stash, 3, kNoSlot), 0u);
+  EXPECT_EQ(stash_slot({true, 0.5}, stash, 3, kNoSlot), kNoSlot);
+  const std::vector<StashRank> clean = {{false, 0.3}, {false, 0.2}, {false, 0.5}};
+  EXPECT_EQ(stash_slot({false, 0.25}, clean, 3, kNoSlot), 1u);
+  EXPECT_EQ(stash_slot({false, 0.2}, clean, 3, kNoSlot), kNoSlot);
+}

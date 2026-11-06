@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -2004,6 +2005,9 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     // rather than inferred from !pair_built, because the provenance field on the
     // response (ADR-0041 §7) has to name the builder, not guess it.
     bool rescue = false;
+    // The roads it rides beyond the Start Exemption, read once by the distinctness tests.
+    roundtrip::LoopKeys keys;
+    bool keyed = false;
     // Rank tier, absolute: clean hard-exclude < soft leash < gated.
     uint8_t tier() const {
       return gated ? 3 : rung;
@@ -2094,11 +2098,76 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     queue.insert(queue.end(), widx.begin(), widx.end());
   };
 
-  // The Defect Gate's dirty stash: rejected loops kept for the per-slot last resort,
-  // at most `want` of them, in rejection order.
+  // A built loop's road keys: every edge beyond the Start Exemption, twins keyed by road.
+  auto loop_keys = [&](Loop& L) -> const roundtrip::LoopKeys& {
+    if (!L.keyed) {
+      std::unordered_map<uint64_t, double> twin_metres;
+      L.keys.total = roundtrip::built_keys(L.fwd_edges, L.ret_edges,
+                                           static_cast<double>(L.fwd.back().path_distance),
+                                           static_cast<double>(L.ret.back().path_distance),
+                                           twins_fn, kStartExemptionMeters, L.keys.ridden,
+                                           twin_metres);
+      for (const auto& [t, len] : twin_metres)
+        L.keys.twins.insert(t);
+      L.keyed = true;
+    }
+    return L.keys;
+  };
+  // The bank's distinctness, for loops that reach it without the pair selection's test:
+  // more than roundtrip_sharing_frac of a's length on b's roads or their twins.
+  const bool share_test = pairs && roundtrip_pair_sharing;
+  auto shares_with = [&](Loop& a, Loop& b) {
+    return share_test &&
+           roundtrip::shared_fraction(loop_keys(a), loop_keys(b)) > roundtrip_sharing_frac;
+  };
+  // A stash entry duplicates a loop when the bank would have refused one beside the
+  // other: the same edges, a turnaround within min_separation_m, or a shared road.
+  auto duplicates = [&](Loop& a, Loop& b) {
+    if (a.cand != baldr::kInvalidLabel && b.cand != baldr::kInvalidLabel &&
+        static_cast<double>(cands[a.cand].ll.Distance(cands[b.cand].ll)) < min_separation_m)
+      return true;
+    auto same = [](const std::vector<PathInfo>& x, const std::vector<PathInfo>& y) {
+      return std::equal(x.begin(), x.end(), y.begin(), y.end(),
+                        [](const PathInfo& p, const PathInfo& q) { return p.edgeid == q.edgeid; });
+    };
+    return (same(a.fwd, b.fwd) && same(a.ret, b.ret)) || shares_with(a, b);
+  };
+
+  // The Defect Gate's dirty stash: at most `want` rejected loops, none a duplicate of
+  // another or of a bank loop, kept for the per-slot last resort (roundtrip::stash_slot).
+  // `last_stash` says what the last call did with its loop, for the rescue ledger.
+  uint32_t stash_dups = 0, stash_full_drops = 0;
+  char last_stash = '-';
+  auto stash_ranks = [&]() {
+    std::vector<roundtrip::StashRank> ranks;
+    ranks.reserve(dirty_loops.size());
+    for (const auto& d : dirty_loops)
+      ranks.push_back({d.seam_reject, d.score});
+    return ranks;
+  };
   auto stash_dirty = [&](Loop&& L) {
-    if (dirty_loops.size() < want)
+    for (auto& b : loops)
+      if (duplicates(L, b)) {
+        ++stash_dups;
+        last_stash = 'd';
+        return;
+      }
+    size_t dup = roundtrip::kNoSlot;
+    for (size_t i = 0; i < dirty_loops.size() && dup == roundtrip::kNoSlot; ++i)
+      if (duplicates(L, dirty_loops[i]))
+        dup = i;
+    const size_t slot = roundtrip::stash_slot({L.seam_reject, L.score}, stash_ranks(), want, dup);
+    if (slot == roundtrip::kNoSlot) {
+      ++(dup == roundtrip::kNoSlot ? stash_full_drops : stash_dups);
+      last_stash = dup == roundtrip::kNoSlot ? 'f' : 'd';
+      return;
+    }
+    last_stash = slot == dirty_loops.size() ? (L.seam_reject ? 's' : 'S')
+                                            : (L.seam_reject ? 'r' : 'R');
+    if (slot == dirty_loops.size())
       dirty_loops.push_back(std::move(L));
+    else
+      dirty_loops[slot] = std::move(L);
   };
 
   // Shared tail of every build — the seam gate, the geometry gate and its budget, the
@@ -2562,12 +2631,31 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   // builder over the same queue (the RESCUE pass): a cell with no disjoint pair at all
   // (vlasina: one road in and out) is then served exactly as P1.1 serves it — a soft-
   // leash Fallback Loop, gated and ranked last — never a 442 where P1.1 has a loop.
-  uint32_t pair_rescue_attempts = 0, pair_rescue_loops = 0;
+  uint32_t pair_rescue_attempts = 0, pair_rescue_loops = 0, rescue_share_rejects = 0;
   bool rescue_pass = false;
+  // The bank's size when the rescue starts, then one letter per rescue build, for the
+  // ledger: B banked, G banked gated (past the refill budget), n near-copy of a bank loop,
+  // i identical to one, S stashed, R replaced a stash entry (s, r: a seam reject),
+  // d duplicate the stash dropped, f stash full, x no loop.
+  std::string rescue_trace;
+  // The rescue stops once it has stopped finding loops: kAttemptSlack builds in a row that
+  // put nothing new in the bank or the stash (a copy of a bank loop, a duplicate or
+  // overflow the stash dropped, or no loop at all). A full stash turns every further
+  // reject into such a build. In sparse cells those builds are turnarounds converging on
+  // loops already held; the bank keeps its loops either way.
+  uint32_t rescue_dry = 0;
+  auto rescue_note = [&](char outcome) {
+    rescue_trace += outcome;
+    rescue_dry = std::strchr("BGSRsr", outcome) ? 0 : rescue_dry + 1;
+  };
   auto build_loop = [&]() {
   while (true) {
     if (loops.size() >= want)
       break;
+    if (rescue_pass && rescue_dry >= kAttemptSlack) {
+      underfill_cause = "dry";
+      break;
+    }
     if (qi >= queue.size() || attempts >= attempt_cap) {
       if (roundtrip_f09_budget ? !stall_granted : !widened) {
         stall_granted = true;
@@ -2610,10 +2698,14 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       }
     }
     ++attempts;
-    if (rescue_pass)
+    if (rescue_pass) {
       ++pair_rescue_attempts;
+      last_stash = 'x';
+    }
     auto built = rescue_pass ? attempt_build(ci) : build_candidate(ci);
     if (!built) {
+      if (rescue_pass)
+        rescue_note(last_stash);
       if (pairs && !rescue_pass && pair_cheap_reject)
         --attempts; // died before any search: not a spent build
       continue;
@@ -2675,8 +2767,24 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         sig.push_back(pi.edgeid.value);
       for (const auto& pi : built->ret)
         sig.push_back(pi.edgeid.value);
-      if (!served_sigs.insert(std::move(sig)).second)
+      if (!served_sigs.insert(std::move(sig)).second) {
+        if (rescue_pass)
+          rescue_note('i');
         continue; // identical to an already-built loop — refill from the queue
+      }
+    }
+    // The rescue builder has no pair to test before it builds, so its loop meets the
+    // bank's whole-loop sharing test once built: a near-copy of a bank loop refills.
+    if (rescue_pass) {
+      bool shared = false;
+      for (auto& b : loops)
+        if ((shared = shares_with(*built, b)))
+          break;
+      if (shared) {
+        ++rescue_share_rejects;
+        rescue_note('n');
+        continue;
+      }
     }
     built_lls.push_back(cands[serve_ci].ll);
     built_nodes.insert(cands[serve_ci].node);
@@ -2718,15 +2826,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
       // proto/v4-p2.1: key the bank on the BUILT loop — both legs as served (92 % of P2's
       // returns are repairs the pair never described) — for every loop, rescue-built too,
       // so later candidates are tested against the returns the rider actually gets.
-      roundtrip::LoopKeys bk;
-      std::unordered_map<uint64_t, double> kl_twins;
-      bk.total = roundtrip::built_keys(built->fwd_edges, built->ret_edges,
-                                       static_cast<double>(built->fwd.back().path_distance),
-                                       static_cast<double>(built->ret.back().path_distance),
-                                       twins_fn, kStartExemptionMeters, bk.ridden, kl_twins);
-      for (const auto& [t, len] : kl_twins)
-        bk.twins.insert(t);
-      pair_built_keys.push_back(std::move(bk));
+      pair_built_keys.push_back(loop_keys(*built));
     } else if (pairs && built->cand != baldr::kInvalidLabel) {
       pair_built_keys.push_back(pair_cache[built->cand].keys);
     }
@@ -2738,6 +2838,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     if (rescue_pass) {
       ++pair_rescue_loops;
       built->rescue = true;
+      rescue_note(built->gated ? 'G' : 'B');
     }
     loops.push_back(std::move(*built));
   }
@@ -2801,6 +2902,7 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
   }
   if (pairs && loops.size() < want) {
     rescue_pass = true;
+    rescue_trace = std::to_string(loops.size()) + ":";
     qi = 0;
     attempt_cap = std::max(attempt_cap, attempts + want + kAttemptSlack);
     stall_granted = false; // the rescue gets P1.1's own stall grant (F09) once more
@@ -2868,7 +2970,12 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
         " rescue_last=" + (roundtrip_pair_rescue_last ? "1" : "0") +
         " cache=" + std::to_string(pair_cache.size()) + " keys_held=" +
         std::to_string(std::count_if(pair_cache.begin(), pair_cache.end(),
-                                     [](const auto& kv) { return !kv.second.keys.ridden.empty(); })));
+                                     [](const auto& kv) { return !kv.second.keys.ridden.empty(); })) +
+        " rescue_share=" + std::to_string(rescue_share_rejects) +
+        " stash_dups=" + std::to_string(stash_dups) +
+        " stash_full=" + std::to_string(stash_full_drops) +
+        " rescue_trace=" + (rescue_trace.empty() ? "-" : rescue_trace) +
+        " underfill=" + underfill_cause);
   LOG_INFO("roundtrip rungs: r0=" + std::to_string(rung_hits[0]) +
            " r2=" + std::to_string(rung_hits[2]) + " none=" + std::to_string(rung_hits[3]));
   if (loops.size() < want && !dirty_loops.empty()) {
@@ -2885,6 +2992,14 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     std::stable_sort(dirty_loops.begin(), dirty_loops.end(),
                      [](const Loop& a, const Loop& b) { return a.score > b.score; });
     const size_t before = loops.size();
+    // The stash holds no two duplicates and none of a loop banked before it was stashed;
+    // a loop banked after it can still be one, and is checked here.
+    auto distinct_from_bank = [&](Loop& d) {
+      for (auto& b : loops)
+        if (duplicates(d, b))
+          return false;
+      return true;
+    };
     // A SEAM-rejected loop is an exact-mirror stub — the harness's own spike meter, and
     // Gate v1.3's one absolute (`spike_ge_500m == 0`).  Topping a bank up with one trades
     // a fill for a spike, which is not a trade this gate is allowed to make: the first
@@ -2894,13 +3009,13 @@ void thor_worker_t::roundtrip_impl(Api& request, const std::string& /*costing*/)
     for (auto& d : dirty_loops) {
       if (loops.size() >= want)
         break;
-      if (d.seam_reject)
+      if (d.seam_reject || !distinct_from_bank(d))
         continue;
       loops.push_back(std::move(d));
     }
     if (loops.empty())
       for (auto& d : dirty_loops)
-        if (d.seam_reject && loops.size() < want)
+        if (d.seam_reject && loops.size() < want && distinct_from_bank(d))
           loops.push_back(std::move(d));
     LOG_INFO("roundtrip: topped the bank up with " + std::to_string(loops.size() - before) +
              " gated loop(s) as a last resort (had " + std::to_string(before) + ")");

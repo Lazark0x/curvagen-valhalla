@@ -79,6 +79,26 @@ enum class GateAction { kServe, kStashSeam, kStashGeometry, kKeepGated };
 
 GateAction gate_action(const GateVerdict& verdict, uint32_t refills_used, uint32_t refill_budget);
 
+// A dirty-stash entry as the stash's admission rule reads it. The stash holds at most K
+// rejected loops for the per-slot top-up, which takes geometry rejects first, best score
+// first, and a seam reject only when the bank would otherwise be empty.
+struct StashRank {
+  bool seam = false;
+  double score = 0;
+};
+
+// True when the top-up would take a before b.
+bool stash_before(const StashRank& a, const StashRank& b);
+
+constexpr size_t kNoSlot = std::numeric_limits<size_t>::max();
+
+// Where a rejected loop goes in a stash of at most `cap` entries: the index to write it
+// to (stash.size() appends) or kNoSlot to drop it. `dup` is the index of the stash entry
+// the loop duplicates, kNoSlot when none; the two keep whichever the top-up would take
+// first. A full stash gives up the entry the top-up would take last, and only for a loop
+// it would take before that entry.
+size_t stash_slot(const StashRank& loop, const std::vector<StashRank>& stash, size_t cap, size_t dup);
+
 } // namespace roundtrip
 } // namespace thor
 } // namespace valhalla
