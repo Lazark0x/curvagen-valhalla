@@ -51,6 +51,20 @@ sorted order, and aggregates are pure functions of `loops.jsonl` — same corpus
 same engine ⇒ identical `loops.jsonl` and identical `aggregates` (only the `run`
 provenance block varies). Request parallelism does not affect results.
 
+## Engine memory and the curvature bucket histogram
+
+Two tools beside the harness (`venv` needs `numpy` for the second):
+
+- `engine_memory.py`: engine wall time and cgroup memory per Round Trip request, sampled
+  inside the Docker VM next to the engine. Its responses are loopqual records, so `loopqual run`
+  on the same `--out` adds the loop metrics. Usage in its docstring.
+- `tile_buckets.py TAR [--region name:lat,lon,km] [--split-lon 165]`: the length-weighted
+  curvature bucket histogram (0..15) of a tileset, read straight from the tar.
+
+Corpora for them: `corpus-aunz-v1.yaml` (AU/NZ at K=3, the production serve) and its
+Balkans control `corpus-balkans-k3-v1.yaml`. Reading:
+`curvagen/docs/research/2026-11-06-aunz-round-trip.md`.
+
 ## Corpus format
 
 YAML/JSON: `id`, global `k` / `avoid_motorways`, `origins: {name: {lat, lon}}`,
