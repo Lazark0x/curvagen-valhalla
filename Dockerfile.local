@@ -11,8 +11,10 @@
 # Local serving image:
 #     DOCKER_BUILDKIT=0 docker build -f Dockerfile.local \
 #       --build-arg ENABLE_TESTS=On -t curvagen-valhalla:latest .
+# The round-trip release tests (scripts/curvagen-roundtrip-tests.sh) build in the
+# `deps` stage with the checkout mounted.
 
-FROM ubuntu:24.04 AS builder
+FROM ubuntu:24.04 AS deps
 
 ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ENV LD_LIBRARY_PATH=/usr/local/lib:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu
@@ -24,6 +26,8 @@ WORKDIR /src/valhalla
 # (slow) layer on every recompile.
 COPY scripts/install-linux-deps.sh scripts/install-linux-deps.sh
 RUN bash ./scripts/install-linux-deps.sh
+
+FROM deps AS builder
 
 # Then the local working tree (third_party submodules included from the host).
 COPY . .

@@ -11,6 +11,11 @@ name: build-amd64
 # `docker/build-push-action@*` — the four actions below and nothing else. A new
 # third-party action fails at startup with a policy error, not a build error;
 # add its pattern under Settings -> Actions -> General first.
+#
+# Dispatch only after scripts/curvagen-roundtrip-tests.sh has passed on the commit
+# being built: the image compiles with ENABLE_TESTS=Off, so nothing here runs a test.
+# Quote the script's last line in the release note (docs/curvagen/extension-api.md,
+# "Before an engine image ships").
 
 on:
   workflow_dispatch: {}
