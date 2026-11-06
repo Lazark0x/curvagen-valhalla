@@ -27,7 +27,8 @@ GURKA=(gurka_motorcycle_roundtrip gurka_roundtrip_audit gurka_roundtrip_distinct
 if [ -z "${DEPS_IMAGE:-}" ]; then
   DEPS_IMAGE="curvagen-valhalla-deps:$(git hash-object scripts/install-linux-deps.sh | cut -c1-12)"
   if ! docker image inspect "$DEPS_IMAGE" >/dev/null 2>&1; then
-    tar -c Dockerfile.local scripts/install-linux-deps.sh |
+    # No extended attributes: the daemon cannot set macOS ones (com.apple.provenance).
+    COPYFILE_DISABLE=1 tar --no-xattrs -c Dockerfile.local scripts/install-linux-deps.sh |
       docker build -f Dockerfile.local --target deps -t "$DEPS_IMAGE" -
   fi
 fi
