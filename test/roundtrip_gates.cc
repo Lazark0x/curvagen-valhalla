@@ -97,25 +97,53 @@ TEST(RoundTripGates, TheTopUpTakesGeometryRejectsBeforeSeamRejectsThenTheHigherS
 
 TEST(RoundTripGates, AStashWithRoomAppendsADistinctReject) {
   const std::vector<StashRank> stash = {{false, 0.5}};
-  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, kNoSlot), 1u);
-  EXPECT_EQ(stash_slot({true, 0.1}, {}, 3, kNoSlot), 0u);
+  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, {}), 1u);
+  EXPECT_EQ(stash_slot({true, 0.1}, {}, 3, {}), 0u);
 }
 
 TEST(RoundTripGates, ADuplicateReplacesItsTwinOnlyWhenTheTopUpWouldTakeItFirst) {
   const std::vector<StashRank> stash = {{false, 0.5}, {true, 0.9}};
-  EXPECT_EQ(stash_slot({false, 0.4}, stash, 3, 0), kNoSlot);
-  EXPECT_EQ(stash_slot({false, 0.6}, stash, 3, 0), 0u);
-  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, 1), 1u);
-  EXPECT_EQ(stash_slot({true, 0.95}, stash, 3, 0), kNoSlot);
+  EXPECT_EQ(stash_slot({false, 0.4}, stash, 3, {0}), kNoSlot);
+  EXPECT_EQ(stash_slot({false, 0.6}, stash, 3, {0}), 0u);
+  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, {1}), 1u);
+  EXPECT_EQ(stash_slot({true, 0.95}, stash, 3, {0}), kNoSlot);
 }
 
 TEST(RoundTripGates, AFullStashGivesUpItsLastEntryForABetterReject) {
   const std::vector<StashRank> stash = {{true, 0.9}, {false, 0.2}, {false, 0.5}};
   // The last entry the top-up would take is the seam reject at index 0.
-  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, kNoSlot), 0u);
-  EXPECT_EQ(stash_slot({true, 0.95}, stash, 3, kNoSlot), 0u);
-  EXPECT_EQ(stash_slot({true, 0.5}, stash, 3, kNoSlot), kNoSlot);
+  EXPECT_EQ(stash_slot({false, 0.1}, stash, 3, {}), 0u);
+  EXPECT_EQ(stash_slot({true, 0.95}, stash, 3, {}), 0u);
+  EXPECT_EQ(stash_slot({true, 0.5}, stash, 3, {}), kNoSlot);
   const std::vector<StashRank> clean = {{false, 0.3}, {false, 0.2}, {false, 0.5}};
-  EXPECT_EQ(stash_slot({false, 0.25}, clean, 3, kNoSlot), 1u);
-  EXPECT_EQ(stash_slot({false, 0.2}, clean, 3, kNoSlot), kNoSlot);
+  EXPECT_EQ(stash_slot({false, 0.25}, clean, 3, {}), 1u);
+  EXPECT_EQ(stash_slot({false, 0.2}, clean, 3, {}), kNoSlot);
+}
+
+TEST(RoundTripGates, ALoopDuplicatingTwoStashEntriesIsDropped) {
+  const std::vector<StashRank> stash = {{false, 0.5}, {false, 0.4}};
+  EXPECT_EQ(stash_slot({false, 0.9}, stash, 3, {0, 1}), kNoSlot);
+}
+
+TEST(RoundTripGates, TheRescueStopsAfterFiveBuildsInARowOnHeldLoops) {
+  RescueStop stop;
+  for (int i = 0; i < 5; ++i) {
+    EXPECT_FALSE(stop.reached());
+    stop.note(RescueBuild::kHeldLoop);
+  }
+  EXPECT_TRUE(stop.reached());
+}
+
+TEST(RoundTripGates, ANewLoopBreaksTheRescueRunAndNoLoopLeavesItAlone) {
+  RescueStop stop;
+  for (uint32_t i = 0; i + 1 < kRescueHeldRun; ++i)
+    stop.note(RescueBuild::kHeldLoop);
+  stop.note(RescueBuild::kNoLoop);
+  EXPECT_FALSE(stop.reached());
+  stop.note(RescueBuild::kNewLoop);
+  for (uint32_t i = 0; i + 1 < kRescueHeldRun; ++i)
+    stop.note(RescueBuild::kHeldLoop);
+  EXPECT_FALSE(stop.reached());
+  stop.note(RescueBuild::kHeldLoop);
+  EXPECT_TRUE(stop.reached());
 }

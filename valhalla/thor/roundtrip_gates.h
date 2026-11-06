@@ -1,9 +1,7 @@
 #ifndef VALHALLA_THOR_ROUNDTRIP_GATES_H_
 #define VALHALLA_THOR_ROUNDTRIP_GATES_H_
 
-// The round-trip Defect Gate: a built loop's legs decoded onto the 1e-5 grid, the
-// exact-mirror stubs read off that trace, and the verdict the build loop acts on.
-// Everything here is pure except append_leg, the one function that reads tiles.
+// The round-trip Defect Gate and dirty stash; pure except append_leg, which reads tiles.
 
 #include <valhalla/baldr/graphreader.h>
 #include <valhalla/midgard/pointll.h>
@@ -18,8 +16,7 @@ namespace valhalla {
 namespace thor {
 namespace roundtrip {
 
-// A leg shape on the 1e-5 grid (lat, lng), consecutive duplicates dropped, with the
-// running along-trace distance at every point.
+// A leg shape on the 1e-5 grid (lat, lng), repeats dropped, with along-trace metres.
 struct GridTrace {
   std::vector<std::pair<int64_t, int64_t>> pts;
   std::vector<double> cum{0.0};
@@ -27,8 +24,7 @@ struct GridTrace {
   void add(const midgard::PointLL& p);
 };
 
-// Appends the shapes of leg[from, to) to the trace. false = an unresolvable tile, which
-// every caller reads as an inconclusive, clean check.
+// false on an unresolvable tile, which every caller reads as a clean check.
 bool append_leg(const std::vector<PathInfo>& leg,
                 size_t from,
                 size_t to,
@@ -37,12 +33,10 @@ bool append_leg(const std::vector<PathInfo>& leg,
 
 constexpr size_t kAnywhere = std::numeric_limits<size_t>::max();
 
-// The longest exact-mirror stub (a palindrome of grid points: ridden out and straight
-// back) in metres. With a seam index, only stubs whose interval covers it (slack 2).
+// Metres of the longest palindrome of grid points; with seam_idx, only one covering it.
 double longest_mirror_stub_m(const GridTrace& trace, size_t seam_idx = kAnywhere);
 
-// The leg ranges a seam window keeps: fwd[fwd_begin, end) and ret[0, ret_end), each
-// ~window_m of riding next to the seam. window_m <= 0 keeps both legs whole.
+// fwd[fwd_begin, end) and ret[0, ret_end): ~window_m each side of the seam; <= 0 keeps all.
 struct SeamWindow {
   size_t fwd_begin;
   size_t ret_end;
@@ -59,9 +53,7 @@ double seam_stub_m(const std::vector<PathInfo>& fwd,
 // The longest exact-mirror stub anywhere in one leg.
 double leg_mirror_stub_m(const std::vector<PathInfo>& leg, baldr::GraphReader& reader);
 
-// Which shapes a built loop carries. seam = an exact mirror across the seam (always
-// read); twin = the return rides the forward road or its twin; bounce = a mirror inside
-// the return. twin and bounce are the geometry gate's two halves.
+// seam: a mirror across the seam; twin and bounce: the geometry gate's two halves.
 struct GateVerdict {
   bool seam = false;
   bool twin = false;
@@ -72,32 +64,44 @@ struct GateVerdict {
   }
 };
 
-// What the build loop does with a judged loop. A seam reject always buys a replacement
-// build; a geometry reject does while the request's refill budget lasts, and past it is
-// kept in the bank's last tier.
+// A seam reject always refills; a geometry reject refills within the budget, then is kept gated.
 enum class GateAction { kServe, kStashSeam, kStashGeometry, kKeepGated };
 
 GateAction gate_action(const GateVerdict& verdict, uint32_t refills_used, uint32_t refill_budget);
 
-// A dirty-stash entry as the stash's admission rule reads it. The stash holds at most K
-// rejected loops for the per-slot top-up, which takes geometry rejects first, best score
-// first, and a seam reject only when the bank would otherwise be empty.
+// A dirty-stash entry as the stash's admission rule reads it.
 struct StashRank {
   bool seam = false;
   double score = 0;
 };
 
-// True when the top-up would take a before b.
+// The top-up takes geometry rejects before seam rejects, then the higher score.
 bool stash_before(const StashRank& a, const StashRank& b);
 
 constexpr size_t kNoSlot = std::numeric_limits<size_t>::max();
 
-// Where a rejected loop goes in a stash of at most `cap` entries: the index to write it
-// to (stash.size() appends) or kNoSlot to drop it. `dup` is the index of the stash entry
-// the loop duplicates, kNoSlot when none; the two keep whichever the top-up would take
-// first. A full stash gives up the entry the top-up would take last, and only for a loop
-// it would take before that entry.
-size_t stash_slot(const StashRank& loop, const std::vector<StashRank>& stash, size_t cap, size_t dup);
+// The index to write a reject to (stash.size() appends), or kNoSlot: no two entries duplicate.
+size_t stash_slot(const StashRank& loop,
+                  const std::vector<StashRank>& stash,
+                  size_t cap,
+                  const std::vector<size_t>& dups);
+
+// kHeldLoop: identical to, or a near-copy of, a loop the bank holds.
+enum class RescueBuild { kNoLoop, kHeldLoop, kNewLoop };
+
+constexpr uint32_t kRescueHeldRun = 5;
+
+// The rescue stops after kRescueHeldRun held loops in a row; a build with no loop is not counted.
+class RescueStop {
+public:
+  void note(RescueBuild build);
+  bool reached() const {
+    return run_ >= kRescueHeldRun;
+  }
+
+private:
+  uint32_t run_ = 0;
+};
 
 } // namespace roundtrip
 } // namespace thor

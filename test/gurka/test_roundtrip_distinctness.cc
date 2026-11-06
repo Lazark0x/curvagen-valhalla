@@ -135,8 +135,7 @@ TEST_F(RoundTripXCandExemption, PenaltyLeavesTheForcedStemRoutable) {
 
 namespace {
 
-// The largest share of one served loop's ways that another served loop also rides (shared
-// ways / the smaller loop's ways). 1.0 means a served loop rides nothing another does not.
+// The largest share of one served loop's ways that another served loop also rides.
 double max_pair_containment(const std::vector<std::vector<std::string>>& paths) {
   double worst = 0.0;
   for (size_t i = 0; i < paths.size(); ++i)
@@ -164,10 +163,7 @@ std::string dump(const std::vector<std::vector<std::string>>& paths) {
 
 } // namespace
 
-// A sparse cell in the shipped configuration: one road out of A with dead-end spurs. No
-// disjoint pair exists, so every loop comes from the rescue builder, and every one is an
-// out-and-back the Defect Gate rejects: the cell serves from the dirty stash. The stash
-// keeps one out-and-back per road, not one per spur.
+// One road out of A with dead-end spurs: every loop is a rescue out-and-back the gate rejects.
 class RoundTripSparseSpurs : public ::testing::Test {
 protected:
   static gurka::map map;

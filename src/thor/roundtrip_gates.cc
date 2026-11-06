@@ -117,10 +117,14 @@ bool stash_before(const StashRank& a, const StashRank& b) {
   return a.score > b.score;
 }
 
-size_t
-stash_slot(const StashRank& loop, const std::vector<StashRank>& stash, size_t cap, size_t dup) {
-  if (dup != kNoSlot)
-    return stash_before(loop, stash[dup]) ? dup : kNoSlot;
+size_t stash_slot(const StashRank& loop,
+                  const std::vector<StashRank>& stash,
+                  size_t cap,
+                  const std::vector<size_t>& dups) {
+  if (dups.size() > 1)
+    return kNoSlot;
+  if (dups.size() == 1)
+    return stash_before(loop, stash[dups[0]]) ? dups[0] : kNoSlot;
   if (stash.size() < cap)
     return stash.size();
   size_t last = kNoSlot;
@@ -128,6 +132,13 @@ stash_slot(const StashRank& loop, const std::vector<StashRank>& stash, size_t ca
     if (last == kNoSlot || !stash_before(stash[i], stash[last]))
       last = i;
   return last != kNoSlot && stash_before(loop, stash[last]) ? last : kNoSlot;
+}
+
+void RescueStop::note(RescueBuild build) {
+  if (build == RescueBuild::kHeldLoop)
+    ++run_;
+  else if (build == RescueBuild::kNewLoop)
+    run_ = 0;
 }
 
 } // namespace roundtrip

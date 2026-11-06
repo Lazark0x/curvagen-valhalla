@@ -114,6 +114,23 @@ TEST(RoundTripScore, SharedFractionsReadRoadsAndTwins) {
   EXPECT_DOUBLE_EQ(fwd_shared_fraction(LoopKeys{}, b), 0.0);
 }
 
+TEST(RoundTripScore, AShortLoopInsideALongOneIsANearCopyEitherWay) {
+  LoopKeys long_loop;
+  long_loop.ridden = {{1, 1000}, {2, 1000}, {3, 1000}, {4, 1000}};
+  long_loop.total = 4000;
+  LoopKeys short_loop;
+  short_loop.ridden = {{1, 1000}};
+  short_loop.twins = {9};
+  short_loop.total = 1000;
+  EXPECT_TRUE(near_copies(short_loop, long_loop, 0.6));
+  EXPECT_TRUE(near_copies(long_loop, short_loop, 0.6));
+  LoopKeys apart;
+  apart.ridden = {{5, 1000}, {1, 100}};
+  apart.total = 1100;
+  EXPECT_FALSE(near_copies(apart, long_loop, 0.6));
+  EXPECT_FALSE(near_copies(long_loop, apart, 0.6));
+}
+
 TEST(RoundTripScore, BuiltKeysSumMetresPerRoadBeyondTheExemption) {
   const std::vector<LoopEdge> fwd = {road(7, 1000, 1000), road(1, 1500, 2500), road(2, 500, 3000)};
   const std::vector<LoopEdge> ret = {road(1, 400, 2600), road(8, 1200, 1200)};

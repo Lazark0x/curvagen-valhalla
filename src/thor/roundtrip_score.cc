@@ -68,6 +68,10 @@ double fwd_shared_fraction(const LoopKeys& cand, const LoopKeys& prev) {
   return shared / cand.fwd_total;
 }
 
+bool near_copies(const LoopKeys& a, const LoopKeys& b, double frac) {
+  return shared_fraction(a, b) > frac || shared_fraction(b, a) > frac;
+}
+
 PairMeasure measure_pair(const std::vector<LoopEdge>& tree,
                          const std::vector<LoopEdge>& other,
                          const TwinsFn& twins,

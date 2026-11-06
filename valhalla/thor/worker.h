@@ -151,28 +151,18 @@ protected:
   // the box, so it stays wired rather than compiled out.
   bool roundtrip_stage_timing;
 
-  // Cross-candidate distinctness. roundtrip_xcand_penalty: each built loop's fresh-road
-  // edges soft-surcharge later candidates' return legs, pushing the bank off shared
-  // corridors. xcand_strength = soft surcharge added per prior loop that rode an edge;
-  // xcand_cap = max prior-use count that surcharge grows with (so a genuinely-single
-  // corridor stays routable); sharing_frac = the whole-pair road share above which the
-  // pair selection calls a candidate a near-duplicate.
+  // xcand surcharges later returns on roads earlier loops rode; sharing_frac is the near-copy share.
   bool roundtrip_xcand_penalty;
   double roundtrip_xcand_strength;
   uint32_t roundtrip_xcand_cap;
   double roundtrip_sharing_frac;
 
-  // Tiered road identity.  The twin/parallel sidecar (thor::RoadTwinIndex) is built once per process at engine
-  // start and read by roundtrip_impl: twins of a hard-excluded corridor edge are
-  // hard-excluded too, parallels join the soft leash + progress-graded rejoin tier.
-  // roundtrip_road_identity turns the whole mechanism off (v3 behaviour);
-  // roundtrip_parallel_tier turns the parallel tier off (the "twins only" variant).
+  // Road identity (RoadTwinIndex): a corridor edge's twins are excluded with it, its parallels leashed.
   bool roundtrip_road_identity;
   bool roundtrip_parallel_tier;
   double roundtrip_twin_radius_m;
   double roundtrip_parallel_radius_m;
-  // F01: reject harvest chains that revisit an undirected edge
-  // (or its twin).  Config-gated so the before/after is one binary.
+  // Reject harvest chains that revisit an undirected edge or its twin.
   bool roundtrip_simple_chains;
 
   // 1. switchback test: a geometric twin pair is only the same physical road if it is a
@@ -192,14 +182,7 @@ protected:
   bool roundtrip_f09_budget;
   double roundtrip_rank_overlap_w;
   double roundtrip_rank_disterr_w;
-  // The Suurballe-Tarjan whole-loop pair pass.
-  // roundtrip_pair_pass swaps harvest->select->return-A* for one disjoint-pair pass
-  // over the harvest forest (the return is the pair's second path, reversed, rebuilt
-  // whole by the return-leg router where it cannot be ridden); roundtrip_pair_sharing
-  // applies the K x K near-dup filter at SELECTION (the pair is known before any build);
-  // roundtrip_pair_band is the |built - target| / target the pair must satisfy to be
-  // chosen; roundtrip_pair_shortlist is the per-sector top-M whose pairs are constructed
-  // and scored before the seed-rotated pick.
+  // The Suurballe-Tarjan whole-loop pair pass and its selection-time filters.
   bool roundtrip_pair_pass;
   bool roundtrip_pair_sharing;
   double roundtrip_pair_band;

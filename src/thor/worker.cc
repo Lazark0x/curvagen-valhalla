@@ -79,8 +79,8 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       // Flipped here rather than in the deploy config so the engine that ships is
       // the engine that was measured — a knob that has to be set in
       // curvagen-meta/deploy to get the measured behaviour is a knob that will
-      // one day not be set. Every knob is still a knob: setting it back reaches
-      // v3 / P1 / P2 behaviour for a bisect.
+      // one day not be set. Every remaining knob is still a knob: setting it back
+      // reaches v3 / P1 / P2 behaviour for a bisect.
       //   pair pass on · per-leg forward sharing 0.35 with the relaxation ladder ·
       //   built-loop bank keys · whole-pair test at 0.6 (roundtrip_sharing_frac) ·
       //   one evaluation budget of 1 200 per request, 150 fresh per relaxation rung ·
@@ -124,8 +124,7 @@ thor_worker_t::thor_worker_t(const boost::property_tree::ptree& config,
       roundtrip_pair_relax_eval_cap(config.get<uint32_t>("thor.roundtrip_pair_relax_eval_cap", 150)),
       roundtrip_pair_rescue_last(config.get<bool>("thor.roundtrip_pair_rescue_last", true)) {
 
-  // Build the road-identity sidecar at engine start (first thor worker; later workers hit the cached instance) so the
-  // per-request path never pays for it.  Logs size + build time at INFO.
+  // Built once per process at engine start, so no request pays for it.
   if (roundtrip_road_identity)
     RoadTwinIndex::get(*reader, roundtrip_twin_radius_m, roundtrip_parallel_radius_m,
                        roundtrip_parallel_tier, roundtrip_switchback_test);
